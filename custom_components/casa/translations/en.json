@@ -1,0 +1,14 @@
+{
+  "title": "Casa",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Welcome to Casa",
+        "description": "Casa is a integration that uses encrypted QR codes to automatically provision and configure devices without any manual data entry. Using standard Home Assistant automations, you can dynamically create sandboxed guest accounts and generate time-limited QR codes that instantly connect a device to your Wi-Fi and load a specific dashboard. Background housekeeping automations then manage the entire security lifecycle by automatically scrambling passwords, killing active login tokens, and deleting the physical QR codes the moment a guest's stay ends."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Casa is already installed. Only one instance is permitted."
+    }
+  }
+}

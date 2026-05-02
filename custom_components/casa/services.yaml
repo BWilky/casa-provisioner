@@ -1,0 +1,385 @@
+generate_qr:
+  name: "Generate Casa QR Code"
+  description: "Generates an encrypted QR code payload for the Casa iOS app."
+  fields:
+    host_url:
+      name: "Host URL"
+      description: "e.g., http://192.168.1.21:8123. The exact address the device will use to connect."
+      required: true
+      selector:
+        text: {}
+    username:
+      name: "Username"
+      description: "e.g., guest. The Home Assistant user account to provision."
+      required: true
+      selector:
+        text: {}
+    password:
+      name: "Password (Optional)"
+      description: "Use an existing password instead of generating a random one. If left blank, a secure random password is automatically generated."
+      selector:
+        text: {}
+    pin:
+      name: "Provisioning PIN (Optional)"
+      description: "A max 6-digit PIN the user must enter in the app before provisioning completes."
+      selector:
+        text: {}
+    connect_wifi_ssid:
+      name: "Connect to Wi-Fi SSID (Optional)"
+      description: "The exact name of the network the device should automatically join."
+      selector:
+        text: {}
+    connect_wifi_password:
+      name: "Connect to Wi-Fi Password (Optional)"
+      description: "The password for the network above."
+      selector:
+        text: {}
+    qr_timeout_minutes:
+      name: "QR Code Scanning Window (Minutes)"
+      description: "How many minutes the physical QR code is allowed to be scanned. Set to 0 or leave unchecked for a permanent, non-expiring code."
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 60
+          mode: box
+    delete_qr_after_window:
+      name: "Delete QR Code After Window"
+      description: "If enabled, the custom QR code image file will be physically deleted after the window closes."
+      default: true
+      selector:
+        boolean: {}
+    password_scramble:
+      name: "Scramble Password"
+      description: "If enabled, the password will be scrambled after the allotted time."
+      default: true
+      selector:
+        boolean: {}
+    password_scramble_in:
+      name: "Scramble Password In (Minutes)"
+      description: "How many minutes until the password actually scrambles. Set to 0 to inherit the time from the QR Code Scanning Window."
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 120
+          mode: box
+    qr_filename:
+      name: "QR Filename"
+      description: "Optional. Custom filename (without .png). If left blank, defaults to qr_[username]_[timestamp].png"
+      selector:
+        text: {}
+    deauthenticate_existing:
+      name: "Deauthenticate Existing Connections"
+      description: "If enabled, forces all currently authenticated Casa devices to log out immediately."
+      default: false
+      selector:
+        boolean: {}
+    allow_all_pages:
+      name: "Allow All Pages"
+      description: "If enabled, grants access to all dashboards and panels (forces '/*' in the payload)."
+      default: false
+      selector:
+        boolean: {}
+    allowed_pages:
+      name: "Allowed Pages"
+      description: "Add allowed paths one by one. Use asterisks for wildcards (e.g., /dashboard-1/*). Ignored if 'Allow All Pages' is enabled."
+      selector:
+        text:
+          multiple: true
+    allowed_wifi:
+      name: "Allowed Validation WiFi SSIDs"
+      description: "Add allowed WiFi network names one by one. App checks if it's on this network to function."
+      selector:
+        text:
+          multiple: true
+    default_dashboard:
+      name: "Default Dashboard Path"
+      description: "The path to load on startup (e.g., /lovelace/home)."
+      selector:
+        text: {}
+    welcome_url:
+      name: "Welcome URL (Optional)"
+      description: "An internal or external URL to display in a pop-up sheet immediately after initial provisioning."
+      selector:
+        text: {}
+    immersive_level:
+      name: "Immersive Level"
+      description: "Level 1: Standard (Below Notch). Level 2: Edge-to-Edge (Transparent Status Bar). Level 3: Fullscreen (Hidden Status Bar)."
+      default: "1"
+      selector:
+        select:
+          options:
+            - label: "Level 1 (Standard)"
+              value: "1"
+            - label: "Level 2 (Transparent Edge-to-Edge)"
+              value: "2"
+            - label: "Level 3 (Fullscreen / Hidden Bar)"
+              value: "3"
+    theme_color_mode:
+      name: "Top Bar Color Mode (Level 1 Only)"
+      description: "How the app colors the safe area behind the notch. Inherit attempts to pull the meta-theme color from your HA dashboard."
+      default: "inherit"
+      selector:
+        select:
+          options:
+            - label: "Inherit from Home Assistant"
+              value: "inherit"
+            - label: "Custom Color"
+              value: "custom"
+            - label: "Inherit with Custom Fallback"
+              value: "inherit_with_fallback"
+    custom_color:
+      name: "Custom Top Bar Color (Hex)"
+      description: "The hex color code to use if Custom or Fallback is selected (e.g., #03A9F4)."
+      default: "#000000"
+      selector:
+        text: {}
+    expiration_hours:
+      name: "Session Expiration (Hours)"
+      description: "Hours until the app logs out. Set to 0 for permanent access. Default: 336 (14 days)."
+      default: 336
+      selector:
+        number:
+          min: 0
+          max: 87600
+          mode: box
+
+remove_token:
+  name: "Remove Casa Token"
+  description: "Forcefully logs out a session by removing its refresh token."
+  fields:
+    username:
+      name: "Username"
+      description: "The user account this token belongs to."
+      required: true
+      selector:
+        text: {}
+    token_id:
+      name: "Token ID"
+      description: "The exact ID of the token to remove, or an asterisk (*) to remove ALL tokens for this user."
+      required: true
+      selector:
+        text: {}
+
+create_user:
+  name: "Create Casa User"
+  description: "Creates a new Home Assistant local user account with standard permissions."
+  fields:
+    name:
+      name: "Display Name"
+      description: "e.g., Guest 1. The full name shown in the HA UI."
+      required: true
+      selector:
+        text: {}
+    username:
+      name: "Username"
+      description: "e.g., guest_1. The login username."
+      required: true
+      selector:
+        text: {}
+    password:
+      name: "Password (Optional)"
+      description: "If left blank, a secure 12-character password will be randomly generated and returned to your automation."
+      selector:
+        text: {}
+    local_only:
+      name: "Local Access Only"
+      description: "If enabled, this user can ONLY connect while on your local WiFi network. External remote access is blocked by Home Assistant."
+      default: true
+      selector:
+        boolean: {}
+
+list_tokens:
+  name: "List Casa Tokens"
+  description: "Returns a list of all active login tokens and devices connected to a specific user."
+  fields:
+    username:
+      name: "Username"
+      description: "The user account to check (e.g., guest)."
+      required: true
+      selector:
+        text: {}
+
+housekeeping:
+  name: "Casa Housekeeping"
+  description: "Sweeps the www folder and deletes old QR code images."
+  fields:
+    hours_old:
+      name: "Hours Old"
+      description: "Delete files that were created more than this many hours ago."
+      required: true
+      default: 24
+      selector:
+        number:
+          min: 1
+          max: 720
+          mode: box
+    prefix:
+      name: "File Prefix"
+      description: "The prefix of the files to target (e.g., qr_)."
+      required: true
+      default: "qr_"
+      selector:
+        text: {}
+
+scramble_guest_password:
+  name: "Scramble User Password"
+  description: "Manually scrambles a user's password and optionally forces a logout across all devices."
+  fields:
+    username:
+      name: "Username"
+      description: "The user account to scramble (e.g., guest_1)."
+      required: true
+      selector:
+        text: {}
+    deauthenticate:
+      name: "Deauthenticate Devices"
+      description: "If enabled, all active tokens for this user will be deleted, forcing their devices offline immediately."
+      default: true
+      selector:
+        boolean: {}
+
+provision_ble_beacon:
+  name: "Provision Casa BLE Beacon"
+  description: "Generates an encrypted payload and pushes it directly to multiple ESPHome Bluetooth beacons."
+  fields:
+    esphome_service:
+      name: "ESPHome Target Services"
+      description: "Add ESPHome API services one by one (e.g., esphome.lobby_beacon_update_payload)."
+      required: true
+      selector:
+        text:
+          multiple: true
+    host_url:
+      name: "Host URL"
+      description: "e.g., http://192.168.1.21:8123."
+      required: true
+      selector:
+        text: {}
+    username:
+      name: "Username"
+      required: true
+      selector:
+        text: {}
+    password:
+      name: "Password (Optional)"
+      description: "If left blank, a random password is generated."
+      selector:
+        text: {}
+    pin:
+      name: "Provisioning PIN (Optional)"
+      description: "A max 6-digit PIN the user must enter in the app before the beacon reveals the payload."
+      selector:
+        text: {}
+    connect_wifi_ssid:
+      name: "Connect to Wi-Fi SSID (Optional)"
+      description: "The exact name of the network the device should automatically join."
+      selector:
+        text: {}
+    connect_wifi_password:
+      name: "Connect to Wi-Fi Password (Optional)"
+      description: "The password for the network above."
+      selector:
+        text: {}
+    ble_timeout_minutes:
+      name: "BLE Broadcast Window (Minutes)"
+      description: "How long the beacon should broadcast this valid payload before it expires. Set to 0 for permanent."
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 60
+          mode: box
+    password_scramble:
+      name: "Scramble Password"
+      description: "If enabled, the password will be scrambled after the allotted time."
+      default: true
+      selector:
+        boolean: {}
+    password_scramble_in:
+      name: "Scramble Password In (Minutes)"
+      description: "How many minutes until the password actually scrambles. Set to 0 to inherit from the BLE Broadcast Window."
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 120
+          mode: box
+    deauthenticate_existing:
+      name: "Deauthenticate Existing Connections"
+      default: false
+      selector:
+        boolean: {}
+    allow_all_pages:
+      name: "Allow All Pages"
+      default: false
+      selector:
+        boolean: {}
+    allowed_pages:
+      name: "Allowed Pages"
+      selector:
+        text:
+          multiple: true
+    allowed_wifi:
+      name: "Allowed Validation WiFi SSIDs"
+      selector:
+        text:
+          multiple: true
+    default_dashboard:
+      name: "Default Dashboard Path"
+      selector:
+        text: {}
+    welcome_url:
+      name: "Welcome URL (Optional)"
+      selector:
+        text: {}
+    immersive_level:
+      name: "Immersive Level"
+      default: "1"
+      selector:
+        select:
+          options:
+            - label: "Level 1 (Standard)"
+              value: "1"
+            - label: "Level 2 (Transparent Edge-to-Edge)"
+              value: "2"
+            - label: "Level 3 (Fullscreen / Hidden Bar)"
+              value: "3"
+    theme_color_mode:
+      name: "Top Bar Color Mode (Level 1 Only)"
+      default: "inherit"
+      selector:
+        select:
+          options:
+            - label: "Inherit from Home Assistant"
+              value: "inherit"
+            - label: "Custom Color"
+              value: "custom"
+            - label: "Inherit with Custom Fallback"
+              value: "inherit_with_fallback"
+    custom_color:
+      name: "Custom Top Bar Color (Hex)"
+      default: "#000000"
+      selector:
+        text: {}
+    expiration_hours:
+      name: "Session Expiration (Hours)"
+      default: 336
+      selector:
+        number:
+          min: 0
+          max: 87600
+          mode: box
+
+clear_ble_beacon:
+  name: "Clear BLE Beacon"
+  description: "Forcefully stops specific ESPHome beacons from broadcasting a provisioning profile."
+  fields:
+    esphome_service:
+      name: "ESPHome Target Services"
+      description: "Add ESPHome API services one by one (e.g., esphome.lobby_beacon_update_payload)."
+      required: true
+      selector:
+        text:
+          multiple: true
