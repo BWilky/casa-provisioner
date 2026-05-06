@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import string
-import random
+import secrets
 import base64
 import time
 from datetime import timedelta
@@ -20,6 +20,10 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+def generate_random_password(length=12):
+    chars = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(chars) for _ in range(length))
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
@@ -33,6 +37,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ==========================================
     async def _login_listener(username, user_id, known_tokens, ttl_seconds, method):
         """Poll for new refresh tokens and fire casa_code_redeemed when detected."""
+        if ttl_seconds <= 0:
+            _LOGGER.warning("CASA: Listener for '%s' skipped — TTL is %s.", username, ttl_seconds)
+            return
         try:
             elapsed = 0
             poll_interval = 1
@@ -61,7 +68,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 "redeemed_at": dt_util.now().isoformat(),
                                 "method": method,
                             })
-                            _LOGGER.warning(
+                            _LOGGER.info(
                                 "CASA EVENT: Code redeemed by '%s' via %s (client: %s, IP: %s).",
                                 username, method, token.client_name, token.last_used_ip
                             )
@@ -75,7 +82,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def handle_generate_qr(call: ServiceCall):
         service_data = call.data
         
-        _LOGGER.warning("CASA DEBUG: Service triggered. Starting generation sequence.")
+        _LOGGER.debug("CASA: generate_qr service triggered.")
         
         current_dir = os.path.dirname(__file__)
         public_key_path = os.path.join(current_dir, "casa_public.pem")
@@ -132,10 +139,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         
         expiration_hours = int(service_data.get("expiration_hours", 336))
         if expiration_hours == 0:
-            expiration_unix = "0"
+            expiration_unix = 0
         else:
             future_dt = dt_util.now() + timedelta(hours=expiration_hours)
-            expiration_unix = str(int(future_dt.timestamp()))
+            expiration_unix = int(future_dt.timestamp())
 
         # Extract Time Windows
         qr_timeout_mins = int(service_data.get("qr_timeout_minutes", 0))
@@ -156,10 +163,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if qr_timeout_mins > 0:
             qr_timeout_secs = qr_timeout_mins * 60
             qr_dead_dt = dt_util.now() + timedelta(seconds=qr_timeout_secs)
-            qr_expiration_unix = str(int(qr_dead_dt.timestamp()))
+            qr_expiration_unix = int(qr_dead_dt.timestamp())
             delete_qr = service_data.get("delete_qr_after_window", True)
         else:
-            qr_expiration_unix = "0"
+            qr_expiration_unix = 0
             qr_timeout_secs = 0
             delete_qr = False
 
@@ -177,10 +184,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return {"error": "No credentials"}
 
         provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
-        
-        def generate_random_password(length=12):
-            chars = string.ascii_letters + string.digits
-            return ''.join(random.choice(chars) for _ in range(length))
+        if not provider:
+            return {"error": "Home Assistant core auth provider not found"}
 
         target_password = str(service_data.get("password", "")).strip()
         
@@ -194,12 +199,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if deauthenticate_existing:
             for token in list(target_user.refresh_tokens.values()):
                 hass.auth.async_remove_refresh_token(token)
-            _LOGGER.warning("CASA DEBUG: All existing sessions for '%s' terminated.", target_username)
+            _LOGGER.debug("CASA: All existing sessions for '%s' terminated.", target_username)
         
         # Construct Raw Payload (13 Variables)
         raw_payload_array = [
             str(final_server_url), str(login_username), str(login_password), allowed_paths_str,
-            allowed_wifi, default_dashboard, immersive_payload, expiration_unix, qr_expiration_unix, welcome_url,
+            allowed_wifi, default_dashboard, immersive_payload, str(expiration_unix), str(qr_expiration_unix), welcome_url,
             target_pin, connect_wifi_ssid, connect_wifi_password
         ]
         payload_string = "|".join(raw_payload_array)
@@ -222,6 +227,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             final_filename = f"qr_{login_username}_{int(time.time())}.png"
 
+        # NOTE: This always overwrites the shared casa_qr.png dashboard image.
+        # If multiple users generate codes concurrently, the last write wins.
         def create_qr_images(text):
             www_dir = hass.config.path("www")
             os.makedirs(www_dir, exist_ok=True)
@@ -234,7 +241,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return final_filename
 
         await hass.async_add_executor_job(create_qr_images, final_encrypted_b64)
-        _LOGGER.warning("CASA SUCCESS: QR Code saved as %s.", final_filename)
+        _LOGGER.info("CASA: QR Code saved as %s.", final_filename)
 
         # Detach Auto-Destruct Timer
         async def _auto_destruct_sequence(username, auth_provider, qr_time, scramble_time, do_scramble, do_delete, filename):
@@ -270,16 +277,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 img.save(dashboard_path)
                                 
                             await hass.async_add_executor_job(delete_and_overwrite)
-                            _LOGGER.warning("CASA SUCCESS: QR Code file %s physically deleted.", filename)
+                            _LOGGER.info("CASA: QR Code file %s physically deleted.", filename)
                         else:
                             await hass.async_add_executor_job(create_qr_images, "EXPIRED - Request a new Casa code.")
-                            _LOGGER.warning("CASA SUCCESS: QR Code %s wiped from dashboard.", filename)
+                            _LOGGER.info("CASA: QR Code %s wiped from dashboard.", filename)
                             
                     elif event["action"] == "scramble":
                         scrambled_password = generate_random_password()
                         auth_provider.data.change_password(username, scrambled_password)
                         await auth_provider.data.async_save()
-                        _LOGGER.warning("CASA SUCCESS: Password for %s scrambled.", username)
+                        _LOGGER.info("CASA: Password for %s scrambled.", username)
             except asyncio.CancelledError:
                 pass
 
@@ -292,7 +299,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
             hass.data[DOMAIN]["timers"][target_username] = countdown_task
         else:
-            _LOGGER.warning("CASA DEBUG: Both QR Timeout and Password Scramble are disabled. Permanent Code.")
+            _LOGGER.warning("CASA: No QR timeout or password scramble configured. Code is permanent.")
 
         # Start login listener to detect code redemption
         known_token_ids = set(target_user.refresh_tokens.keys())
@@ -301,7 +308,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         elif expiration_hours > 0:
             listener_ttl = min(expiration_hours * 3600, 86400)
         else:
-            listener_ttl = 86400
+            listener_ttl = 300
 
         if target_username in hass.data[DOMAIN]["listeners"]:
             hass.data[DOMAIN]["listeners"][target_username].cancel()
@@ -314,7 +321,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return {
             "filename": final_filename,
             "url_path": f"/local/{final_filename}",
-            "qr_expires_at": int(qr_expiration_unix)
+            "qr_expires_at": qr_expiration_unix
         }
 
     hass.services.async_register(
@@ -340,7 +347,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if token_id == "*":
             for token in list(target_user.refresh_tokens.values()):
                 hass.auth.async_remove_refresh_token(token)
-            _LOGGER.warning("CASA: All active sessions terminated for %s.", target_username)
+            _LOGGER.info("CASA: All active sessions terminated for %s.", target_username)
         else:
             token_to_remove = target_user.refresh_tokens.get(token_id)
             if token_to_remove:
@@ -370,8 +377,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return {"error": "Home Assistant core auth provider not found"}
 
         if not target_password:
-            chars = string.ascii_letters + string.digits
-            target_password = ''.join(random.choice(chars) for _ in range(12))
+            target_password = generate_random_password()
 
         group_ids = ["system-users"]
 
@@ -387,7 +393,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         credentials = await provider.async_get_or_create_credentials({"username": target_username})
         await hass.auth.async_link_user(new_user, credentials)
 
-        _LOGGER.warning("CASA SUCCESS: New local user '%s' created (Local Only: %s).", target_username, local_only)
+        _LOGGER.info("CASA: New local user '%s' created (Local Only: %s).", target_username, local_only)
 
         return {
             "name": target_name,
@@ -469,7 +475,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return deleted_count
 
         deleted_count = await hass.async_add_executor_job(cleanup_files)
-        _LOGGER.warning("CASA SUCCESS: Housekeeping deleted %s old files matching prefix '%s'.", deleted_count, prefix)
+        _LOGGER.info("CASA: Housekeeping deleted %s old files matching prefix '%s'.", deleted_count, prefix)
 
         return {"deleted_count": deleted_count}
 
@@ -511,18 +517,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not provider:
             return {"error": "Home Assistant core auth provider not found"}
 
-        chars = string.ascii_letters + string.digits
-        new_password = ''.join(random.choice(chars) for _ in range(12))
+        new_password = generate_random_password()
 
         provider.data.change_password(login_username, new_password)
         await provider.data.async_save()
         
-        _LOGGER.warning("CASA SUCCESS: Password for user '%s' manually scrambled.", target_username)
+        _LOGGER.info("CASA: Password for user '%s' manually scrambled.", target_username)
 
         if deauthenticate:
             for token in list(target_user.refresh_tokens.values()):
                 hass.auth.async_remove_refresh_token(token)
-            _LOGGER.warning("CASA SUCCESS: All active sessions for '%s' terminated.", target_username)
+            _LOGGER.info("CASA: All active sessions for '%s' terminated.", target_username)
 
         return {
             "username": target_username,
@@ -541,7 +546,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def handle_provision_ble_beacon(call: ServiceCall):
         service_data = call.data
         
-        _LOGGER.warning("CASA DEBUG: BLE Provisioning triggered.")
+        _LOGGER.debug("CASA: provision_ble_beacon service triggered.")
         
         current_dir = os.path.dirname(__file__)
         public_key_path = os.path.join(current_dir, "casa_public.pem")
@@ -602,10 +607,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         
         expiration_hours = int(service_data.get("expiration_hours", 336))
         if expiration_hours == 0:
-            expiration_unix = "0"
+            expiration_unix = 0
         else:
             future_dt = dt_util.now() + timedelta(hours=expiration_hours)
-            expiration_unix = str(int(future_dt.timestamp()))
+            expiration_unix = int(future_dt.timestamp())
 
         # Extract Time Windows
         ble_timeout_mins = int(service_data.get("ble_timeout_minutes", 0))
@@ -626,9 +631,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if ble_timeout_mins > 0:
             ble_timeout_secs = ble_timeout_mins * 60
             ble_dead_dt = dt_util.now() + timedelta(seconds=ble_timeout_secs)
-            ble_expiration_unix = str(int(ble_dead_dt.timestamp()))
+            ble_expiration_unix = int(ble_dead_dt.timestamp())
         else:
-            ble_expiration_unix = "0"
+            ble_expiration_unix = 0
             ble_timeout_secs = 0
 
         users = await hass.auth.async_get_users()
@@ -645,10 +650,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return {"error": "No credentials"}
 
         provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
-        
-        def generate_random_password(length=12):
-            chars = string.ascii_letters + string.digits
-            return ''.join(random.choice(chars) for _ in range(length))
+        if not provider:
+            return {"error": "Home Assistant core auth provider not found"}
 
         target_password = str(service_data.get("password", "")).strip()
         
@@ -666,7 +669,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Construct Raw Payload (13 Variables)
         raw_payload_array = [
             str(final_server_url), str(login_username), str(login_password), allowed_paths_str,
-            allowed_wifi, default_dashboard, immersive_payload, expiration_unix, ble_expiration_unix, welcome_url,
+            allowed_wifi, default_dashboard, immersive_payload, str(expiration_unix), str(ble_expiration_unix), welcome_url,
             target_pin, connect_wifi_ssid, connect_wifi_password
         ]
         payload_string = "|".join(raw_payload_array)
@@ -690,13 +693,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     service, 
                     {
                         "payload": final_encrypted_b64,
-                        "expires_at": int(ble_expiration_unix),
+                        "expires_at": ble_expiration_unix,
                         "pin": target_pin
                     }, 
                     blocking=False
                 )
                 successful_targets.append(target)
-                _LOGGER.warning("CASA SUCCESS: Pushed payload and PIN to %s.", target)
+                _LOGGER.info("CASA: Pushed payload and PIN to %s.", target)
             except Exception as e:
                 _LOGGER.error("CASA ERROR: Failed to call ESPHome service %s. Error: %s", target, str(e))
 
@@ -706,7 +709,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 scrambled_password = generate_random_password()
                 auth_provider.data.change_password(username, scrambled_password)
                 await auth_provider.data.async_save()
-                _LOGGER.warning("CASA SUCCESS: Password for %s scrambled.", username)
+                _LOGGER.info("CASA: Password for %s scrambled.", username)
             except asyncio.CancelledError:
                 pass
 
@@ -726,7 +729,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         elif expiration_hours > 0:
             listener_ttl = min(expiration_hours * 3600, 86400)
         else:
-            listener_ttl = 86400
+            listener_ttl = 300
 
         if target_username in hass.data[DOMAIN]["listeners"]:
             hass.data[DOMAIN]["listeners"][target_username].cancel()
@@ -739,7 +742,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return {
             "status": "success",
             "successful_targets": successful_targets,
-            "ble_expires_at": int(ble_expiration_unix),
+            "ble_expires_at": ble_expiration_unix,
             "pin_required": bool(target_pin)
         }
 
@@ -776,7 +779,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     blocking=False
                 )
                 successful_targets.append(target)
-                _LOGGER.warning("CASA SUCCESS: Manually cleared BLE beacon at %s.", target)
+                _LOGGER.info("CASA: Manually cleared BLE beacon at %s.", target)
             except Exception as e:
                 _LOGGER.error("CASA ERROR: Failed to clear %s: %s", target, str(e))
                 
