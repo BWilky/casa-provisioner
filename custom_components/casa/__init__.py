@@ -16,7 +16,8 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 import qrcode
 
-from .const import DOMAIN
+from homeassistant.exceptions import HomeAssistantError
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +45,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault("timers", {})
     hass.data[DOMAIN].setdefault("listeners", {})
+
+    async def _check_authorization(call: ServiceCall):
+        """Check if the service call is authorized."""
+        if not entry.options.get(CONF_ADMIN_SYSTEM_ONLY, True):
+            return
+
+        # System/Script contexts are allowed:
+        # - call.context.parent_id is set when called from script/automation
+        # - call.context.user_id is None when triggered by the system/time triggers
+        if call.context.parent_id is not None or call.context.user_id is None:
+            return
+
+        # Directly called by a user. Verify that they are an admin.
+        users = await hass.auth.async_get_users()
+        calling_user = next((u for u in users if u.id == call.context.user_id), None)
+        if not calling_user or not getattr(calling_user, "is_admin", False):
+            _LOGGER.warning(
+                "CASA SECURITY: Blocked unauthorized service call to '%s' by user '%s' (ID: %s).",
+                call.service,
+                getattr(calling_user, "name", "Unknown") if calling_user else "Unknown",
+                call.context.user_id,
+            )
+            raise HomeAssistantError("Admin or system context is required to execute this service.")
 
     # ==========================================
     # SHARED: LOGIN LISTENER
@@ -395,9 +419,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             }
 
     async def handle_provision(call: ServiceCall):
+        await _check_authorization(call)
         return await _provision_internal(call.data)
 
     async def handle_generate_qr_legacy(call: ServiceCall):
+        await _check_authorization(call)
         _LOGGER.warning("CASA: generate_qr service is deprecated. Please use the provision service with method='qr' instead.")
         data = dict(call.data)
         data["method"] = "qr"
@@ -406,6 +432,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return await _provision_internal(data)
 
     async def handle_provision_ble_beacon_legacy(call: ServiceCall):
+        await _check_authorization(call)
         _LOGGER.warning("CASA: provision_ble_beacon service is deprecated. Please use the provision service with method='ble' instead.")
         data = dict(call.data)
         data["method"] = "ble"
@@ -432,6 +459,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 2: REMOVE TOKEN
     # ==========================================
     async def handle_remove_token(call: ServiceCall):
+        await _check_authorization(call)
         token_id = str(call.data.get("token_id", "")).strip()
         target_username = str(call.data.get("username", "")).strip()
         
@@ -458,6 +486,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 3: CREATE USER
     # ==========================================
     async def handle_create_user(call: ServiceCall):
+        await _check_authorization(call)
         target_name = str(call.data.get("name", "")).strip()
         target_username = str(call.data.get("username", "")).strip().casefold()
         target_password = str(call.data.get("password", "")).strip()
@@ -511,6 +540,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 4: LIST TOKENS
     # ==========================================
     async def handle_list_tokens(call: ServiceCall):
+        await _check_authorization(call)
         target_username = str(call.data.get("username", "")).strip()
         
         if not target_username:
@@ -544,6 +574,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 5: HOUSEKEEPING
     # ==========================================
     async def handle_housekeeping(call: ServiceCall):
+        await _check_authorization(call)
         val_hours = call.data.get("hours_old")
         hours_old = float(val_hours) if val_hours is not None else 24.0
         prefix = str(call.data.get("prefix", "qr_")).strip()
@@ -588,6 +619,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 6: SCRAMBLE USER PASSWORD
     # ==========================================
     async def handle_scramble_guest_password(call: ServiceCall):
+        await _check_authorization(call)
         target_username = str(call.data.get("username", "")).strip()
         deauthenticate = call.data.get("deauthenticate", True)
 
@@ -644,6 +676,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 8: CLEAR BLE BEACON
     # ==========================================
     async def handle_clear_ble_beacon(call: ServiceCall):
+        await _check_authorization(call)
         esphome_services_input = call.data.get("esphome_service", [])
         if isinstance(esphome_services_input, list):
             esphome_targets = [str(s).strip() for s in esphome_services_input if str(s).strip()]
