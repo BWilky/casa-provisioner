@@ -32,7 +32,7 @@ Generates an encrypted provisioning payload. Returns response data.
 | `pin` | string | Optional. Max 6-digit PIN code required by app. |
 | `connect_wifi_ssid` | string | Optional. Auto-connect Wi-Fi SSID. |
 | `connect_wifi_password` | string | Optional. Wi-Fi password. |
-| `timeout_minutes` | integer | Scanning/broadcast window (mins). Default: `0` (permanent) for QR, `5` for BLE. |
+| `timeout_minutes` | integer | Scanning/broadcast window (mins). Default: `5` minutes. Set to `0` for permanent. |
 | `delete_qr_after_window`| boolean| Delete QR file after timeout. Default: `true` (QR only). |
 | `password_scramble` | boolean| Scramble user password after timeout. Default: `true`. |
 | `password_scramble_in` | integer | Minutes to scramble password (0 = inherit from timeout). |

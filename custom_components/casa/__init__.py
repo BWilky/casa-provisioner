@@ -198,7 +198,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if val_timeout is not None:
             timeout_mins = int(val_timeout)
         else:
-            timeout_mins = 0 if method == "qr" else 5
+            timeout_mins = 5
 
         password_scramble = service_data.get("password_scramble", True)
         val_scramble = service_data.get("password_scramble_in")

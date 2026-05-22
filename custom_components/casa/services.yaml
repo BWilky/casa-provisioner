@@ -47,7 +47,8 @@ provision:
         text: {}
     timeout_minutes:
       name: "Broadcast/Scanning Window (Minutes)"
-      description: "How many minutes the QR code is allowed to be scanned, or BLE beacon to broadcast. Leave empty/0 for permanent QR codes, or defaults to 5 minutes for BLE beacons."
+      description: "How many minutes the QR code is allowed to be scanned, or BLE beacon to broadcast. Default: 5 minutes. Set to 0 for permanent."
+      default: 5
       selector:
         number:
           min: 0
