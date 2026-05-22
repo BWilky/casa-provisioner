@@ -1,6 +1,169 @@
+provision:
+  name: "Provision Casa Device"
+  description: "Generates an encrypted provisioning payload and either outputs a QR code or pushes it to ESPHome BLE beacons."
+  fields:
+    method:
+      name: "Provisioning Method"
+      description: "Choose whether to generate a QR code image ('qr') or broadcast via BLE beacons ('ble')."
+      required: true
+      selector:
+        select:
+          options:
+            - label: "QR Code"
+              value: "qr"
+            - label: "BLE Beacon"
+              value: "ble"
+    host_url:
+      name: "Host URL"
+      description: "e.g., http://192.168.1.21:8123. The exact address the device will use to connect."
+      required: true
+      selector:
+        text: {}
+    username:
+      name: "Username"
+      description: "e.g., guest. The Home Assistant user account to provision."
+      required: true
+      selector:
+        text: {}
+    password:
+      name: "Password (Optional)"
+      description: "Use an existing password instead of generating a random one. If left blank, a secure random password is automatically generated."
+      selector:
+        text: {}
+    pin:
+      name: "Provisioning PIN (Optional)"
+      description: "A max 6-digit PIN the user must enter in the app before provisioning completes."
+      selector:
+        text: {}
+    connect_wifi_ssid:
+      name: "Connect to Wi-Fi SSID (Optional)"
+      description: "The exact name of the network the device should automatically join."
+      selector:
+        text: {}
+    connect_wifi_password:
+      name: "Connect to Wi-Fi Password (Optional)"
+      description: "The password for the network above."
+      selector:
+        text: {}
+    timeout_minutes:
+      name: "Broadcast/Scanning Window (Minutes)"
+      description: "How many minutes the QR code is allowed to be scanned, or BLE beacon to broadcast. Leave empty/0 for permanent QR codes, or defaults to 5 minutes for BLE beacons."
+      selector:
+        number:
+          min: 0
+          max: 60
+          mode: box
+    delete_qr_after_window:
+      name: "Delete QR Code After Window"
+      description: "QR Method only. If enabled, the custom QR code image file will be physically deleted after the window closes."
+      default: true
+      selector:
+        boolean: {}
+    password_scramble:
+      name: "Scramble Password"
+      description: "If enabled, the password will be scrambled after the allotted time."
+      default: true
+      selector:
+        boolean: {}
+    password_scramble_in:
+      name: "Scramble Password In (Minutes)"
+      description: "How many minutes until the password actually scrambles. Set to 0 to inherit the time from the Broadcast/Scanning Window."
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 120
+          mode: box
+    qr_filename:
+      name: "QR Filename"
+      description: "QR Method only. Custom filename (without .png). If left blank, defaults to qr_[username]_[timestamp].png"
+      selector:
+        text: {}
+    esphome_service:
+      name: "ESPHome Target Services"
+      description: "BLE Method only. Add ESPHome API services one by one (e.g., esphome.lobby_beacon_update_payload)."
+      selector:
+        text:
+          multiple: true
+    deauthenticate_existing:
+      name: "Deauthenticate Existing Connections"
+      description: "If enabled, forces all currently authenticated Casa devices to log out immediately."
+      default: false
+      selector:
+        boolean: {}
+    allow_all_pages:
+      name: "Allow All Pages"
+      description: "If enabled, grants access to all dashboards and panels (forces '/*' in the payload)."
+      default: false
+      selector:
+        boolean: {}
+    allowed_pages:
+      name: "Allowed Pages"
+      description: "Add allowed paths one by one. Use asterisks for wildcards (e.g., /dashboard-1/*). Ignored if 'Allow All Pages' is enabled."
+      selector:
+        text:
+          multiple: true
+    allowed_wifi:
+      name: "Allowed Validation WiFi SSIDs"
+      description: "Add allowed WiFi network names one by one. App checks if it's on this network to function."
+      selector:
+        text:
+          multiple: true
+    default_dashboard:
+      name: "Default Dashboard Path"
+      description: "The path to load on startup (e.g., /lovelace/home)."
+      selector:
+        text: {}
+    welcome_url:
+      name: "Welcome URL (Optional)"
+      description: "An internal or external URL to display in a pop-up sheet immediately after initial provisioning."
+      selector:
+        text: {}
+    immersive_level:
+      name: "Immersive Level"
+      description: "Level 1: Standard (Below Notch). Level 2: Edge-to-Edge (Transparent Status Bar). Level 3: Fullscreen (Hidden Status Bar)."
+      default: "1"
+      selector:
+        select:
+          options:
+            - label: "Level 1 (Standard)"
+              value: "1"
+            - label: "Level 2 (Transparent Edge-to-Edge)"
+              value: "2"
+            - label: "Level 3 (Fullscreen / Hidden Bar)"
+              value: "3"
+    theme_color_mode:
+      name: "Top Bar Color Mode (Level 1 Only)"
+      description: "How the app colors the safe area behind the notch. Inherit attempts to pull the meta-theme color from your HA dashboard."
+      default: "inherit"
+      selector:
+        select:
+          options:
+            - label: "Inherit from Home Assistant"
+              value: "inherit"
+            - label: "Custom Color"
+              value: "custom"
+            - label: "Inherit with Custom Fallback"
+              value: "inherit_with_fallback"
+    custom_color:
+      name: "Custom Top Bar Color (Hex)"
+      description: "The hex color code to use if Custom or Fallback is selected (e.g., #03A9F4)."
+      default: "#000000"
+      selector:
+        text: {}
+    expiration_hours:
+      name: "Session Expiration (Hours)"
+      description: "Hours until the app logs out. Set to 0 for permanent access. Default: 336 (14 days)."
+      default: 336
+      selector:
+        number:
+          min: 0
+          max: 87600
+          mode: box
+
 generate_qr:
-  name: "Generate Casa QR Code"
-  description: "Generates an encrypted QR code payload for the Casa iOS app."
+  name: "Generate Casa QR Code [DEPRECATED]"
+  description: "[DEPRECATED] Please use the new 'provision' service with method: 'qr' instead. Generates an encrypted QR code payload for the Casa iOS app."
   fields:
     host_url:
       name: "Host URL"
@@ -241,8 +404,8 @@ scramble_guest_password:
         boolean: {}
 
 provision_ble_beacon:
-  name: "Provision Casa BLE Beacon"
-  description: "Generates an encrypted payload and pushes it directly to multiple ESPHome Bluetooth beacons."
+  name: "Provision Casa BLE Beacon [DEPRECATED]"
+  description: "[DEPRECATED] Please use the new 'provision' service with method: 'ble' instead. Generates an encrypted payload and pushes it directly to multiple ESPHome Bluetooth beacons."
   fields:
     esphome_service:
       name: "ESPHome Target Services"
