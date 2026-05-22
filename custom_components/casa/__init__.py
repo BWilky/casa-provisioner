@@ -24,6 +24,19 @@ def generate_random_password(length=12):
     chars = string.ascii_letters + string.digits
     return ''.join(secrets.choice(chars) for _ in range(length))
 
+def _encrypt_payload(payload_str: str, key_bytes: bytes) -> str:
+    """Helper to perform RSA OAEP encryption in the executor thread."""
+    public_key = serialization.load_pem_public_key(key_bytes)
+    ciphertext = public_key.encrypt(
+        payload_str.encode('utf-8'),
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    return base64.b64encode(ciphertext).decode('utf-8')
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
@@ -42,7 +55,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return
         try:
             elapsed = 0
-            poll_interval = 1
+            poll_interval = 2
             while elapsed < ttl_seconds:
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
@@ -95,7 +108,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         try:
             public_key_data = await hass.async_add_executor_job(read_public_key)
-            public_key = serialization.load_pem_public_key(public_key_data)
         except Exception as e:
             _LOGGER.error("CASA CRITICAL CRASH: Failed to load public key. Error: %s", str(e))
             return {"error": "Missing Public Key"}
@@ -149,7 +161,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         custom_color = str(service_data.get("custom_color", "#000000")).strip().replace("|", "")
         immersive_payload = f"{immersive_level},{theme_color_mode},{custom_color}"
 
-        expiration_hours = int(service_data.get("expiration_hours", 336))
+        val_hours = service_data.get("expiration_hours")
+        expiration_hours = int(val_hours) if val_hours is not None else 336
         if expiration_hours == 0:
             session_expiration_unix = 0
         else:
@@ -157,13 +170,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             session_expiration_unix = int(future_dt.timestamp())
 
         # Extract Time Windows
-        if "timeout_minutes" in service_data:
-            timeout_mins = int(service_data["timeout_minutes"])
+        val_timeout = service_data.get("timeout_minutes")
+        if val_timeout is not None:
+            timeout_mins = int(val_timeout)
         else:
             timeout_mins = 0 if method == "qr" else 5
 
         password_scramble = service_data.get("password_scramble", True)
-        password_scramble_in = int(service_data.get("password_scramble_in", 0))
+        val_scramble = service_data.get("password_scramble_in")
+        password_scramble_in = int(val_scramble) if val_scramble is not None else 0
 
         # Inheritance & Validation Logic
         if password_scramble:
@@ -185,9 +200,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             timeout_secs = 0
 
         users = await hass.auth.async_get_users()
-        target_user = next((u for u in users if u.name.casefold() == target_username.casefold()), None)
+        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
         if not target_user: 
             return {"error": "User not found"}
+
+        if getattr(target_user, "is_admin", False):
+            _LOGGER.error("CASA ERROR: Attempted to provision an admin user '%s'. Blocked.", target_username)
+            return {"error": "Cannot provision an admin user"}
 
         login_username = None
         for cred in target_user.credentials:
@@ -223,16 +242,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ]
         payload_string = "|".join(raw_payload_array)
 
-        # Encrypt
-        ciphertext = public_key.encrypt(
-            payload_string.encode('utf-8'),
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
+        # Encrypt in executor
+        try:
+            final_encrypted_b64 = await hass.async_add_executor_job(
+                _encrypt_payload, payload_string, public_key_data
             )
-        )
-        final_encrypted_b64 = base64.b64encode(ciphertext).decode('utf-8')
+        except Exception as e:
+            _LOGGER.error("CASA ERROR: Failed to encrypt payload. Error: %s", str(e))
+            return {"error": "Encryption failed"}
 
         # Setup method-specific fields
         delete_qr = False
@@ -326,6 +343,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         auth_provider.data.change_password(username, scrambled_password)
                         await auth_provider.data.async_save()
                         _LOGGER.info("CASA: Password for %s scrambled.", username)
+                        # Cancel active listener since code can no longer be redeemed
+                        listener_task = hass.data[DOMAIN]["listeners"].get(target_username)
+                        if listener_task:
+                            listener_task.cancel()
             except asyncio.CancelledError:
                 pass
 
@@ -404,6 +425,218 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.services.async_register(
         DOMAIN, "provision_ble_beacon", handle_provision_ble_beacon_legacy,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    # ==========================================
+    # SERVICE 2: REMOVE TOKEN
+    # ==========================================
+    async def handle_remove_token(call: ServiceCall):
+        token_id = str(call.data.get("token_id", "")).strip()
+        target_username = str(call.data.get("username", "")).strip()
+        
+        if not token_id or not target_username:
+            return
+            
+        users = await hass.auth.async_get_users()
+        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
+        if not target_user:
+            return
+            
+        if token_id == "*":
+            for token in list(target_user.refresh_tokens.values()):
+                hass.auth.async_remove_refresh_token(token)
+            _LOGGER.info("CASA: All active sessions terminated for %s.", target_username)
+        else:
+            token_to_remove = target_user.refresh_tokens.get(token_id)
+            if token_to_remove:
+                hass.auth.async_remove_refresh_token(token_to_remove)
+
+    hass.services.async_register(DOMAIN, "remove_token", handle_remove_token)
+
+    # ==========================================
+    # SERVICE 3: CREATE USER
+    # ==========================================
+    async def handle_create_user(call: ServiceCall):
+        target_name = str(call.data.get("name", "")).strip()
+        target_username = str(call.data.get("username", "")).strip().casefold()
+        target_password = str(call.data.get("password", "")).strip()
+        
+        local_only = call.data.get("local_only", True)
+        
+        if not target_name or not target_username:
+            return {"error": "Missing mandatory name or username"}
+
+        users = await hass.auth.async_get_users()
+        if any(u.name and u.name.casefold() == target_username for u in users) or any(u.name and u.name.casefold() == target_name.casefold() for u in users):
+            return {"error": "User with this name or username already exists"}
+
+        provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
+        if not provider:
+            return {"error": "Home Assistant core auth provider not found"}
+
+        if not target_password:
+            target_password = generate_random_password()
+
+        group_ids = ["system-users"]
+
+        new_user = await hass.auth.async_create_user(
+            name=target_name, 
+            group_ids=group_ids, 
+            local_only=local_only
+        )
+        
+        provider.data.add_auth(target_username, target_password)
+        await provider.data.async_save()
+
+        credentials = await provider.async_get_or_create_credentials({"username": target_username})
+        await hass.auth.async_link_user(new_user, credentials)
+
+        _LOGGER.info("CASA: New local user '%s' created (Local Only: %s).", target_username, local_only)
+
+        return {
+            "name": target_name,
+            "username": target_username,
+            "password": target_password,
+            "user_id": new_user.id,
+            "is_local_only": local_only
+        }
+
+    hass.services.async_register(
+        DOMAIN, "create_user", handle_create_user,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    # ==========================================
+    # SERVICE 4: LIST TOKENS
+    # ==========================================
+    async def handle_list_tokens(call: ServiceCall):
+        target_username = str(call.data.get("username", "")).strip()
+        
+        if not target_username:
+            return {"error": "Missing mandatory username"}
+
+        users = await hass.auth.async_get_users()
+        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
+        
+        if not target_user:
+            return {"error": "User not found"}
+
+        active_tokens = []
+        for token in target_user.refresh_tokens.values():
+            active_tokens.append({
+                "id": token.id,
+                "client_id": token.client_id,
+                "client_name": token.client_name,
+                "created_at": token.created_at.isoformat() if token.created_at else None,
+                "last_used_at": token.last_used_at.isoformat() if token.last_used_at else None,
+                "last_used_ip": token.last_used_ip
+            })
+
+        return {"tokens": active_tokens}
+
+    hass.services.async_register(
+        DOMAIN, "list_tokens", handle_list_tokens,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    # ==========================================
+    # SERVICE 5: HOUSEKEEPING
+    # ==========================================
+    async def handle_housekeeping(call: ServiceCall):
+        val_hours = call.data.get("hours_old")
+        hours_old = float(val_hours) if val_hours is not None else 24.0
+        prefix = str(call.data.get("prefix", "qr_")).strip()
+
+        if not prefix:
+            return {"error": "Prefix cannot be empty"}
+
+        def cleanup_files():
+            deleted_count = 0
+            www_dir = hass.config.path("www")
+            
+            if not os.path.exists(www_dir):
+                return 0
+
+            current_time = time.time()
+            cutoff_time = current_time - (hours_old * 3600)
+
+            for filename in os.listdir(www_dir):
+                if filename.startswith(prefix) and filename.endswith(".png"):
+                    filepath = os.path.join(www_dir, filename)
+                    if os.path.isfile(filepath):
+                        file_mtime = os.path.getmtime(filepath)
+                        if file_mtime < cutoff_time:
+                            try:
+                                os.remove(filepath)
+                                deleted_count += 1
+                            except Exception as e:
+                                _LOGGER.error("CASA ERROR: Failed to delete %s: %s", filename, e)
+            return deleted_count
+
+        deleted_count = await hass.async_add_executor_job(cleanup_files)
+        _LOGGER.info("CASA: Housekeeping deleted %s old files matching prefix '%s'.", deleted_count, prefix)
+
+        return {"deleted_count": deleted_count}
+
+    hass.services.async_register(
+        DOMAIN, "housekeeping", handle_housekeeping,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    # ==========================================
+    # SERVICE 6: SCRAMBLE USER PASSWORD
+    # ==========================================
+    async def handle_scramble_guest_password(call: ServiceCall):
+        target_username = str(call.data.get("username", "")).strip()
+        deauthenticate = call.data.get("deauthenticate", True)
+
+        if not target_username:
+            return {"error": "Missing mandatory username"}
+
+        users = await hass.auth.async_get_users()
+        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
+        
+        if not target_user:
+            return {"error": "User not found"}
+
+        if getattr(target_user, "is_admin", False):
+            _LOGGER.error("CASA ERROR: Attempted to scramble an admin user's password. Blocked.")
+            return {"error": "Cannot scramble password for an admin user"}
+
+        login_username = None
+        for cred in target_user.credentials:
+            if cred.auth_provider_type == "homeassistant":
+                login_username = cred.data.get("username")
+                break
+                
+        if not login_username: 
+            return {"error": "No local Home Assistant credentials found for this user"}
+
+        provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
+        if not provider:
+            return {"error": "Home Assistant core auth provider not found"}
+
+        new_password = generate_random_password()
+
+        provider.data.change_password(login_username, new_password)
+        await provider.data.async_save()
+        
+        _LOGGER.info("CASA: Password for user '%s' manually scrambled.", target_username)
+
+        if deauthenticate:
+            for token in list(target_user.refresh_tokens.values()):
+                hass.auth.async_remove_refresh_token(token)
+            _LOGGER.info("CASA: All active sessions for '%s' terminated.", target_username)
+
+        return {
+            "username": target_username,
+            "new_password": new_password,
+            "deauthenticated": deauthenticate
+        }
+
+    hass.services.async_register(
+        DOMAIN, "scramble_guest_password", handle_scramble_guest_password,
         supports_response=SupportsResponse.OPTIONAL
     )
 
