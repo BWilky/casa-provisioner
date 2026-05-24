@@ -161,6 +161,21 @@ provision:
           min: 0
           max: 87600
           mode: box
+    cache_control_hours:
+      name: "Cache Control (Hours)"
+      description: "Optional. How many hours the app should cache assets. If left blank, the app defaults to 48 hours."
+      selector:
+        number:
+          min: 0
+          max: 8760
+          step: any
+          mode: box
+    payload_decrypted:
+      name: "Plaintext Payload (No Encryption)"
+      description: "If enabled, the provisioning payload is generated in plaintext (not encrypted with the public key)."
+      default: false
+      selector:
+        boolean: {}
 
 generate_qr:
   name: "Generate Casa QR Code [DEPRECATED]"
@@ -547,3 +562,25 @@ clear_ble_beacon:
       selector:
         text:
           multiple: true
+
+remove_user:
+  name: "Remove Casa User"
+  description: "Deletes a local user account from Home Assistant and updates the Casa user tracker."
+  fields:
+    username:
+      name: "Username"
+      description: "The username of the user account to remove."
+      required: true
+      selector:
+        text: {}
+
+view_casa_users:
+  name: "View Casa Users"
+  description: "Lists users created via the integration, including optional deleted records."
+  fields:
+    include_deleted:
+      name: "Include Deleted Users"
+      description: "Whether to include users that have been deleted."
+      default: false
+      selector:
+        boolean: {}

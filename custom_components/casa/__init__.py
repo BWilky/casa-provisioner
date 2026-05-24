@@ -5,6 +5,7 @@ import string
 import secrets
 import base64
 import time
+import urllib.parse
 from datetime import timedelta
 
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
@@ -17,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.storage import Store
 from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,6 +48,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN].setdefault("timers", {})
     hass.data[DOMAIN].setdefault("listeners", {})
 
+    # Initialize user tracking store
+    STORAGE_KEY = "casa_users"
+    STORAGE_VERSION = 1
+    store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+    hass.data[DOMAIN]["store"] = store
+    
+    stored_data = await store.async_load()
+    if stored_data is None:
+        stored_data = {"users": {}}
+    hass.data[DOMAIN]["stored_data"] = stored_data
+
     async def _check_authorization(call: ServiceCall):
         """Check if the service call is authorized."""
         if not entry.options.get(CONF_ADMIN_SYSTEM_ONLY, True):
@@ -68,6 +81,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 call.context.user_id,
             )
             raise HomeAssistantError("Admin or system context is required to execute this service.")
+
+    async def _get_context_creator(context) -> str:
+        """Analyze the context to find who/what triggered the action."""
+        if context.user_id:
+            users = await hass.auth.async_get_users()
+            calling_user = next((u for u in users if u.id == context.user_id), None)
+            user_name = calling_user.name if calling_user else "Unknown User"
+            if context.parent_id:
+                return f"user: {user_name} ({context.user_id}) via automation/script"
+            return f"user: {user_name} ({context.user_id})"
+        elif context.parent_id:
+            return "automation or script"
+        else:
+            return "system"
 
     # ==========================================
     # SHARED: LOGIN LISTENER
@@ -223,6 +250,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             expiration_unix = 0
             timeout_secs = 0
 
+        # Extract Cache Control Hours
+        val_cache_control = service_data.get("cache_control_hours")
+        cache_control_hours_str = str(val_cache_control) if val_cache_control is not None else ""
+
         users = await hass.auth.async_get_users()
         target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
         if not target_user: 
@@ -258,22 +289,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.auth.async_remove_refresh_token(token)
             _LOGGER.debug("CASA: All existing sessions for '%s' terminated.", target_username)
 
-        # Construct Raw Payload (13 Variables)
+        # Construct Raw Payload (14 Variables)
         raw_payload_array = [
             str(final_server_url), str(login_username), str(login_password), allowed_paths_str,
             allowed_wifi, default_dashboard, immersive_payload, str(session_expiration_unix), str(expiration_unix), welcome_url,
-            target_pin, connect_wifi_ssid, connect_wifi_password
+            target_pin, connect_wifi_ssid, connect_wifi_password, cache_control_hours_str
         ]
         payload_string = "|".join(raw_payload_array)
 
-        # Encrypt in executor
-        try:
-            final_encrypted_b64 = await hass.async_add_executor_job(
-                _encrypt_payload, payload_string, public_key_data
-            )
-        except Exception as e:
-            _LOGGER.error("CASA ERROR: Failed to encrypt payload. Error: %s", str(e))
-            return {"error": "Encryption failed"}
+        # Encrypt in executor if not decrypted/plaintext
+        payload_decrypted = service_data.get("payload_decrypted", False)
+        if payload_decrypted:
+            final_payload = base64.b64encode(payload_string.encode('utf-8')).decode('utf-8')
+        else:
+            try:
+                final_payload = await hass.async_add_executor_job(
+                    _encrypt_payload, payload_string, public_key_data
+                )
+            except Exception as e:
+                _LOGGER.error("CASA ERROR: Failed to encrypt payload. Error: %s", str(e))
+                return {"error": "Encryption failed"}
 
         # Setup method-specific fields
         delete_qr = False
@@ -301,7 +336,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             else:
                 final_filename = f"qr_{login_username}_{int(time.time())}.png"
 
-            await hass.async_add_executor_job(create_qr_images, final_encrypted_b64)
+            # URL-encode the base64 payload and prepend the custom deep link scheme
+            url_encoded_payload = urllib.parse.quote(final_payload)
+            qr_content = f"hascasa://setup?data={url_encoded_payload}"
+
+            await hass.async_add_executor_job(create_qr_images, qr_content)
             _LOGGER.info("CASA: QR Code saved as %s.", final_filename)
 
         elif method == "ble":
@@ -312,7 +351,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         domain,
                         service,
                         {
-                            "payload": final_encrypted_b64,
+                            "payload": final_payload,
                             "expires_at": expiration_unix,
                             "pin": target_pin
                         },
@@ -523,6 +562,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         _LOGGER.info("CASA: New local user '%s' created (Local Only: %s).", target_username, local_only)
 
+        # Track the creation in the store
+        creator = await _get_context_creator(call.context)
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        stored_data["users"][new_user.id] = {
+            "user_id": new_user.id,
+            "username": target_username,
+            "name": target_name,
+            "created_at": dt_util.now().isoformat(),
+            "created_by": creator,
+            "deleted": False,
+            "deleted_at": None,
+            "deleted_by": None,
+        }
+        await hass.data[DOMAIN]["store"].async_write(stored_data)
+
         return {
             "name": target_name,
             "username": target_username,
@@ -707,8 +761,124 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 
         return {"status": "cleared", "successful_targets": successful_targets}
 
+    # ==========================================
+    # SERVICE: REMOVE USER
+    # ==========================================
+    async def handle_remove_user(call: ServiceCall):
+        await _check_authorization(call)
+        target_username = str(call.data.get("username", "")).strip()
+        if not target_username:
+            raise HomeAssistantError("Missing mandatory username.")
+
+        users = await hass.auth.async_get_users()
+        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
+        if not target_user:
+            # Let's check credentials username too, just in case
+            for u in users:
+                for cred in u.credentials:
+                    if cred.auth_provider_type == "homeassistant" and cred.data.get("username", "").casefold() == target_username.casefold():
+                        target_user = u
+                        break
+                if target_user:
+                    break
+
+        if not target_user:
+            raise HomeAssistantError(f"User '{target_username}' not found.")
+
+        if getattr(target_user, "is_admin", False) or target_user.is_owner:
+            raise HomeAssistantError("Cannot delete an admin or owner user account.")
+
+        user_id = target_user.id
+        user_name = target_user.name
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        if user_id not in stored_data["users"] or stored_data["users"][user_id].get("deleted", False):
+            raise HomeAssistantError(f"User '{target_username}' was not created via this integration and cannot be removed.")
+
+        # Perform deletion
+        await hass.auth.async_remove_user(target_user)
+        _LOGGER.info("CASA: Local user '%s' (ID: %s) removed.", target_username, user_id)
+
+        # Track the deletion in the store
+        deleter = await _get_context_creator(call.context)
+        
+        stored_data["users"][user_id].update({
+            "deleted": True,
+            "deleted_at": dt_util.now().isoformat(),
+            "deleted_by": deleter,
+        })
+        await hass.data[DOMAIN]["store"].async_write(stored_data)
+
+    # ==========================================
+    # SERVICE: VIEW CASA USERS
+    # ==========================================
+    async def handle_view_casa_users(call: ServiceCall):
+        await _check_authorization(call)
+        include_deleted = call.data.get("include_deleted", False)
+
+        users_in_ha = await hass.auth.async_get_users()
+        ha_user_ids = {u.id for u in users_in_ha}
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        store = hass.data[DOMAIN]["store"]
+
+        # Sync with actual Home Assistant state to detect out-of-band deletions
+        changed = False
+        for uid, udata in list(stored_data["users"].items()):
+            if uid not in ha_user_ids and not udata.get("deleted", False):
+                stored_data["users"][uid].update({
+                    "deleted": True,
+                    "deleted_at": dt_util.now().isoformat(),
+                    "deleted_by": "deleted outside integration (UI or other means)",
+                })
+                changed = True
+
+        if changed:
+            await store.async_write(stored_data)
+
+        result_users = []
+        for uid, udata in stored_data["users"].items():
+            is_deleted = udata.get("deleted", False)
+            if is_deleted and not include_deleted:
+                continue
+
+            user_info = {
+                "user_id": uid,
+                "name": udata.get("name"),
+                "username": udata.get("username"),
+                "created_at": udata.get("created_at"),
+                "created_by": udata.get("created_by"),
+                "deleted": is_deleted,
+                "deleted_at": udata.get("deleted_at"),
+                "deleted_by": udata.get("deleted_by"),
+            }
+
+            if not is_deleted:
+                ha_user = next((u for u in users_in_ha if u.id == uid), None)
+                if ha_user:
+                    user_info.update({
+                        "is_owner": ha_user.is_owner,
+                        "is_active": ha_user.is_active,
+                        "is_admin": getattr(ha_user, "is_admin", False),
+                        "local_only": getattr(ha_user, "local_only", False),
+                        "group_ids": ha_user.groups,
+                    })
+
+            result_users.append(user_info)
+
+        return {"users": result_users}
+
     hass.services.async_register(
         DOMAIN, "clear_ble_beacon", handle_clear_ble_beacon,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    hass.services.async_register(
+        DOMAIN, "remove_user", handle_remove_user
+    )
+
+    hass.services.async_register(
+        DOMAIN, "view_casa_users", handle_view_casa_users,
         supports_response=SupportsResponse.OPTIONAL
     )
 
@@ -724,6 +894,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "scramble_guest_password")
     hass.services.async_remove(DOMAIN, "provision_ble_beacon")
     hass.services.async_remove(DOMAIN, "clear_ble_beacon")
+    hass.services.async_remove(DOMAIN, "remove_user")
+    hass.services.async_remove(DOMAIN, "view_casa_users")
     
     for task in hass.data[DOMAIN].get("timers", {}).values():
         task.cancel()

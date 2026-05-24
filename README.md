@@ -48,6 +48,8 @@ Generates an encrypted provisioning payload. Returns response data.
 | `theme_color_mode` | string | Status bar color: `inherit` (default), `custom`, `inherit_with_fallback`. |
 | `custom_color` | string | Hex color for status bar (default: `#000000`). |
 | `expiration_hours` | integer | App session duration. Default: `336` (14 days). `0` for permanent. |
+| `cache_control_hours` | float | Optional. Custom duration for app asset caching. Defaults to `48` hours in the app. |
+| `payload_decrypted` | boolean | Optional. If `true`, the payload is not encrypted using the public key (useful for debugging). Default: `false`. |
 
 ### `casa.create_user`
 Creates a local Home Assistant user account.
@@ -58,6 +60,20 @@ Creates a local Home Assistant user account.
 | `username` | string | **Required**. Login username. |
 | `password` | string | Optional password (auto-generated if empty). |
 | `local_only` | boolean| Restrict user to local network. Default: `true`. |
+
+### `casa.remove_user`
+Deletes a local user account from Home Assistant and updates the Casa user tracker. **Safeguard:** This service only allows deleting users that were originally created via this integration.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `username` | string | **Required**. Username of the user to remove. |
+
+### `casa.view_casa_users`
+Lists user accounts created via the integration, including metadata about when they were created and by whom, as well as optional deleted records.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `include_deleted` | boolean| Include deleted user records. Default: `false`. |
 
 ### `casa.remove_token`
 Forcefully logs out a user session.
