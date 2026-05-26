@@ -172,7 +172,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.info("CASA: Generated static site key")
 
     if updated:
-        await store.async_write(stored_data)
+        await store.async_save(stored_data)
 
     hass.data[DOMAIN]["stored_data"] = stored_data
 
@@ -730,7 +730,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "deleted_at": None,
             "deleted_by": None,
         }
-        await hass.data[DOMAIN]["store"].async_write(stored_data)
+        await hass.data[DOMAIN]["store"].async_save(stored_data)
 
         return {
             "name": target_name,
@@ -959,7 +959,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "deleted_at": dt_util.now().isoformat(),
             "deleted_by": deleter,
         })
-        await hass.data[DOMAIN]["store"].async_write(stored_data)
+        await hass.data[DOMAIN]["store"].async_save(stored_data)
 
         return {
             "status": "removed",
@@ -991,7 +991,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 changed = True
 
         if changed:
-            await store.async_write(stored_data)
+            await store.async_save(stored_data)
 
         result_users = []
         for uid, udata in stored_data["users"].items():

@@ -51,7 +51,7 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
                 chars = string.ascii_letters + string.digits
                 stored_data["site_id"] = "".join(secrets.choice(chars) for _ in range(32))
                 stored_data["site_key"] = "".join(secrets.choice(chars) for _ in range(32))
-                await self.hass.data[DOMAIN]["store"].async_write(stored_data)
+                await self.hass.data[DOMAIN]["store"].async_save(stored_data)
 
             return self.async_create_entry(title="", data=user_input)
 
