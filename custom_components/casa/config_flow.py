@@ -47,7 +47,7 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
                 import string
                 import secrets
                 
-                stored_data = self.hass.data[DOMAIN]["stored_data"]
+                stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data", {})
                 chars = string.ascii_letters + string.digits
                 stored_data["site_id"] = "".join(secrets.choice(chars) for _ in range(32))
                 stored_data["site_key"] = "".join(secrets.choice(chars) for _ in range(32))
@@ -55,7 +55,7 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
 
             return self.async_create_entry(title="", data=user_input)
 
-        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data", {})
         site_id = stored_data.get("site_id", "Not Generated")
 
         # Format registered devices list
