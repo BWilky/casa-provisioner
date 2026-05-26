@@ -584,3 +584,43 @@ view_casa_users:
       default: false
       selector:
         boolean: {}
+
+register_device:
+  name: "Register Casa Device"
+  description: "Registers a device token for push notifications for the caller user context."
+  fields:
+    device_id:
+      name: "Device ID"
+      description: "A unique identifier for the device."
+      required: true
+      selector:
+        text: {}
+    push_token:
+      name: "Push Token"
+      description: "The raw APNs device token (hex)."
+      required: true
+      selector:
+        text: {}
+
+notify_user:
+  name: "Notify Casa User"
+  description: "Sends a push notification to all registered devices of a guest user via the Google Cloud relay."
+  fields:
+    username:
+      name: "Username"
+      description: "The guest user username to notify."
+      required: true
+      selector:
+        text: {}
+    title:
+      name: "Title"
+      description: "The title of the push notification."
+      required: true
+      selector:
+        text: {}
+    message:
+      name: "Message"
+      description: "The message content of the push notification."
+      required: true
+      selector:
+        text: {}

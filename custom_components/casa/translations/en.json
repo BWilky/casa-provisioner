@@ -18,8 +18,10 @@
     "step": {
       "init": {
         "title": "Configure Casa Settings",
+        "description": "Your current static Site ID is: {site_id}\n\nRegistered Push Notification Devices:\n{devices}",
         "data": {
-          "admin_system_only": "Admin / System context only (restrict direct service calls by non-admins)"
+          "admin_system_only": "Admin / System context only (restrict direct service calls by non-admins)",
+          "regenerate_site_id": "Regenerate Site ID (Warning: This will change the static token used for client connections)"
         }
       }
     }

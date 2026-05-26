@@ -6,6 +6,7 @@ import secrets
 import base64
 import time
 import urllib.parse
+import re
 from datetime import timedelta
 
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
@@ -19,7 +20,10 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS
+from homeassistant.components.http import HomeAssistantView
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from aiohttp import ClientTimeout
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +44,101 @@ def _encrypt_payload(payload_str: str, key_bytes: bytes) -> str:
     )
     return base64.b64encode(ciphertext).decode('utf-8')
 
+class CasaRegisterDeviceView(HomeAssistantView):
+    """View to register devices for push notifications."""
+
+    url = "/api/casa/register_device"
+    name = "api:casa:register_device"
+
+    def __init__(self, hass: HomeAssistant, register_device_func):
+        self.hass = hass
+        self.register_device_func = register_device_func
+
+    async def post(self, request):
+        """Handle device registration."""
+        user = request.get("hass_user")
+        if not user:
+            return self.json({"error": "Unauthorized"}, status_code=401)
+
+        try:
+            data = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = data.get("device_id")
+        push_token = data.get("push_token")
+
+        if not device_id or not push_token:
+            return self.json({"error": "Missing device_id or push_token"}, status_code=400)
+
+        try:
+            await self.register_device_func(user.id, device_id, push_token)
+        except HomeAssistantError as err:
+            return self.json({"error": str(err)}, status_code=400)
+        except Exception as err:
+            _LOGGER.exception("CASA: Unexpected error during device registration: %s", err)
+            return self.json({"error": "Internal server error"}, status_code=500)
+
+        return self.json({"status": "success"})
+
+    async def get(self, request):
+        """Check if a device is registered."""
+        user = request.get("hass_user")
+        if not user:
+            return self.json({"error": "Unauthorized"}, status_code=401)
+
+        device_id = request.query.get("device_id")
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        
+        # Check if the user is in stored_data and not deleted
+        if user.id not in stored_data["users"] or stored_data["users"][user.id].get("deleted", False):
+            return self.json({"registered": False, "reason": "User not found or deleted"}, status_code=200)
+
+        user_entry = stored_data["users"][user.id]
+        devices = user_entry.get("devices", {})
+        
+        if device_id in devices:
+            device_info = devices[device_id]
+            return self.json({
+                "registered": True,
+                "push_token": device_info.get("push_token"),
+                "registered_at": device_info.get("registered_at"),
+                "last_seen_at": device_info.get("last_seen_at")
+            })
+        
+        return self.json({"registered": False, "reason": "Device not registered for this user"}, status_code=200)
+
+    async def delete(self, request):
+        """Unregister/delete a device."""
+        user = request.get("hass_user")
+        if not user:
+            return self.json({"error": "Unauthorized"}, status_code=401)
+
+        device_id = request.query.get("device_id")
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        
+        if user.id not in stored_data["users"] or stored_data["users"][user.id].get("deleted", False):
+            return self.json({"error": "User not found or deleted"}, status_code=404)
+
+        user_entry = stored_data["users"][user.id]
+        devices = user_entry.get("devices", {})
+        
+        if device_id in devices:
+            devices.pop(device_id)
+            store = self.hass.data[DOMAIN]["store"]
+            store.async_delay_save(lambda: stored_data, 2.0)
+            _LOGGER.info("CASA: Unregistered device '%s' for user '%s'.", device_id, user_entry.get("username"))
+            return self.json({"status": "success"})
+            
+        return self.json({"error": "Device not found"}, status_code=404)
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
@@ -57,21 +156,72 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     stored_data = await store.async_load()
     if stored_data is None:
         stored_data = {"users": {}}
+
+    # Auto-generate site_id and site_key if not present
+    updated = False
+    if "site_id" not in stored_data:
+        chars = string.ascii_letters + string.digits
+        stored_data["site_id"] = "".join(secrets.choice(chars) for _ in range(32))
+        updated = True
+        _LOGGER.info("CASA: Generated static site ID")
+
+    if "site_key" not in stored_data:
+        chars = string.ascii_letters + string.digits
+        stored_data["site_key"] = "".join(secrets.choice(chars) for _ in range(32))
+        updated = True
+        _LOGGER.info("CASA: Generated static site key")
+
+    if updated:
+        await store.async_write(stored_data)
+
     hass.data[DOMAIN]["stored_data"] = stored_data
+
+    async def async_register_device(user_id: str, device_id: str, push_token: str) -> None:
+        """Register or update a device for a user."""
+        if DOMAIN not in hass.data:
+            raise HomeAssistantError("Casa integration is not loaded.")
+
+        if not re.match(r"^[0-9a-fA-F]{64}$", push_token):
+            raise HomeAssistantError("Invalid push token format. Must be a 64-character hex string.")
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        
+        if user_id not in stored_data["users"] or stored_data["users"][user_id].get("deleted", False):
+            raise HomeAssistantError("User was not created via this integration.")
+            
+        user_entry = stored_data["users"][user_id]
+        if "devices" not in user_entry:
+            user_entry["devices"] = {}
+
+        if device_id not in user_entry["devices"] and len(user_entry["devices"]) >= 100:
+            raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
+            
+        now_iso = dt_util.now().isoformat()
+        user_entry["devices"][device_id] = {
+            "push_token": push_token,
+            "registered_at": user_entry["devices"].get(device_id, {}).get("registered_at", now_iso),
+            "last_seen_at": now_iso
+        }
+        
+        store.async_delay_save(lambda: stored_data, 2.0)
+        _LOGGER.info("CASA: Registered device '%s' for user '%s'.", device_id, user_entry.get("username"))
+
+    # Register the HTTP view
+    hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
 
     async def _check_authorization(call: ServiceCall):
         """Check if the service call is authorized."""
+        users = await hass.auth.async_get_users()
         if not entry.options.get(CONF_ADMIN_SYSTEM_ONLY, True):
-            return
+            return users
 
         # System/Script contexts are allowed:
         # - call.context.parent_id is set when called from script/automation
         # - call.context.user_id is None when triggered by the system/time triggers
         if call.context.parent_id is not None or call.context.user_id is None:
-            return
+            return users
 
         # Directly called by a user. Verify that they are an admin.
-        users = await hass.auth.async_get_users()
         calling_user = next((u for u in users if u.id == call.context.user_id), None)
         if not calling_user or not getattr(calling_user, "is_admin", False):
             _LOGGER.warning(
@@ -81,6 +231,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 call.context.user_id,
             )
             raise HomeAssistantError("Admin or system context is required to execute this service.")
+        return users
 
     async def _get_context_creator(context) -> str:
         """Analyze the context to find who/what triggered the action."""
@@ -143,7 +294,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ==========================================
     # UNIFIED SERVICE: PROVISION (QR & BLE)
     # ==========================================
-    async def _provision_internal(service_data: dict) -> dict:
+    async def _provision_internal(service_data: dict, users: list = None) -> dict:
         method = str(service_data.get("method", "qr")).strip().lower()
         if method not in ("qr", "ble"):
             return {"error": f"Invalid method: {method}"}
@@ -254,7 +405,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         val_cache_control = service_data.get("cache_control_hours")
         cache_control_hours_str = str(val_cache_control) if val_cache_control is not None else ""
 
-        users = await hass.auth.async_get_users()
+        if users is None:
+            users = await hass.auth.async_get_users()
         target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
         if not target_user: 
             return {"error": "User not found"}
@@ -289,11 +441,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.auth.async_remove_refresh_token(token)
             _LOGGER.debug("CASA: All existing sessions for '%s' terminated.", target_username)
 
-        # Construct Raw Payload (14 Variables)
+        # Construct Raw Payload (15 Variables)
+        site_id = stored_data.get("site_id", "")
         raw_payload_array = [
             str(final_server_url), str(login_username), str(login_password), allowed_paths_str,
             allowed_wifi, default_dashboard, immersive_payload, str(session_expiration_unix), str(expiration_unix), welcome_url,
-            target_pin, connect_wifi_ssid, connect_wifi_password, cache_control_hours_str
+            target_pin, connect_wifi_ssid, connect_wifi_password, cache_control_hours_str,
+            str(site_id)
         ]
         payload_string = "|".join(raw_payload_array)
 
@@ -433,6 +587,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             listener_ttl = 300
 
+        # E4: Hard cap listener TTL to 30 minutes (1800 seconds)
+        listener_ttl = min(listener_ttl, 1800)
+
         if target_username in hass.data[DOMAIN]["listeners"]:
             hass.data[DOMAIN]["listeners"][target_username].cancel()
 
@@ -458,26 +615,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             }
 
     async def handle_provision(call: ServiceCall):
-        await _check_authorization(call)
-        return await _provision_internal(call.data)
+        users = await _check_authorization(call)
+        return await _provision_internal(call.data, users)
 
     async def handle_generate_qr_legacy(call: ServiceCall):
-        await _check_authorization(call)
+        users = await _check_authorization(call)
         _LOGGER.warning("CASA: generate_qr service is deprecated. Please use the provision service with method='qr' instead.")
         data = dict(call.data)
         data["method"] = "qr"
         if "qr_timeout_minutes" in data:
             data["timeout_minutes"] = data.pop("qr_timeout_minutes")
-        return await _provision_internal(data)
+        return await _provision_internal(data, users)
 
     async def handle_provision_ble_beacon_legacy(call: ServiceCall):
-        await _check_authorization(call)
+        users = await _check_authorization(call)
         _LOGGER.warning("CASA: provision_ble_beacon service is deprecated. Please use the provision service with method='ble' instead.")
         data = dict(call.data)
         data["method"] = "ble"
         if "ble_timeout_minutes" in data:
             data["timeout_minutes"] = data.pop("ble_timeout_minutes")
-        return await _provision_internal(data)
+        return await _provision_internal(data, users)
 
     hass.services.async_register(
         DOMAIN, "provision", handle_provision,
@@ -498,14 +655,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 2: REMOVE TOKEN
     # ==========================================
     async def handle_remove_token(call: ServiceCall):
-        await _check_authorization(call)
+        users = await _check_authorization(call)
         token_id = str(call.data.get("token_id", "")).strip()
         target_username = str(call.data.get("username", "")).strip()
         
         if not token_id or not target_username:
             return
             
-        users = await hass.auth.async_get_users()
         target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
         if not target_user:
             return
@@ -525,7 +681,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 3: CREATE USER
     # ==========================================
     async def handle_create_user(call: ServiceCall):
-        await _check_authorization(call)
+        users = await _check_authorization(call)
         target_name = str(call.data.get("name", "")).strip()
         target_username = str(call.data.get("username", "")).strip().casefold()
         target_password = str(call.data.get("password", "")).strip()
@@ -535,7 +691,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not target_name or not target_username:
             return {"error": "Missing mandatory name or username"}
 
-        users = await hass.auth.async_get_users()
         if any(u.name and u.name.casefold() == target_username for u in users) or any(u.name and u.name.casefold() == target_name.casefold() for u in users):
             return {"error": "User with this name or username already exists"}
 
@@ -594,13 +749,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 4: LIST TOKENS
     # ==========================================
     async def handle_list_tokens(call: ServiceCall):
-        await _check_authorization(call)
+        users = await _check_authorization(call)
         target_username = str(call.data.get("username", "")).strip()
         
         if not target_username:
             return {"error": "Missing mandatory username"}
 
-        users = await hass.auth.async_get_users()
         target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
         
         if not target_user:
@@ -673,14 +827,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE 6: SCRAMBLE USER PASSWORD
     # ==========================================
     async def handle_scramble_guest_password(call: ServiceCall):
-        await _check_authorization(call)
+        users = await _check_authorization(call)
         target_username = str(call.data.get("username", "")).strip()
         deauthenticate = call.data.get("deauthenticate", True)
 
         if not target_username:
             return {"error": "Missing mandatory username"}
 
-        users = await hass.auth.async_get_users()
         target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
         
         if not target_user:
@@ -717,7 +870,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         return {
             "username": target_username,
-            "new_password": new_password,
+            "scrambled": True,
             "deauthenticated": deauthenticate
         }
 
@@ -765,12 +918,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # SERVICE: REMOVE USER
     # ==========================================
     async def handle_remove_user(call: ServiceCall):
-        await _check_authorization(call)
+        users = await _check_authorization(call)
         target_username = str(call.data.get("username", "")).strip()
         if not target_username:
             raise HomeAssistantError("Missing mandatory username.")
 
-        users = await hass.auth.async_get_users()
         target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
         if not target_user:
             # Let's check credentials username too, just in case
@@ -809,14 +961,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         })
         await hass.data[DOMAIN]["store"].async_write(stored_data)
 
+        return {
+            "status": "removed",
+            "username": target_username,
+            "user_id": user_id
+        }
+
     # ==========================================
     # SERVICE: VIEW CASA USERS
     # ==========================================
     async def handle_view_casa_users(call: ServiceCall):
-        await _check_authorization(call)
+        users_in_ha = await _check_authorization(call)
         include_deleted = call.data.get("include_deleted", False)
 
-        users_in_ha = await hass.auth.async_get_users()
         ha_user_ids = {u.id for u in users_in_ha}
 
         stored_data = hass.data[DOMAIN]["stored_data"]
@@ -868,13 +1025,129 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         return {"users": result_users}
 
+    async def handle_register_device(call: ServiceCall):
+        user_id = call.context.user_id
+        if not user_id:
+            raise HomeAssistantError("User context required to register device.")
+
+        device_id = str(call.data.get("device_id", "")).strip()
+        push_token = str(call.data.get("push_token", "")).strip()
+
+        if not device_id or not push_token:
+            raise HomeAssistantError("Missing device_id or push_token.")
+
+        await async_register_device(user_id, device_id, push_token)
+        return {"status": "success"}
+
+    async def handle_notify_user(call: ServiceCall):
+        users = await _check_authorization(call)
+        username = str(call.data.get("username", "")).strip()
+        title = str(call.data.get("title", "")).strip()
+        message = str(call.data.get("message", "")).strip()
+
+        if not username or not title or not message:
+            raise HomeAssistantError("Missing username, title, or message.")
+
+        target_user = next((u for u in users if u.name and u.name.casefold() == username.casefold()), None)
+        
+        if not target_user:
+            for u in users:
+                for cred in u.credentials:
+                    if cred.auth_provider_type == "homeassistant" and cred.data.get("username", "").casefold() == username.casefold():
+                        target_user = u
+                        break
+                if target_user:
+                    break
+
+        if not target_user:
+            raise HomeAssistantError(f"User '{username}' not found.")
+
+        user_id = target_user.id
+        stored_data = hass.data[DOMAIN]["stored_data"]
+
+        if user_id not in stored_data["users"] or stored_data["users"][user_id].get("deleted", False):
+            raise HomeAssistantError(f"User '{username}' was not created via this integration.")
+
+        user_entry = stored_data["users"][user_id]
+        devices = user_entry.get("devices", {})
+
+        if not devices:
+            _LOGGER.warning("CASA: No registered devices found for user '%s'.", username)
+            return {"success": True, "sent_count": 0, "failed_count": 0}
+
+        session = async_get_clientsession(hass)
+        sem = asyncio.Semaphore(10)
+
+        tasks = []
+        for device_id, device_data in devices.items():
+            push_token = device_data.get("push_token")
+            if not push_token:
+                continue
+
+            payload = {
+                "title": title,
+                "message": message,
+                "target": push_token,
+                "site_id": stored_data.get("site_id"),
+                "site_key": stored_data.get("site_key")
+            }
+
+            async def send_post(tok=push_token, data_payload=dict(payload)):
+                async with sem:
+                    success = False
+                    for url in RELAY_URLS:
+                        try:
+                            async with session.post(url, json=data_payload, timeout=ClientTimeout(total=10)) as response:
+                                if response.status == 200:
+                                    _LOGGER.info("CASA: Notification successfully sent to token %s... via %s", tok[:10], url)
+                                    success = True
+                                    break
+                                
+                                text = await response.text()
+                                _LOGGER.warning("CASA: Relay %s returned status %s for token %s...: %s", url, response.status, tok[:10], text)
+                                if response.status < 500:
+                                    # Client-side error (4xx): don't attempt failover since it's a validation error
+                                    break
+                        except Exception as err:
+                            _LOGGER.warning("CASA: Failed to connect to relay %s for token %s...: %s", url, tok[:10], err)
+                    
+                    if not success:
+                        _LOGGER.error("CASA: Failed to send notification to token %s... after trying all relays", tok[:10])
+                    return success
+
+            tasks.append(send_post())
+
+        success_count = 0
+        failed_count = 0
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            success_count = sum(1 for r in results if r)
+            failed_count = len(results) - success_count
+
+        return {
+            "success": failed_count == 0,
+            "sent_count": success_count,
+            "failed_count": failed_count,
+        }
+
+    hass.services.async_register(
+        DOMAIN, "register_device", handle_register_device,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    hass.services.async_register(
+        DOMAIN, "notify_user", handle_notify_user,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
     hass.services.async_register(
         DOMAIN, "clear_ble_beacon", handle_clear_ble_beacon,
         supports_response=SupportsResponse.OPTIONAL
     )
 
     hass.services.async_register(
-        DOMAIN, "remove_user", handle_remove_user
+        DOMAIN, "remove_user", handle_remove_user,
+        supports_response=SupportsResponse.OPTIONAL
     )
 
     hass.services.async_register(
@@ -896,6 +1169,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "clear_ble_beacon")
     hass.services.async_remove(DOMAIN, "remove_user")
     hass.services.async_remove(DOMAIN, "view_casa_users")
+    hass.services.async_remove(DOMAIN, "register_device")
+    hass.services.async_remove(DOMAIN, "notify_user")
     
     for task in hass.data[DOMAIN].get("timers", {}).values():
         task.cancel()
