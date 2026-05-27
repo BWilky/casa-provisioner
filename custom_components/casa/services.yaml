@@ -178,6 +178,12 @@ provision:
       default: false
       selector:
         boolean: {}
+    push_notifications:
+      name: "Enable Push Notifications"
+      description: "If enabled, registers the device to receive push notifications. Disabled by default."
+      default: false
+      selector:
+        boolean: {}
 
 generate_qr:
   name: "Generate Casa QR Code [DEPRECATED]"
@@ -325,6 +331,12 @@ generate_qr:
           min: 0
           max: 87600
           mode: box
+    push_notifications:
+      name: "Enable Push Notifications"
+      description: "If enabled, registers the device to receive push notifications. Disabled by default."
+      default: false
+      selector:
+        boolean: {}
 
 remove_token:
   name: "Remove Casa Token"
@@ -552,6 +564,12 @@ provision_ble_beacon:
           min: 0
           max: 87600
           mode: box
+    push_notifications:
+      name: "Enable Push Notifications"
+      description: "If enabled, registers the device to receive push notifications. Disabled by default."
+      default: false
+      selector:
+        boolean: {}
 
 clear_ble_beacon:
   name: "Clear BLE Beacon"

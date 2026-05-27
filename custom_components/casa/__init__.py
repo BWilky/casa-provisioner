@@ -441,13 +441,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.auth.async_remove_refresh_token(token)
             _LOGGER.debug("CASA: All existing sessions for '%s' terminated.", target_username)
 
-        # Construct Raw Payload (15 Variables)
+        # Construct Raw Payload (16 Variables)
         site_id = stored_data.get("site_id", "")
+        enable_push = service_data.get("push_notifications", False)
         raw_payload_array = [
             str(final_server_url), str(login_username), str(login_password), allowed_paths_str,
             allowed_wifi, default_dashboard, immersive_payload, str(session_expiration_unix), str(expiration_unix), welcome_url,
             target_pin, connect_wifi_ssid, connect_wifi_password, cache_control_hours_str,
-            str(site_id)
+            str(site_id),
+            "true" if enable_push else "false"
         ]
         payload_string = "|".join(raw_payload_array)
 
