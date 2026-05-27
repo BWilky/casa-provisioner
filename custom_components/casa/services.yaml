@@ -665,3 +665,14 @@ notify_user:
       required: true
       selector:
         text: {}
+
+reload_device:
+  name: "Reload Casa Device"
+  description: "Sends a silent background push notification to clear cache and reload the default URL on a registered device."
+  fields:
+    device_id:
+      name: "Device ID"
+      description: "The unique identifier (UUID) of the target device to reload."
+      required: true
+      selector:
+        text: {}

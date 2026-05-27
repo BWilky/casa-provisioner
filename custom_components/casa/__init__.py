@@ -246,6 +246,7 @@ class CasaHeartbeatView(HomeAssistantView):
         ip_address = data.get("ip_address") or client_ip
         provisioned_at = data.get("provisioned_at")
         expires_at = data.get("expires_at")
+        current_url = data.get("current_url")
 
         try:
             await self.heartbeat_func(
@@ -255,7 +256,8 @@ class CasaHeartbeatView(HomeAssistantView):
                 refresh_token_id=refresh_token_id,
                 ip_address=ip_address,
                 provisioned_at=provisioned_at,
-                expires_at=expires_at
+                expires_at=expires_at,
+                current_url=current_url
             )
         except HomeAssistantError as err:
             return self.json({"error": str(err)}, status_code=400)
@@ -460,7 +462,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         refresh_token_id: str = None,
         ip_address: str = None,
         provisioned_at: str = None,
-        expires_at: str = None
+        expires_at: str = None,
+        current_url: str = None
     ) -> None:
         """Process heartbeat from a device."""
         if DOMAIN not in hass.data:
@@ -508,6 +511,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             device_info["provisioned_at"] = provisioned_at
         if expires_at is not None:
             device_info["expires_at"] = expires_at
+        if current_url is not None:
+            device_info["current_url"] = current_url
 
         device_info["last_seen_at"] = now_iso
 
@@ -1562,6 +1567,77 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "failed_count": failed_count,
         }
 
+    async def handle_reload_device(call: ServiceCall):
+        users = await _check_authorization(call)
+        device_id = str(call.data.get("device_id", "")).strip()
+
+        if not device_id:
+            raise HomeAssistantError("Missing device_id parameter.")
+
+        # Find the device in stored_data
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        device_info = {}
+        username = "Unknown"
+        
+        # 1. Search in integration users
+        for uid, udata in stored_data.get("users", {}).items():
+            if device_id in udata.get("devices", {}):
+                device_info = udata["devices"][device_id]
+                username = udata.get("username", "Unknown")
+                break
+                
+        # 2. Search in native users if not found
+        if not device_info:
+            for uid, devices in stored_data.get("native_devices", {}).items():
+                if device_id in devices:
+                    device_info = devices[device_id]
+                    ha_user = next((u for u in users if u.id == uid), None)
+                    username = ha_user.name if ha_user else uid
+                    break
+
+        if not device_info:
+            raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
+
+        push_token = device_info.get("push_token")
+        if not push_token:
+            raise HomeAssistantError(f"No push notification token registered for device '{device_id}'.")
+
+        # Send silent push
+        session = async_get_clientsession(hass)
+        payload = {
+            "title": "",
+            "message": "",
+            "target": push_token,
+            "site_id": stored_data.get("site_id"),
+            "site_key": stored_data.get("site_key"),
+            "command": "clear_cache_and_reload"
+        }
+
+        _LOGGER.info(
+            "CASA: Service called to send silent reload push to device '%s' of user '%s'. Target: %s",
+            device_id, username, push_token[:10] + "..."
+        )
+
+        success = False
+        for url in RELAY_URLS:
+            try:
+                _LOGGER.info("CASA: Posting reload payload to relay %s", url)
+                async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        _LOGGER.info("CASA: Reload command successfully sent to token %s... via %s", push_token[:10], url)
+                        success = True
+                        break
+                    
+                    text = await response.text()
+                    _LOGGER.warning("CASA: Relay %s returned status %s: %s", url, response.status, text)
+            except Exception as err:
+                _LOGGER.warning("CASA: Failed to connect to relay %s: %s", url, err)
+
+        if not success:
+            raise HomeAssistantError("Failed to deliver reload command to any Casa push relay.")
+
+        return {"status": "success"}
+
     hass.services.async_register(
         DOMAIN, "register_device", handle_register_device,
         supports_response=SupportsResponse.OPTIONAL
@@ -1587,13 +1663,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.OPTIONAL
     )
 
-    # Set up sensor platform
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
+    hass.services.async_register(
+        DOMAIN, "reload_device", handle_reload_device,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    # Set up platforms
+    await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "button"])
 
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, ["sensor"])
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, ["sensor", "button"])
     
     hass.services.async_remove(DOMAIN, "provision")
     hass.services.async_remove(DOMAIN, "generate_qr")
@@ -1608,6 +1689,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "view_casa_users")
     hass.services.async_remove(DOMAIN, "register_device")
     hass.services.async_remove(DOMAIN, "notify_user")
+    hass.services.async_remove(DOMAIN, "reload_device")
     
     for task in hass.data[DOMAIN].get("timers", {}).values():
         task.cancel()

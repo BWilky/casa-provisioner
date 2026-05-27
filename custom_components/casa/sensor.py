@@ -28,6 +28,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
             CasaDevicePushStatusSensor(hass, device_id, username, is_native),
             CasaDeviceLastSeenSensor(hass, device_id, username, is_native),
             CasaDeviceExpiresSensor(hass, device_id, username, is_native),
+            CasaDeviceCurrentURLSensor(hass, device_id, username, is_native),
         ]
 
     existing_entities = []
@@ -285,3 +286,29 @@ class CasaDeviceExpiresSensor(CasaDeviceSensorBase):
             except Exception:
                 pass
         return None
+
+
+class CasaDeviceCurrentURLSensor(CasaDeviceSensorBase):
+    """Sensor for currently loaded WebKit URL."""
+    sensor_type = "current_url"
+    _attr_icon = "mdi:web"
+
+    @property
+    def name(self):
+        return "Current URL"
+
+    @property
+    def native_value(self):
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_info = {}
+        if not self.is_native:
+            for u in stored_data.get("users", {}).values():
+                if self.device_id in u.get("devices", {}):
+                    device_info = u["devices"][self.device_id]
+                    break
+        else:
+            for devs in stored_data.get("native_devices", {}).values():
+                if self.device_id in devs:
+                    device_info = devs[self.device_id]
+                    break
+        return device_info.get("current_url", "unknown")
