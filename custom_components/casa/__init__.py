@@ -1498,6 +1498,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for device_id, device_data in devices.items():
             push_token = device_data.get("push_token")
             if not push_token:
+                _LOGGER.warning("CASA: Device '%s' for user '%s' has no push token registered.", device_id, username)
                 continue
 
             payload = {
@@ -1508,11 +1509,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "site_key": stored_data.get("site_key")
             }
 
+            _LOGGER.info(
+                "CASA: Attempting to send push notification to user '%s' device '%s'. Target (obfuscated): %s, Site ID: %s",
+                username,
+                device_id,
+                push_token[:10] + "..." if isinstance(push_token, str) and len(push_token) > 10 else "invalid",
+                stored_data.get("site_id")
+            )
+            _LOGGER.debug(
+                "CASA DEBUG PAYLOAD: Target=%s, SiteID=%s, SiteKey=%s",
+                push_token,
+                stored_data.get("site_id"),
+                stored_data.get("site_key")
+            )
+
             async def send_post(tok=push_token, data_payload=dict(payload)):
                 async with sem:
                     success = False
                     for url in RELAY_URLS:
                         try:
+                            _LOGGER.info("CASA: Posting payload to relay %s", url)
                             async with session.post(url, json=data_payload, timeout=ClientTimeout(total=10)) as response:
                                 if response.status == 200:
                                     _LOGGER.info("CASA: Notification successfully sent to token %s... via %s", tok[:10], url)

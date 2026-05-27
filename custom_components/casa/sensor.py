@@ -24,6 +24,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
         return [
             CasaDeviceIPSensor(hass, device_id, username, is_native),
             CasaDeviceTokenSensor(hass, device_id, username, is_native),
+            CasaDevicePushTokenSensor(hass, device_id, username, is_native),
+            CasaDevicePushStatusSensor(hass, device_id, username, is_native),
             CasaDeviceLastSeenSensor(hass, device_id, username, is_native),
             CasaDeviceExpiresSensor(hass, device_id, username, is_native),
         ]
@@ -147,6 +149,76 @@ class CasaDeviceTokenSensor(CasaDeviceSensorBase):
                     break
         token = device_info.get("last_12_token")
         return f"...{token}" if token else "no token"
+
+
+class CasaDevicePushTokenSensor(CasaDeviceSensorBase):
+    """Sensor for device push notification token."""
+    sensor_type = "push_token"
+    _attr_icon = "mdi:bell-ring-outline"
+
+    @property
+    def name(self):
+        return "Push Token"
+
+    @property
+    def native_value(self):
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_info = {}
+        if not self.is_native:
+            for u in stored_data.get("users", {}).values():
+                if self.device_id in u.get("devices", {}):
+                    device_info = u["devices"][self.device_id]
+                    break
+        else:
+            for devs in stored_data.get("native_devices", {}).values():
+                if self.device_id in devs:
+                    device_info = devs[self.device_id]
+                    break
+        token = device_info.get("push_token")
+        return token if token else "Not Registered"
+
+
+class CasaDevicePushStatusSensor(CasaDeviceSensorBase):
+    """Sensor for push notification registration status."""
+    sensor_type = "push_status"
+
+    @property
+    def name(self):
+        return "Push Registration"
+
+    @property
+    def icon(self):
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_info = {}
+        if not self.is_native:
+            for u in stored_data.get("users", {}).values():
+                if self.device_id in u.get("devices", {}):
+                    device_info = u["devices"][self.device_id]
+                    break
+        else:
+            for devs in stored_data.get("native_devices", {}).values():
+                if self.device_id in devs:
+                    device_info = devs[self.device_id]
+                    break
+        has_token = bool(device_info.get("push_token"))
+        return "mdi:bell-check" if has_token else "mdi:bell-off"
+
+    @property
+    def native_value(self):
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_info = {}
+        if not self.is_native:
+            for u in stored_data.get("users", {}).values():
+                if self.device_id in u.get("devices", {}):
+                    device_info = u["devices"][self.device_id]
+                    break
+        else:
+            for devs in stored_data.get("native_devices", {}).values():
+                if self.device_id in devs:
+                    device_info = devs[self.device_id]
+                    break
+        has_token = bool(device_info.get("push_token"))
+        return "Registered" if has_token else "Not Registered"
 
 
 class CasaDeviceLastSeenSensor(CasaDeviceSensorBase):
