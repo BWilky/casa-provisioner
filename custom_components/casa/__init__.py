@@ -443,13 +443,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Construct Raw Payload (16 Variables)
         site_id = stored_data.get("site_id", "")
-        enable_push = service_data.get("push_notifications", False)
+        push_val = service_data.get("push_notifications", "false")
+        if push_val is True or (isinstance(push_val, str) and push_val.lower() == "true"):
+            normalized_push = "true"
+        elif isinstance(push_val, str) and push_val.lower() == "mandatory":
+            normalized_push = "mandatory"
+        else:
+            normalized_push = "false"
+
         raw_payload_array = [
             str(final_server_url), str(login_username), str(login_password), allowed_paths_str,
             allowed_wifi, default_dashboard, immersive_payload, str(session_expiration_unix), str(expiration_unix), welcome_url,
             target_pin, connect_wifi_ssid, connect_wifi_password, cache_control_hours_str,
             str(site_id),
-            "true" if enable_push else "false"
+            normalized_push
         ]
         payload_string = "|".join(raw_payload_array)
 

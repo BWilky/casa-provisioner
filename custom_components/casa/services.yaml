@@ -180,10 +180,17 @@ provision:
         boolean: {}
     push_notifications:
       name: "Enable Push Notifications"
-      description: "If enabled, registers the device to receive push notifications. Disabled by default."
-      default: false
+      description: "Choose push notifications behavior: Disabled, Enabled, or Mandatory (device must register and stay registered)."
+      default: "false"
       selector:
-        boolean: {}
+        select:
+          options:
+            - label: "Disabled"
+              value: "false"
+            - label: "Enabled"
+              value: "true"
+            - label: "Mandatory"
+              value: "mandatory"
 
 generate_qr:
   name: "Generate Casa QR Code [DEPRECATED]"
@@ -333,10 +340,17 @@ generate_qr:
           mode: box
     push_notifications:
       name: "Enable Push Notifications"
-      description: "If enabled, registers the device to receive push notifications. Disabled by default."
-      default: false
+      description: "Choose push notifications behavior: Disabled, Enabled, or Mandatory (device must register and stay registered)."
+      default: "false"
       selector:
-        boolean: {}
+        select:
+          options:
+            - label: "Disabled"
+              value: "false"
+            - label: "Enabled"
+              value: "true"
+            - label: "Mandatory"
+              value: "mandatory"
 
 remove_token:
   name: "Remove Casa Token"
@@ -566,10 +580,17 @@ provision_ble_beacon:
           mode: box
     push_notifications:
       name: "Enable Push Notifications"
-      description: "If enabled, registers the device to receive push notifications. Disabled by default."
-      default: false
+      description: "Choose push notifications behavior: Disabled, Enabled, or Mandatory (device must register and stay registered)."
+      default: "false"
       selector:
-        boolean: {}
+        select:
+          options:
+            - label: "Disabled"
+              value: "false"
+            - label: "Enabled"
+              value: "true"
+            - label: "Mandatory"
+              value: "mandatory"
 
 clear_ble_beacon:
   name: "Clear BLE Beacon"
