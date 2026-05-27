@@ -296,7 +296,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ==========================================
     async def _provision_internal(service_data: dict, users: list = None) -> dict:
         method = str(service_data.get("method", "qr")).strip().lower()
-        if method not in ("qr", "ble"):
+        if method not in ("qr", "ble", "deep_link"):
             return {"error": f"Invalid method: {method}"}
 
         _LOGGER.debug("CASA: Internal provision function triggered (method: %s).", method)
@@ -482,6 +482,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             img.save(dashboard_path)
             return final_filename
 
+        url_encoded_payload = urllib.parse.quote(final_payload)
+        deep_link = f"hascasa://setup?data={url_encoded_payload}"
+
         if method == "qr":
             delete_qr = service_data.get("delete_qr_after_window", True) if timeout_mins > 0 else False
             qr_filename_input = str(service_data.get("qr_filename", "")).strip()
@@ -490,11 +493,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             else:
                 final_filename = f"qr_{login_username}_{int(time.time())}.png"
 
-            # URL-encode the base64 payload and prepend the custom deep link scheme
-            url_encoded_payload = urllib.parse.quote(final_payload)
-            qr_content = f"hascasa://setup?data={url_encoded_payload}"
-
-            await hass.async_add_executor_job(create_qr_images, qr_content)
+            await hass.async_add_executor_job(create_qr_images, deep_link)
             _LOGGER.info("CASA: QR Code saved as %s.", final_filename)
 
         elif method == "ble":
@@ -570,7 +569,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if target_username in hass.data[DOMAIN]["timers"]:
             hass.data[DOMAIN]["timers"][target_username].cancel()
 
-        if (method == "qr" and timeout_mins > 0) or password_scramble:
+        if (method in ("qr", "deep_link") and timeout_mins > 0) or password_scramble:
             countdown_task = hass.async_create_task(
                 _cleanup_sequence(login_username, provider, timeout_secs, scramble_timeout_secs, password_scramble, delete_qr, final_filename)
             )
@@ -603,6 +602,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "method": "qr",
                 "filename": final_filename,
                 "url_path": f"/local/{final_filename}",
+                "expires_at": expiration_unix,
+                "deep_link": deep_link
+            }
+        elif method == "deep_link":
+            return {
+                "method": "deep_link",
+                "deep_link": deep_link,
                 "expires_at": expiration_unix
             }
         else:
