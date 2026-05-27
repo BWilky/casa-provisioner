@@ -66,15 +66,23 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
                 continue
             username = user_data.get("username", "Unknown User")
             for device_id, device_info in user_data.get("devices", {}).items():
-                last_seen = device_info.get("last_seen_at", "Never")
-                if last_seen != "Never":
-                    try:
-                        last_seen = last_seen.split(".")[0].replace("T", " ")
-                    except Exception:
-                        pass
-                ip = device_info.get("ip_address", "unknown IP")
-                token_suffix = device_info.get("last_12_token", "no token")
-                devices_list.append(f"- {username}: {device_id} (IP: {ip}, token: ...{token_suffix}, seen {last_seen})")
+                try:
+                    last_seen = device_info.get("last_seen_at", "Never")
+                    if last_seen != "Never":
+                        try:
+                            last_seen = str(last_seen).split(".")[0].replace("T", " ")
+                        except Exception:
+                            pass
+                    ip = device_info.get("ip_address", "unknown IP")
+                    token_suffix = device_info.get("last_12_token", "no token")
+                    push_token = device_info.get("push_token")
+                    if isinstance(push_token, str) and push_token:
+                        push_info = f"push: ...{push_token[-12:]}"
+                    else:
+                        push_info = "push: Not Registered"
+                    devices_list.append(f"- {username}: {device_id} (IP: {ip}, token: ...{token_suffix}, {push_info}, seen {last_seen})")
+                except Exception as err:
+                    devices_list.append(f"- {username}: {device_id} (Error loading: {err})")
 
         native_devices = stored_data.get("native_devices", {})
         if native_devices:
@@ -83,15 +91,23 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
             for user_id, devices in native_devices.items():
                 username = user_map.get(user_id) or f"Native User {user_id[:6]}"
                 for device_id, device_info in devices.items():
-                    last_seen = device_info.get("last_seen_at", "Never")
-                    if last_seen != "Never":
-                        try:
-                            last_seen = last_seen.split(".")[0].replace("T", " ")
-                        except Exception:
-                            pass
-                    ip = device_info.get("ip_address", "unknown IP")
-                    token_suffix = device_info.get("last_12_token", "no token")
-                    devices_list.append(f"- {username}: {device_id} (IP: {ip}, token: ...{token_suffix}, seen {last_seen})")
+                    try:
+                        last_seen = device_info.get("last_seen_at", "Never")
+                        if last_seen != "Never":
+                            try:
+                                last_seen = str(last_seen).split(".")[0].replace("T", " ")
+                            except Exception:
+                                pass
+                        ip = device_info.get("ip_address", "unknown IP")
+                        token_suffix = device_info.get("last_12_token", "no token")
+                        push_token = device_info.get("push_token")
+                        if isinstance(push_token, str) and push_token:
+                            push_info = f"push: ...{push_token[-12:]}"
+                        else:
+                            push_info = "push: Not Registered"
+                        devices_list.append(f"- {username}: {device_id} (IP: {ip}, token: ...{token_suffix}, {push_info}, seen {last_seen})")
+                    except Exception as err:
+                        devices_list.append(f"- {username}: {device_id} (Error loading: {err})")
 
         devices_str = "\n".join(devices_list) if devices_list else "No devices registered."
 
