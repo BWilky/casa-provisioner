@@ -1,7 +1,7 @@
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, CONF_CREATE_DEVICES
 
 class CasaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Casa."""
@@ -23,6 +23,7 @@ class CasaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=vol.Schema({
                 vol.Required(CONF_ADMIN_SYSTEM_ONLY, default=True): bool,
+                vol.Required(CONF_CREATE_DEVICES, default=True): bool,
             })
         )
 
@@ -71,7 +72,26 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
                         last_seen = last_seen.split(".")[0].replace("T", " ")
                     except Exception:
                         pass
-                devices_list.append(f"- {username}: {device_id} (seen {last_seen})")
+                ip = device_info.get("ip_address", "unknown IP")
+                token_suffix = device_info.get("last_12_token", "no token")
+                devices_list.append(f"- {username}: {device_id} (IP: {ip}, token: ...{token_suffix}, seen {last_seen})")
+
+        native_devices = stored_data.get("native_devices", {})
+        if native_devices:
+            users = await self.hass.auth.async_get_users()
+            user_map = {u.id: (u.name or u.id) for u in users}
+            for user_id, devices in native_devices.items():
+                username = user_map.get(user_id) or f"Native User {user_id[:6]}"
+                for device_id, device_info in devices.items():
+                    last_seen = device_info.get("last_seen_at", "Never")
+                    if last_seen != "Never":
+                        try:
+                            last_seen = last_seen.split(".")[0].replace("T", " ")
+                        except Exception:
+                            pass
+                    ip = device_info.get("ip_address", "unknown IP")
+                    token_suffix = device_info.get("last_12_token", "no token")
+                    devices_list.append(f"- {username}: {device_id} (IP: {ip}, token: ...{token_suffix}, seen {last_seen})")
 
         devices_str = "\n".join(devices_list) if devices_list else "No devices registered."
 
@@ -81,6 +101,10 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Required(
                     CONF_ADMIN_SYSTEM_ONLY,
                     default=self.config_entry.options.get(CONF_ADMIN_SYSTEM_ONLY, True)
+                ): bool,
+                vol.Required(
+                    CONF_CREATE_DEVICES,
+                    default=self.config_entry.options.get(CONF_CREATE_DEVICES, True)
                 ): bool,
                 vol.Optional("regenerate_site_id", default=False): bool,
             }),

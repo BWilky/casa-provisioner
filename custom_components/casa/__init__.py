@@ -20,7 +20,7 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, CONF_CREATE_DEVICES
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from aiohttp import ClientTimeout
@@ -43,6 +43,24 @@ def _encrypt_payload(payload_str: str, key_bytes: bytes) -> str:
         )
     )
     return base64.b64encode(ciphertext).decode('utf-8')
+
+
+def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
+    """Extract refresh_token_id (jti) from the bearer access token JWT payload."""
+    import base64
+    import json
+    try:
+        parts = jwt_str.split('.')
+        if len(parts) == 3:
+            payload_b64 = parts[1]
+            payload_b64 += '=' * (4 - len(payload_b64) % 4)
+            payload_bytes = base64.urlsafe_b64decode(payload_b64)
+            payload = json.loads(payload_bytes.decode('utf-8'))
+            return payload.get("jti")
+    except Exception:
+        pass
+    return None
+
 
 class CasaRegisterDeviceView(HomeAssistantView):
     """View to register devices for push notifications."""
@@ -68,11 +86,27 @@ class CasaRegisterDeviceView(HomeAssistantView):
         device_id = data.get("device_id")
         push_token = data.get("push_token")
 
-        if not device_id or not push_token:
-            return self.json({"error": "Missing device_id or push_token"}, status_code=400)
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        # Extract bearer token details from request headers
+        auth_header = request.headers.get("Authorization")
+        last_12_token = None
+        refresh_token_id = None
+        if auth_header and auth_header.startswith("Bearer "):
+            bearer_token = auth_header[7:].strip()
+            last_12_token = bearer_token[-12:]
+            refresh_token_id = _get_refresh_token_id_from_jwt(bearer_token)
+
+        # Determine the client's IP address from request headers or remote peer
+        client_ip = request.headers.get("X-Forwarded-For")
+        if client_ip:
+            client_ip = client_ip.split(",")[0].strip()
+        else:
+            client_ip = request.headers.get("X-Real-IP") or request.remote
 
         try:
-            await self.register_device_func(user.id, device_id, push_token)
+            await self.register_device_func(user.id, device_id, push_token, last_12_token, refresh_token_id, client_ip)
         except HomeAssistantError as err:
             return self.json({"error": str(err)}, status_code=400)
         except Exception as err:
@@ -93,14 +127,28 @@ class CasaRegisterDeviceView(HomeAssistantView):
 
         stored_data = self.hass.data[DOMAIN]["stored_data"]
         
-        # Check if the user is in stored_data and not deleted
-        if user.id not in stored_data["users"] or stored_data["users"][user.id].get("deleted", False):
-            return self.json({"registered": False, "reason": "User not found or deleted"}, status_code=200)
-
-        user_entry = stored_data["users"][user.id]
-        devices = user_entry.get("devices", {})
+        # Check if the user is an active integration user
+        if user.id in stored_data["users"] and not stored_data["users"][user.id].get("deleted", False):
+            devices = stored_data["users"][user.id].get("devices", {})
+        else:
+            native_devices = stored_data.get("native_devices", {})
+            devices = native_devices.get(user.id, {})
         
         if device_id in devices:
+            devices[device_id]["last_seen_at"] = dt_util.now().isoformat()
+            
+            # Extract and update active token details if available
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                bearer_token = auth_header[7:].strip()
+                devices[device_id]["last_12_token"] = bearer_token[-12:]
+                refresh_token_id = _get_refresh_token_id_from_jwt(bearer_token)
+                if refresh_token_id:
+                    devices[device_id]["refresh_token_id"] = refresh_token_id
+
+            store = self.hass.data[DOMAIN]["store"]
+            store.async_delay_save(lambda: stored_data, 2.0)
+            
             device_info = devices[device_id]
             return self.json({
                 "registered": True,
@@ -123,20 +171,99 @@ class CasaRegisterDeviceView(HomeAssistantView):
 
         stored_data = self.hass.data[DOMAIN]["stored_data"]
         
-        if user.id not in stored_data["users"] or stored_data["users"][user.id].get("deleted", False):
-            return self.json({"error": "User not found or deleted"}, status_code=404)
-
-        user_entry = stored_data["users"][user.id]
-        devices = user_entry.get("devices", {})
+        if user.id in stored_data["users"] and not stored_data["users"][user.id].get("deleted", False):
+            user_entry = stored_data["users"][user.id]
+            devices = user_entry.get("devices", {})
+            username = user_entry.get("username")
+        else:
+            native_devices = stored_data.setdefault("native_devices", {})
+            if user.id in native_devices:
+                devices = native_devices[user.id]
+                username = user.name or user.id
+            else:
+                return self.json({"error": "User not found or deleted"}, status_code=404)
         
         if device_id in devices:
             devices.pop(device_id)
             store = self.hass.data[DOMAIN]["store"]
             store.async_delay_save(lambda: stored_data, 2.0)
-            _LOGGER.info("CASA: Unregistered device '%s' for user '%s'.", device_id, user_entry.get("username"))
+            
+            # Remove from Home Assistant Device Registry
+            from homeassistant.helpers import device_registry as dr
+            dev_reg = dr.async_get(self.hass)
+            device_entry = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+            if device_entry:
+                dev_reg.async_remove_device(device_entry.id)
+                
+            _LOGGER.info("CASA: Unregistered device '%s' for user '%s'.", device_id, username)
             return self.json({"status": "success"})
             
         return self.json({"error": "Device not found"}, status_code=404)
+
+
+class CasaHeartbeatView(HomeAssistantView):
+    """View to handle heartbeats from devices."""
+
+    url = "/api/casa/heartbeat"
+    name = "api:casa:heartbeat"
+
+    def __init__(self, hass: HomeAssistant, heartbeat_func):
+        self.hass = hass
+        self.heartbeat_func = heartbeat_func
+
+    async def post(self, request):
+        """Handle heartbeat ping."""
+        user = request.get("hass_user")
+        if not user:
+            return self.json({"error": "Unauthorized"}, status_code=401)
+
+        try:
+            data = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = data.get("device_id")
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        # Extract bearer token details from request headers
+        auth_header = request.headers.get("Authorization")
+        last_12_token = None
+        refresh_token_id = None
+        if auth_header and auth_header.startswith("Bearer "):
+            bearer_token = auth_header[7:].strip()
+            last_12_token = bearer_token[-12:]
+            refresh_token_id = _get_refresh_token_id_from_jwt(bearer_token)
+
+        # Determine the client's IP address from request headers or remote peer
+        client_ip = request.headers.get("X-Forwarded-For")
+        if client_ip:
+            client_ip = client_ip.split(",")[0].strip()
+        else:
+            client_ip = request.headers.get("X-Real-IP") or request.remote
+
+        last_12_token = data.get("last_12_token") or last_12_token
+        ip_address = data.get("ip_address") or client_ip
+        provisioned_at = data.get("provisioned_at")
+        expires_at = data.get("expires_at")
+
+        try:
+            await self.heartbeat_func(
+                user.id,
+                device_id,
+                last_12_token=last_12_token,
+                refresh_token_id=refresh_token_id,
+                ip_address=ip_address,
+                provisioned_at=provisioned_at,
+                expires_at=expires_at
+            )
+        except HomeAssistantError as err:
+            return self.json({"error": str(err)}, status_code=400)
+        except Exception as err:
+            _LOGGER.exception("CASA: Unexpected error during heartbeat: %s", err)
+            return self.json({"error": "Internal server error"}, status_code=500)
+
+        return self.json({"status": "success"})
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -176,38 +303,243 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN]["stored_data"] = stored_data
 
-    async def async_register_device(user_id: str, device_id: str, push_token: str) -> None:
+    create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
+    
+    if create_devices:
+        # Register all existing devices in the Device Registry
+        from homeassistant.helpers import device_registry as dr
+        dev_reg = dr.async_get(hass)
+        
+        # 1. Integration users
+        for user_id, user_entry in stored_data.get("users", {}).items():
+            if not user_entry.get("deleted", False):
+                username = user_entry.get("username", "Unknown")
+                for device_id, device_data in user_entry.get("devices", {}).items():
+                    dev_reg.async_get_or_create(
+                        config_entry_id=entry.entry_id,
+                        identifiers={(DOMAIN, device_id)},
+                        name=f"Casa Device ({username})",
+                        model="Casa Push Client",
+                        manufacturer="Casa Integration",
+                        sw_version="1.0",
+                    )
+                    
+        # 2. Native users
+        native_devices = stored_data.get("native_devices", {})
+        if native_devices:
+            users = await hass.auth.async_get_users()
+            user_map = {u.id: (u.name or u.id) for u in users}
+            for user_id, devices in native_devices.items():
+                username = user_map.get(user_id) or f"Native User {user_id[:6]}"
+                for device_id, device_data in devices.items():
+                    dev_reg.async_get_or_create(
+                        config_entry_id=entry.entry_id,
+                        identifiers={(DOMAIN, device_id)},
+                        name=f"Casa Device ({username})",
+                        model="Casa Push Client",
+                        manufacturer="Casa Integration",
+                        sw_version="1.0",
+                    )
+    else:
+        # Purge all Casa devices from the Device Registry if disabled
+        from homeassistant.helpers import device_registry as dr
+        dev_reg = dr.async_get(hass)
+        
+        # 1. Integration users
+        for user_id, user_entry in stored_data.get("users", {}).items():
+            for device_id in user_entry.get("devices", {}).keys():
+                device_entry = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+                if device_entry:
+                    dev_reg.async_remove_device(device_entry.id)
+                    
+        # 2. Native users
+        native_devices = stored_data.get("native_devices", {})
+        for user_id, devices in native_devices.items():
+            for device_id in devices.keys():
+                device_entry = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+                if device_entry:
+                    dev_reg.async_remove_device(device_entry.id)
+
+    async def async_register_device(
+        user_id: str,
+        device_id: str,
+        push_token: str = None,
+        last_12_token: str = None,
+        refresh_token_id: str = None,
+        ip_address: str = None
+    ) -> None:
         """Register or update a device for a user."""
         if DOMAIN not in hass.data:
             raise HomeAssistantError("Casa integration is not loaded.")
 
-        if not re.match(r"^[0-9a-fA-F]{64}$", push_token):
-            raise HomeAssistantError("Invalid push token format. Must be a 64-character hex string.")
+        if push_token:
+            if not re.match(r"^[0-9a-fA-F]{64}$", push_token):
+                raise HomeAssistantError("Invalid push token format. Must be a 64-character hex string.")
 
         stored_data = hass.data[DOMAIN]["stored_data"]
         
-        if user_id not in stored_data["users"] or stored_data["users"][user_id].get("deleted", False):
-            raise HomeAssistantError("User was not created via this integration.")
+        # Check if user is an integration-managed user
+        if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
+            user_entry = stored_data["users"][user_id]
+            if "devices" not in user_entry:
+                user_entry["devices"] = {}
+            devices = user_entry["devices"]
+            username = user_entry.get("username")
+        else:
+            # Check if they are a valid Home Assistant user
+            users = await hass.auth.async_get_users()
+            ha_user = next((u for u in users if u.id == user_id), None)
+            if not ha_user or not ha_user.is_active:
+                raise HomeAssistantError("User not found or inactive in Home Assistant.")
             
-        user_entry = stored_data["users"][user_id]
-        if "devices" not in user_entry:
-            user_entry["devices"] = {}
+            native_devices = stored_data.setdefault("native_devices", {})
+            if user_id not in native_devices:
+                native_devices[user_id] = {}
+            devices = native_devices[user_id]
+            username = ha_user.name or user_id
 
-        if device_id not in user_entry["devices"] and len(user_entry["devices"]) >= 100:
+        if device_id not in devices and len(devices) >= 100:
             raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
             
         now_iso = dt_util.now().isoformat()
-        user_entry["devices"][device_id] = {
-            "push_token": push_token,
-            "registered_at": user_entry["devices"].get(device_id, {}).get("registered_at", now_iso),
-            "last_seen_at": now_iso
+        
+        # Keep existing push token if not provided in the update
+        existing_token = devices.get(device_id, {}).get("push_token")
+        final_token = push_token if push_token is not None else existing_token
+
+        # Keep existing bearer token details if not provided in the update
+        existing_last_12 = devices.get(device_id, {}).get("last_12_token")
+        final_last_12 = last_12_token if last_12_token is not None else existing_last_12
+
+        existing_refresh_id = devices.get(device_id, {}).get("refresh_token_id")
+        final_refresh_id = refresh_token_id if refresh_token_id is not None else existing_refresh_id
+
+        existing_ip = devices.get(device_id, {}).get("ip_address")
+        final_ip = ip_address if ip_address is not None else existing_ip
+        
+        devices[device_id] = {
+            "push_token": final_token,
+            "registered_at": devices.get(device_id, {}).get("registered_at", now_iso),
+            "last_seen_at": now_iso,
+            "last_12_token": final_last_12,
+            "refresh_token_id": final_refresh_id,
+            "ip_address": final_ip
         }
         
         store.async_delay_save(lambda: stored_data, 2.0)
-        _LOGGER.info("CASA: Registered device '%s' for user '%s'.", device_id, user_entry.get("username"))
+        
+        # Register in Home Assistant Device Registry if enabled
+        create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
+        if create_devices:
+            from homeassistant.helpers import device_registry as dr
+            dev_reg = dr.async_get(hass)
+            dev_reg.async_get_or_create(
+                config_entry_id=entry.entry_id,
+                identifiers={(DOMAIN, device_id)},
+                name=f"Casa Device ({username})",
+                model="Casa Push Client",
+                manufacturer="Casa Integration",
+                sw_version="1.0",
+            )
+            
+            # Dispatch dynamic added/updated signals
+            from homeassistant.helpers.dispatcher import async_dispatcher_send
+            is_native = user_id not in stored_data["users"]
+            # To be safe, check if it was new
+            if devices.get(device_id, {}).get("registered_at") == now_iso:
+                async_dispatcher_send(hass, "casa_device_added", device_id, username, is_native)
+            else:
+                async_dispatcher_send(hass, f"casa_device_updated_{device_id}")
+        
+        _LOGGER.info("CASA: Registered device '%s' for user '%s'.", device_id, username)
 
-    # Register the HTTP view
+    async def async_heartbeat(
+        user_id: str,
+        device_id: str,
+        last_12_token: str = None,
+        refresh_token_id: str = None,
+        ip_address: str = None,
+        provisioned_at: str = None,
+        expires_at: str = None
+    ) -> None:
+        """Process heartbeat from a device."""
+        if DOMAIN not in hass.data:
+            raise HomeAssistantError("Casa integration is not loaded.")
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+
+        # Check if user is an integration-managed user
+        if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
+            user_entry = stored_data["users"][user_id]
+            if "devices" not in user_entry:
+                user_entry["devices"] = {}
+            devices = user_entry["devices"]
+            username = user_entry.get("username")
+        else:
+            # Check if they are a valid Home Assistant user
+            users = await hass.auth.async_get_users()
+            ha_user = next((u for u in users if u.id == user_id), None)
+            if not ha_user or not ha_user.is_active:
+                raise HomeAssistantError("User not found or inactive in Home Assistant.")
+
+            native_devices = stored_data.setdefault("native_devices", {})
+            if user_id not in native_devices:
+                native_devices[user_id] = {}
+            devices = native_devices[user_id]
+            username = ha_user.name or user_id
+
+        if device_id not in devices and len(devices) >= 100:
+            raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
+
+        now_iso = dt_util.now().isoformat()
+        
+        # Get or initialize existing device info
+        device_info = devices.setdefault(device_id, {
+            "registered_at": now_iso
+        })
+
+        if last_12_token is not None:
+            device_info["last_12_token"] = last_12_token
+        if refresh_token_id is not None:
+            device_info["refresh_token_id"] = refresh_token_id
+        if ip_address is not None:
+            device_info["ip_address"] = ip_address
+        if provisioned_at is not None:
+            device_info["provisioned_at"] = provisioned_at
+        if expires_at is not None:
+            device_info["expires_at"] = expires_at
+
+        device_info["last_seen_at"] = now_iso
+
+        store.async_delay_save(lambda: stored_data, 2.0)
+
+        # Ensure registered in Home Assistant Device Registry if enabled
+        create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
+        if create_devices:
+            from homeassistant.helpers import device_registry as dr
+            dev_reg = dr.async_get(hass)
+            dev_reg.async_get_or_create(
+                config_entry_id=entry.entry_id,
+                identifiers={(DOMAIN, device_id)},
+                name=f"Casa Device ({username})",
+                model="Casa Push Client",
+                manufacturer="Casa Integration",
+                sw_version="1.0",
+            )
+            
+            # Dispatch dynamic added/updated signals
+            from homeassistant.helpers.dispatcher import async_dispatcher_send
+            is_native = user_id not in stored_data["users"]
+            if device_info["registered_at"] == now_iso:
+                async_dispatcher_send(hass, "casa_device_added", device_id, username, is_native)
+            else:
+                async_dispatcher_send(hass, f"casa_device_updated_{device_id}")
+
+        _LOGGER.debug("CASA: Processed heartbeat for device '%s' for user '%s'.", device_id, username)
+
+    # Register the HTTP views
     hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
+    hass.http.register_view(CasaHeartbeatView(hass, async_heartbeat))
 
     async def _check_authorization(call: ServiceCall):
         """Check if the service call is authorized."""
@@ -441,24 +773,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.auth.async_remove_refresh_token(token)
             _LOGGER.debug("CASA: All existing sessions for '%s' terminated.", target_username)
 
-        # Register user in integration store if not already tracked (e.g. existing HA users being provisioned)
         stored_data = hass.data[DOMAIN]["stored_data"]
-        if target_user.id not in stored_data["users"]:
-            stored_data["users"][target_user.id] = {
-                "user_id": target_user.id,
-                "username": login_username,
-                "name": target_user.name or login_username,
-                "created_at": dt_util.now().isoformat(),
-                "created_by": "provision",
-                "deleted": False,
-                "deleted_at": None,
-                "deleted_by": None,
-                "devices": {}
-            }
-            await store.async_save(stored_data)
-        elif stored_data["users"][target_user.id].get("deleted", False):
-            stored_data["users"][target_user.id]["deleted"] = False
-            await store.async_save(stored_data)
 
         # Construct Raw Payload (16 Variables)
         site_id = stored_data.get("site_id", "")
@@ -705,9 +1020,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.auth.async_remove_refresh_token(token)
             _LOGGER.info("CASA: All active sessions terminated for %s.", target_username)
         else:
-            token_to_remove = target_user.refresh_tokens.get(token_id)
-            if token_to_remove:
-                hass.auth.async_remove_refresh_token(token_to_remove)
+            # Let's find the actual refresh token ID to remove
+            real_token_id = None
+            
+            # 1. Check if token_id is the exact refresh token ID
+            if token_id in target_user.refresh_tokens:
+                real_token_id = token_id
+            # 2. Check if token_id is the last 12 characters of any refresh token ID
+            else:
+                for r_token_id in target_user.refresh_tokens.keys():
+                    if r_token_id[-12:] == token_id:
+                        real_token_id = r_token_id
+                        break
+            
+            # 3. Check if it matches the last_12_token of any registered devices for this user
+            if not real_token_id:
+                stored_data = hass.data[DOMAIN]["stored_data"]
+                # Search integration users
+                for uid, udata in stored_data.get("users", {}).items():
+                    if uid == target_user.id:
+                        for dev_id, dev_info in udata.get("devices", {}).items():
+                            l12 = dev_info.get("last_12_token")
+                            if l12 == token_id or (l12 and l12[-12:] == token_id):
+                                real_token_id = dev_info.get("refresh_token_id")
+                                break
+                        if real_token_id:
+                            break
+                
+                # Search native users
+                if not real_token_id:
+                    native_devices = stored_data.get("native_devices", {})
+                    if target_user.id in native_devices:
+                        for dev_id, dev_info in native_devices[target_user.id].items():
+                            l12 = dev_info.get("last_12_token")
+                            if l12 == token_id or (l12 and l12[-12:] == token_id):
+                                real_token_id = dev_info.get("refresh_token_id")
+                                break
+
+            if real_token_id:
+                token_to_remove = target_user.refresh_tokens.get(real_token_id)
+                if token_to_remove:
+                    hass.auth.async_remove_refresh_token(token_to_remove)
+                    _LOGGER.info("CASA: Session '%s' (last 12 matched) revoked for %s.", real_token_id[-12:], target_username)
 
     hass.services.async_register(DOMAIN, "remove_token", handle_remove_token)
 
@@ -985,6 +1339,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.auth.async_remove_user(target_user)
         _LOGGER.info("CASA: Local user '%s' (ID: %s) removed.", target_username, user_id)
 
+        # Remove from Home Assistant Device Registry
+        from homeassistant.helpers import device_registry as dr
+        dev_reg = dr.async_get(hass)
+        user_entry = stored_data["users"][user_id]
+        for device_id in list(user_entry.get("devices", {}).keys()):
+            device_entry = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+            if device_entry:
+                dev_reg.async_remove_device(device_entry.id)
+
         # Track the deletion in the store
         deleter = await _get_context_creator(call.context)
         
@@ -1015,6 +1378,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Sync with actual Home Assistant state to detect out-of-band deletions
         changed = False
+        from homeassistant.helpers import device_registry as dr
+        dev_reg = dr.async_get(hass)
         for uid, udata in list(stored_data["users"].items()):
             if uid not in ha_user_ids and not udata.get("deleted", False):
                 stored_data["users"][uid].update({
@@ -1022,6 +1387,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "deleted_at": dt_util.now().isoformat(),
                     "deleted_by": "deleted outside integration (UI or other means)",
                 })
+                # Clean up their devices from Device Registry
+                for device_id in list(udata.get("devices", {}).keys()):
+                    device_entry = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+                    if device_entry:
+                        dev_reg.async_remove_device(device_entry.id)
+                changed = True
+
+        # Sync with actual Home Assistant state to detect out-of-band deletions for native_devices
+        native_devices = stored_data.setdefault("native_devices", {})
+        for uid in list(native_devices.keys()):
+            if uid not in ha_user_ids:
+                # Clean up their devices from Device Registry
+                for device_id in list(native_devices[uid].keys()):
+                    device_entry = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+                    if device_entry:
+                        dev_reg.async_remove_device(device_entry.id)
+                native_devices.pop(uid)
                 changed = True
 
         if changed:
@@ -1099,11 +1481,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         user_id = target_user.id
         stored_data = hass.data[DOMAIN]["stored_data"]
 
-        if user_id not in stored_data["users"] or stored_data["users"][user_id].get("deleted", False):
-            raise HomeAssistantError(f"User '{username}' was not created via this integration.")
-
-        user_entry = stored_data["users"][user_id]
-        devices = user_entry.get("devices", {})
+        if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
+            devices = stored_data["users"][user_id].get("devices", {})
+        else:
+            native_devices = stored_data.get("native_devices", {})
+            devices = native_devices.get(user_id, {})
 
         if not devices:
             _LOGGER.warning("CASA: No registered devices found for user '%s'.", username)
@@ -1189,9 +1571,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.OPTIONAL
     )
 
+    # Set up sensor platform
+    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
+
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, ["sensor"])
+    
     hass.services.async_remove(DOMAIN, "provision")
     hass.services.async_remove(DOMAIN, "generate_qr")
     hass.services.async_remove(DOMAIN, "remove_token")
@@ -1211,4 +1598,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     for task in hass.data[DOMAIN].get("listeners", {}).values():
         task.cancel()
     hass.data.pop(DOMAIN, None)
-    return True
+    return unload_ok
