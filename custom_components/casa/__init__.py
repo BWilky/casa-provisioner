@@ -441,6 +441,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.auth.async_remove_refresh_token(token)
             _LOGGER.debug("CASA: All existing sessions for '%s' terminated.", target_username)
 
+        # Register user in integration store if not already tracked (e.g. existing HA users being provisioned)
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        if target_user.id not in stored_data["users"]:
+            stored_data["users"][target_user.id] = {
+                "user_id": target_user.id,
+                "username": login_username,
+                "name": target_user.name or login_username,
+                "created_at": dt_util.now().isoformat(),
+                "created_by": "provision",
+                "deleted": False,
+                "deleted_at": None,
+                "deleted_by": None,
+                "devices": {}
+            }
+            await store.async_save(stored_data)
+        elif stored_data["users"][target_user.id].get("deleted", False):
+            stored_data["users"][target_user.id]["deleted"] = False
+            await store.async_save(stored_data)
+
         # Construct Raw Payload (16 Variables)
         site_id = stored_data.get("site_id", "")
         push_val = service_data.get("push_notifications", "false")
