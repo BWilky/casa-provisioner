@@ -6,7 +6,7 @@ from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, CONF_CREATE_DEVICES
 class CasaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Casa."""
 
-    VERSION = 1
+    VERSION = 1.1
 
     async def async_step_user(self, user_input=None):
         """Handle the initial step."""

@@ -698,7 +698,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         immersive_level = str(service_data.get("immersive_level", "1"))
         theme_color_mode = str(service_data.get("theme_color_mode", "inherit"))
         custom_color = str(service_data.get("custom_color", "#000000")).strip().replace("|", "")
-        immersive_payload = f"{immersive_level},{theme_color_mode},{custom_color}"
+
 
         val_hours = service_data.get("expiration_hours")
         expiration_hours = int(val_hours) if val_hours is not None else 336
@@ -780,7 +780,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         stored_data = hass.data[DOMAIN]["stored_data"]
 
-        # Construct Raw Payload (16 Variables)
+        # Construct Raw Payload (21 Variables)
         site_id = stored_data.get("site_id", "")
         push_val = service_data.get("push_notifications", "false")
         if push_val is True or (isinstance(push_val, str) and push_val.lower() == "true"):
@@ -790,12 +790,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             normalized_push = "false"
 
+        allow_wireguard = service_data.get("allow_wireguard", False)
+        normalized_wireguard = "true" if (allow_wireguard is True or (isinstance(allow_wireguard, str) and allow_wireguard.lower() == "true")) else "false"
+
+        wireguard_config_raw = service_data.get("wireguard_config", "")
+        if wireguard_config_raw:
+            wireguard_config_encoded = base64.b64encode(str(wireguard_config_raw).encode("utf-8")).decode("utf-8")
+        else:
+            wireguard_config_encoded = ""
+
+        wireguard_excluded_wifi = str(service_data.get("wireguard_excluded_wifi", "")).strip().replace("|", "")
+
         raw_payload_array = [
-            str(final_server_url), str(login_username), str(login_password), allowed_paths_str,
-            allowed_wifi, default_dashboard, immersive_payload, str(session_expiration_unix), str(expiration_unix), welcome_url,
-            target_pin, connect_wifi_ssid, connect_wifi_password, cache_control_hours_str,
+            str(final_server_url),
+            str(login_username),
+            str(login_password),
             str(site_id),
-            normalized_push
+            target_pin,
+            default_dashboard,
+            welcome_url,
+            immersive_level,
+            theme_color_mode,
+            custom_color,
+            str(session_expiration_unix),
+            str(expiration_unix),
+            cache_control_hours_str,
+            allowed_paths_str,
+            allowed_wifi,
+            normalized_push,
+            normalized_wireguard,
+            wireguard_config_encoded,
+            wireguard_excluded_wifi,
+            connect_wifi_ssid,
+            connect_wifi_password
         ]
         payload_string = "|".join(raw_payload_array)
 
