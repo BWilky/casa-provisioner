@@ -757,6 +757,12 @@ notify_user:
       required: true
       selector:
         text: {}
+    data:
+      name: "Data"
+      description: "Additional custom dictionary/JSON data to send with the push notification."
+      required: false
+      selector:
+        object: {}
 
 reload_device:
   name: "Reload Casa Device"

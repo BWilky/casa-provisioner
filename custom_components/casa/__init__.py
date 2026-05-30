@@ -271,6 +271,12 @@ class CasaHeartbeatView(HomeAssistantView):
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
+async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Handle migration of config entries."""
+    _LOGGER.debug("CASA: Migrating config entry from version %s", config_entry.version)
+    # No data transformation needed — options schema is backwards compatible
+    return True
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault("timers", {})
@@ -1492,6 +1498,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         username = str(call.data.get("username", "")).strip()
         title = str(call.data.get("title", "")).strip()
         message = str(call.data.get("message", "")).strip()
+        custom_data = call.data.get("data")
+
+        parsed_data = None
+        if custom_data is not None:
+            if isinstance(custom_data, str):
+                import json
+                try:
+                    parsed_data = json.loads(custom_data)
+                except ValueError:
+                    parsed_data = custom_data
+            else:
+                parsed_data = custom_data
 
         if not username or not title or not message:
             raise HomeAssistantError("Missing username, title, or message.")
@@ -1540,6 +1558,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "site_id": stored_data.get("site_id"),
                 "site_key": stored_data.get("site_key")
             }
+            if parsed_data is not None:
+                payload["data"] = parsed_data
 
             _LOGGER.info(
                 "CASA: Attempting to send push notification to user '%s' device '%s'. Target (obfuscated): %s, Site ID: %s",
@@ -1549,10 +1569,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 stored_data.get("site_id")
             )
             _LOGGER.debug(
-                "CASA DEBUG PAYLOAD: Target=%s, SiteID=%s, SiteKey=%s",
+                "CASA DEBUG PAYLOAD: Target=%s, SiteID=%s, SiteKey=%s, Data=%s",
                 push_token,
                 stored_data.get("site_id"),
-                stored_data.get("site_key")
+                stored_data.get("site_key"),
+                parsed_data
             )
 
             async def send_post(tok=push_token, data_payload=dict(payload)):
