@@ -217,9 +217,20 @@ provision:
           max: 8760
           step: any
           mode: box
+    payload_version:
+      name: "Payload Format Version"
+      description: "v2 (default): JSON profile with hybrid AES-256-GCM + RSA encryption — no size limit, supports large/WireGuard profiles. v1 (legacy): 21-field pipe-delimited, RSA-only, capped at ~190 bytes. Use v1 only for app builds that don't yet support v2."
+      default: "2"
+      selector:
+        select:
+          options:
+            - label: "v2 (JSON + Hybrid Encryption)"
+              value: "2"
+            - label: "v1 (Legacy Pipe-Delimited)"
+              value: "1"
     payload_decrypted:
       name: "Plaintext Payload (No Encryption)"
-      description: "If enabled, the provisioning payload is generated in plaintext (not encrypted with the public key)."
+      description: "Debug only. If enabled, the payload is emitted unencrypted (v2: base64url JSON, v1: base64 pipe-string) so you can inspect its contents. The app cannot consume this."
       default: false
       selector:
         boolean: {}
@@ -772,5 +783,70 @@ reload_device:
       name: "Device ID"
       description: "The unique identifier (UUID) of the target device to reload."
       required: true
+      selector:
+        text: {}
+
+update_wireguard:
+  name: "Update WireGuard Configuration"
+  description: "Pushes a new WireGuard configuration (or revokes the existing one) to a provisioned device over push notification. The config is end-to-end encrypted so the push relay can never read it."
+  fields:
+    device_id:
+      name: "Device ID"
+      description: "Target a single device by its unique identifier (UUID). Provide this OR a username."
+      required: false
+      selector:
+        text: {}
+    username:
+      name: "Username"
+      description: "Target all registered devices of this user. Provide this OR a device_id."
+      required: false
+      selector:
+        text: {}
+    action:
+      name: "Action"
+      description: "Push a new configuration ('update') or remove the existing one from the device ('revoke')."
+      default: "update"
+      selector:
+        select:
+          options:
+            - label: "Update Configuration"
+              value: "update"
+            - label: "Revoke Configuration"
+              value: "revoke"
+    wireguard_config:
+      name: "WireGuard Configuration"
+      description: "The client's WireGuard configuration file content. Required when Action is 'update'."
+      required: false
+      selector:
+        text:
+          multiline: true
+    wireguard_excluded_wifi:
+      name: "WireGuard Excluded Wi-Fi Networks"
+      description: "Comma-separated list of Wi-Fi SSIDs where WireGuard should not activate (e.g., home networks)."
+      required: false
+      selector:
+        text: {}
+    encrypt_config:
+      name: "Encrypt Configuration"
+      description: "End-to-end encrypt the WireGuard config so the push relay cannot read or tamper with it. The key is derived from the device's existing session secret (never sent to the relay) and the app decrypts it locally. Leave enabled unless you are debugging and explicitly need a plaintext payload."
+      default: true
+      selector:
+        boolean: {}
+    silent:
+      name: "Silent"
+      description: "Deliver as a silent background push that applies the change without alerting the user. Disable to also show a notification."
+      default: true
+      selector:
+        boolean: {}
+    title:
+      name: "Notification Title"
+      description: "Title shown to the user. Only used when Silent is disabled."
+      required: false
+      selector:
+        text: {}
+    message:
+      name: "Notification Message"
+      description: "Message shown to the user. Only used when Silent is disabled."
+      required: false
       selector:
         text: {}

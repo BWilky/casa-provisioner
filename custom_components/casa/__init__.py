@@ -5,6 +5,8 @@ import string
 import secrets
 import base64
 import time
+import json
+import zlib
 import urllib.parse
 import re
 from datetime import timedelta
@@ -16,11 +18,13 @@ from homeassistant.util import dt as dt_util
 
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, CONF_CREATE_DEVICES
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, CONF_CREATE_DEVICES
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from aiohttp import ClientTimeout
@@ -45,6 +49,53 @@ def _encrypt_payload(payload_str: str, key_bytes: bytes) -> str:
     return base64.b64encode(ciphertext).decode('utf-8')
 
 
+def _encrypt_wireguard_payload(plaintext: str, refresh_token: str) -> str:
+    """End-to-end encrypt a WireGuard push payload using the device's session secret.
+
+    The key is derived from the device's HA refresh token via HKDF-SHA256, so the
+    relay (which never sees the token) cannot read or tamper with the config. The
+    iOS app derives the same key from its own copy of the refresh token.
+    Output is base64(nonce || ciphertext || GCM tag).
+    """
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"casa-wireguard-v1",
+    ).derive(refresh_token.encode("utf-8"))
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
+    return base64.b64encode(nonce + ciphertext).decode("utf-8")
+
+
+def _encrypt_payload_hybrid(plaintext: str, public_key_bytes: bytes) -> str:
+    """Hybrid-encrypt a v2 provisioning profile, returning a base64url envelope.
+
+    Layout before base64url: 0x02 || RSA-OAEP-SHA256(aes_key)[256] || nonce[12] || AES-256-GCM(deflate(json)).
+    RSA only wraps the 32-byte AES key, so the JSON body has no 190-byte size limit;
+    GCM authenticates it, and base64url keeps the deep link/QR free of percent-encoding.
+    """
+    public_key = serialization.load_pem_public_key(public_key_bytes)
+    # Raw DEFLATE (wbits=-15): no zlib header/Adler-32 trailer, so iOS's Compression
+    # framework (COMPRESSION_ZLIB == raw DEFLATE) inflates it directly. GCM already
+    # authenticates the payload, so the zlib checksum would be redundant anyway.
+    deflate = zlib.compressobj(9, zlib.DEFLATED, -15)
+    compressed = deflate.compress(plaintext.encode("utf-8")) + deflate.flush()
+    aes_key = AESGCM.generate_key(bit_length=256)
+    nonce = secrets.token_bytes(12)
+    ciphertext = AESGCM(aes_key).encrypt(nonce, compressed, None)
+    wrapped_key = public_key.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    envelope = bytes([2]) + wrapped_key + nonce + ciphertext
+    return base64.urlsafe_b64encode(envelope).decode("utf-8").rstrip("=")
+
+
 def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
     """Extract refresh_token_id (jti) from the bearer access token JWT payload."""
     import base64
@@ -60,6 +111,61 @@ def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
     except Exception:
         pass
     return None
+
+
+async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
+    """Register this HA instance's site with the relay and persist the issued site_key.
+
+    site_id is a 124-char [A-Za-z0-9] value (secrets.token_hex(62)). The relay issues
+    the site_key exactly once (HTTP 201) and never returns it again, so it must be
+    persisted. A 409 means the site_id exists but we hold no key (unrecoverable lockout)
+    — recovery is to register a brand-new site_id, not retry the same one.
+    """
+    session = async_get_clientsession(hass)
+
+    for _attempt in range(3):
+        site_id = stored_data.get("site_id")
+        if not site_id or len(site_id) != 124:
+            site_id = secrets.token_hex(62)  # 124 hex chars
+            stored_data["site_id"] = site_id
+
+        try:
+            async with session.post(
+                RELAY_REGISTER_SITE_URL,
+                json={"site_id": site_id},
+                timeout=ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 201:
+                    data = await resp.json()
+                    stored_data["site_key"] = data["site_key"]
+                    await store.async_save(stored_data)
+                    _LOGGER.info("CASA: Registered site with relay; site_key persisted.")
+                    return True
+
+                if resp.status == 409:
+                    # site_id taken but we have no key -> lockout; rotate to a fresh site_id.
+                    _LOGGER.warning("CASA: site_id already registered with no local key; rotating site_id and retrying.")
+                    stored_data["site_id"] = secrets.token_hex(62)
+                    continue
+
+                if resp.status == 422:
+                    _LOGGER.warning("CASA: Relay rejected site_id as malformed (422); regenerating.")
+                    stored_data["site_id"] = secrets.token_hex(62)
+                    continue
+
+                if resp.status == 400:
+                    _LOGGER.error("CASA: Relay reports no database configured (400); cannot register site.")
+                    return False
+
+                text = await resp.text()
+                _LOGGER.error("CASA: Unexpected /register_site status %s: %s", resp.status, text)
+                return False
+        except Exception as err:
+            _LOGGER.error("CASA: Failed to reach relay /register_site: %s", err)
+            return False
+
+    _LOGGER.error("CASA: Could not register site after multiple attempts.")
+    return False
 
 
 class CasaRegisterDeviceView(HomeAssistantView):
@@ -292,22 +398,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if stored_data is None:
         stored_data = {"users": {}}
 
-    # Auto-generate site_id and site_key if not present
-    updated = False
-    if "site_id" not in stored_data:
-        chars = string.ascii_letters + string.digits
-        stored_data["site_id"] = "".join(secrets.choice(chars) for _ in range(32))
-        updated = True
-        _LOGGER.info("CASA: Generated static site ID")
-
-    if "site_key" not in stored_data:
-        chars = string.ascii_letters + string.digits
-        stored_data["site_key"] = "".join(secrets.choice(chars) for _ in range(32))
-        updated = True
-        _LOGGER.info("CASA: Generated static site key")
-
-    if updated:
-        await store.async_save(stored_data)
+    # Register the site with the relay once. The relay issues the site_key (never
+    # generated locally); we skip registration whenever we already hold a valid one.
+    if not stored_data.get("site_key") or len(stored_data.get("site_id", "")) != 124:
+        # Drop any legacy/invalid credentials so a fresh 124-char site_id is minted.
+        if len(stored_data.get("site_id", "")) != 124:
+            stored_data.pop("site_id", None)
+            stored_data.pop("site_key", None)
+        await _register_site(hass, stored_data, store)
 
     hass.data[DOMAIN]["stored_data"] = stored_data
 
@@ -786,7 +884,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         stored_data = hass.data[DOMAIN]["stored_data"]
 
-        # Construct Raw Payload (21 Variables)
+        # Construct payload field values (shared by v1 and v2)
         site_id = stored_data.get("site_id", "")
         push_val = service_data.get("push_notifications", "false")
         if push_val is True or (isinstance(push_val, str) and push_val.lower() == "true"):
@@ -807,43 +905,93 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         wireguard_excluded_wifi = str(service_data.get("wireguard_excluded_wifi", "")).strip().replace("|", "")
 
-        raw_payload_array = [
-            str(final_server_url),
-            str(login_username),
-            str(login_password),
-            str(site_id),
-            target_pin,
-            default_dashboard,
-            welcome_url,
-            immersive_level,
-            theme_color_mode,
-            custom_color,
-            str(session_expiration_unix),
-            str(expiration_unix),
-            cache_control_hours_str,
-            allowed_paths_str,
-            allowed_wifi,
-            normalized_push,
-            normalized_wireguard,
-            wireguard_config_encoded,
-            wireguard_excluded_wifi,
-            connect_wifi_ssid,
-            connect_wifi_password
-        ]
-        payload_string = "|".join(raw_payload_array)
+        try:
+            payload_version = int(service_data.get("payload_version", 2))
+        except (TypeError, ValueError):
+            payload_version = 2
 
-        # Encrypt in executor if not decrypted/plaintext
         payload_decrypted = service_data.get("payload_decrypted", False)
-        if payload_decrypted:
-            final_payload = base64.b64encode(payload_string.encode('utf-8')).decode('utf-8')
+
+        if payload_version == 1:
+            # Legacy v1: 21-field, '|'-joined, RSA-OAEP (plaintext capped at 190 bytes).
+            raw_payload_array = [
+                str(final_server_url),
+                str(login_username),
+                str(login_password),
+                str(site_id),
+                target_pin,
+                default_dashboard,
+                welcome_url,
+                immersive_level,
+                theme_color_mode,
+                custom_color,
+                str(session_expiration_unix),
+                str(expiration_unix),
+                cache_control_hours_str,
+                allowed_paths_str,
+                allowed_wifi,
+                normalized_push,
+                normalized_wireguard,
+                wireguard_config_encoded,
+                wireguard_excluded_wifi,
+                connect_wifi_ssid,
+                connect_wifi_password
+            ]
+            payload_string = "|".join(raw_payload_array)
+            if payload_decrypted:
+                final_payload = base64.b64encode(payload_string.encode('utf-8')).decode('utf-8')
+            else:
+                try:
+                    final_payload = await hass.async_add_executor_job(
+                        _encrypt_payload, payload_string, public_key_data
+                    )
+                except Exception as e:
+                    _LOGGER.error("CASA ERROR: Failed to encrypt v1 payload. Error: %s", str(e))
+                    return {"error": "Encryption failed"}
+            deep_link = f"hascasa://setup?data={urllib.parse.quote(final_payload)}"
         else:
-            try:
-                final_payload = await hass.async_add_executor_job(
-                    _encrypt_payload, payload_string, public_key_data
-                )
-            except Exception as e:
-                _LOGGER.error("CASA ERROR: Failed to encrypt payload. Error: %s", str(e))
-                return {"error": "Encryption failed"}
+            # v2: JSON profile, hybrid encryption (AES-256-GCM body + RSA-wrapped key), base64url.
+            # No size cap, '|' is no longer a delimiter, and fields are named instead of positional.
+            profile = {
+                "v": 2,
+                "server_url": str(final_server_url),
+                "username": str(login_username),
+                "password": str(login_password),
+                "site_id": str(site_id),
+                "pin": target_pin,
+                "default_dashboard": default_dashboard,
+                "welcome_url": welcome_url,
+                "immersive_level": immersive_level,
+                "theme_color_mode": theme_color_mode,
+                "custom_color": custom_color,
+                "session_expiration": session_expiration_unix,
+                "expiration": expiration_unix,
+                "cache_control_hours": cache_control_hours_str,
+                "allowed_pages": allowed_paths_str,
+                "allowed_wifi": allowed_wifi,
+                "push_notifications": normalized_push,
+                "wireguard": {
+                    "allowed": normalized_wireguard == "true",
+                    "config": str(wireguard_config_raw),
+                    "excluded_wifi": wireguard_excluded_wifi,
+                },
+                "connect_wifi": {
+                    "ssid": connect_wifi_ssid,
+                    "password": connect_wifi_password,
+                },
+            }
+            payload_string = json.dumps(profile, separators=(",", ":"))
+            if payload_decrypted:
+                final_payload = base64.urlsafe_b64encode(payload_string.encode("utf-8")).decode("utf-8").rstrip("=")
+            else:
+                try:
+                    final_payload = await hass.async_add_executor_job(
+                        _encrypt_payload_hybrid, payload_string, public_key_data
+                    )
+                except Exception as e:
+                    _LOGGER.error("CASA ERROR: Failed to encrypt v2 payload. Error: %s", str(e))
+                    return {"error": "Encryption failed"}
+            deep_link = f"hascasa://setup?data={final_payload}"
 
         # Setup method-specific fields
         delete_qr = False
@@ -862,9 +1010,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 img.save(custom_path)
             img.save(dashboard_path)
             return final_filename
-
-        url_encoded_payload = urllib.parse.quote(final_payload)
-        deep_link = f"hascasa://setup?data={url_encoded_payload}"
 
         if method == "qr":
             delete_qr = service_data.get("delete_qr_after_window", True) if timeout_mins > 0 else False
@@ -1686,6 +1831,160 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         return {"status": "success"}
 
+    async def handle_update_wireguard(call: ServiceCall):
+        import json
+
+        users = await _check_authorization(call)
+        device_id = str(call.data.get("device_id", "")).strip()
+        username = str(call.data.get("username", "")).strip()
+        action = str(call.data.get("action", "update")).strip().lower()
+        silent = call.data.get("silent", True)
+        encrypt_config = call.data.get("encrypt_config", True)
+        wireguard_config = str(call.data.get("wireguard_config", ""))
+        excluded_wifi = str(call.data.get("wireguard_excluded_wifi", "")).strip()
+        title = str(call.data.get("title", "")).strip()
+        message = str(call.data.get("message", "")).strip()
+
+        if action not in ("update", "revoke"):
+            raise HomeAssistantError("Invalid action. Must be 'update' or 'revoke'.")
+        if not device_id and not username:
+            raise HomeAssistantError("Must provide either device_id or username.")
+        if action == "update" and not wireguard_config:
+            raise HomeAssistantError("wireguard_config is required for the 'update' action.")
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+
+        # Resolve target devices as a list of (device_id, device_info, owning_user_id)
+        targets = []
+        if device_id:
+            found = None
+            for uid, udata in stored_data.get("users", {}).items():
+                if device_id in udata.get("devices", {}):
+                    found = (device_id, udata["devices"][device_id], uid)
+                    break
+            if not found:
+                for uid, devices in stored_data.get("native_devices", {}).items():
+                    if device_id in devices:
+                        found = (device_id, devices[device_id], uid)
+                        break
+            if not found:
+                raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
+            targets.append(found)
+        else:
+            target_user = next((u for u in users if u.name and u.name.casefold() == username.casefold()), None)
+            if not target_user:
+                for u in users:
+                    for cred in u.credentials:
+                        if cred.auth_provider_type == "homeassistant" and cred.data.get("username", "").casefold() == username.casefold():
+                            target_user = u
+                            break
+                    if target_user:
+                        break
+            if not target_user:
+                raise HomeAssistantError(f"User '{username}' not found.")
+
+            uid = target_user.id
+            if uid in stored_data["users"] and not stored_data["users"][uid].get("deleted", False):
+                devices = stored_data["users"][uid].get("devices", {})
+            else:
+                devices = stored_data.get("native_devices", {}).get(uid, {})
+            for did, dinfo in devices.items():
+                targets.append((did, dinfo, uid))
+
+        if not targets:
+            _LOGGER.warning("CASA: No target devices found for wireguard %s.", action)
+            return {"success": True, "sent_count": 0, "failed_count": 0, "skipped_count": 0}
+
+        session = async_get_clientsession(hass)
+        command = "wireguard_update" if action == "update" else "wireguard_revoke"
+
+        sent_count = 0
+        failed_count = 0
+        skipped_count = 0
+
+        for did, dinfo, uid in targets:
+            push_token = dinfo.get("push_token")
+            if not push_token:
+                _LOGGER.warning("CASA: Device '%s' has no push token; skipping wireguard %s.", did, action)
+                skipped_count += 1
+                continue
+
+            # Inner payload is encrypted (or plaintext-base64) end-to-end; the relay only routes it.
+            if action == "update":
+                inner = {
+                    "action": "update",
+                    "config": wireguard_config,
+                    "excluded_wifi": excluded_wifi,
+                    "ts": int(time.time()),
+                }
+            else:
+                inner = {"action": "revoke", "ts": int(time.time())}
+            inner_str = json.dumps(inner)
+
+            if encrypt_config:
+                refresh_token_id = dinfo.get("refresh_token_id")
+                token_value = None
+                if refresh_token_id:
+                    user_obj = next((u for u in users if u.id == uid), None)
+                    if user_obj:
+                        rt = user_obj.refresh_tokens.get(refresh_token_id)
+                        if rt:
+                            token_value = rt.token
+                if not token_value:
+                    _LOGGER.warning(
+                        "CASA: No active refresh token for device '%s'; cannot encrypt wireguard payload. Skipping.",
+                        did,
+                    )
+                    skipped_count += 1
+                    continue
+                try:
+                    wg_payload = _encrypt_wireguard_payload(inner_str, token_value)
+                except Exception as e:
+                    _LOGGER.error("CASA ERROR: Failed to encrypt wireguard payload for device '%s': %s", did, e)
+                    failed_count += 1
+                    continue
+            else:
+                wg_payload = base64.b64encode(inner_str.encode("utf-8")).decode("utf-8")
+
+            payload = {
+                "target": push_token,
+                "site_id": stored_data.get("site_id"),
+                "site_key": stored_data.get("site_key"),
+                "command": command,
+                "encrypted": bool(encrypt_config),
+                "wireguard_payload": wg_payload,
+                "title": "" if silent else title,
+                "message": "" if silent else message,
+            }
+
+            success = False
+            for url in RELAY_URLS:
+                try:
+                    async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
+                        if response.status == 200:
+                            success = True
+                            break
+                        text = await response.text()
+                        _LOGGER.warning("CASA: Relay %s returned status %s for wireguard %s on device '%s': %s", url, response.status, action, did, text)
+                        if response.status < 500:
+                            break
+                except Exception as err:
+                    _LOGGER.warning("CASA: Failed to connect to relay %s for wireguard %s on device '%s': %s", url, action, did, err)
+
+            if success:
+                sent_count += 1
+                _LOGGER.info("CASA: Sent wireguard %s to device '%s' (encrypted=%s, silent=%s).", action, did, encrypt_config, silent)
+            else:
+                failed_count += 1
+                _LOGGER.error("CASA: Failed to deliver wireguard %s to device '%s' after trying all relays.", action, did)
+
+        return {
+            "success": failed_count == 0,
+            "sent_count": sent_count,
+            "failed_count": failed_count,
+            "skipped_count": skipped_count,
+        }
+
     hass.services.async_register(
         DOMAIN, "register_device", handle_register_device,
         supports_response=SupportsResponse.OPTIONAL
@@ -1716,6 +2015,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.OPTIONAL
     )
 
+    hass.services.async_register(
+        DOMAIN, "update_wireguard", handle_update_wireguard,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "button"])
 
@@ -1738,7 +2042,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "register_device")
     hass.services.async_remove(DOMAIN, "notify_user")
     hass.services.async_remove(DOMAIN, "reload_device")
-    
+    hass.services.async_remove(DOMAIN, "update_wireguard")
+
     for task in hass.data[DOMAIN].get("timers", {}).values():
         task.cancel()
     for task in hass.data[DOMAIN].get("listeners", {}).values():
