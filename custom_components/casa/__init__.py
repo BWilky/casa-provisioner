@@ -97,7 +97,11 @@ def _encrypt_payload_hybrid(plaintext: str, public_key_bytes: bytes) -> str:
 
 
 def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
-    """Extract refresh_token_id (jti) from the bearer access token JWT payload."""
+    """Extract the refresh token id from a Home Assistant access token JWT.
+
+    HA signs access tokens with the refresh token's key and stores the refresh
+    token id in the 'iss' claim (not 'jti'); 'jti' is kept only as a fallback.
+    """
     import base64
     import json
     try:
@@ -107,7 +111,7 @@ def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
             payload_b64 += '=' * (4 - len(payload_b64) % 4)
             payload_bytes = base64.urlsafe_b64decode(payload_b64)
             payload = json.loads(payload_bytes.decode('utf-8'))
-            return payload.get("jti")
+            return payload.get("iss") or payload.get("jti")
     except Exception:
         pass
     return None
@@ -2088,8 +2092,8 @@ async def async_remove_config_entry_device(
         except Exception as err:
             _LOGGER.warning("CASA: Failed to unregister proxy token for device '%s' from relay: %s", device_id, err)
 
-    # Revoke the HA session/refresh token so the device loses access (and can't
-    # silently re-register via heartbeat afterwards).
+    # Revoke this device's HA session so it loses access (and can't silently
+    # re-register via heartbeat). Scoped to the device's own token only.
     if owner_user_id and refresh_token_id:
         user = await hass.auth.async_get_user(owner_user_id)
         if user:
@@ -2098,6 +2102,11 @@ async def async_remove_config_entry_device(
                 hass.auth.async_remove_refresh_token(token)
                 _LOGGER.info(
                     "CASA: Revoked refresh token for deleted device '%s' (user '%s').",
+                    device_id, username,
+                )
+            else:
+                _LOGGER.warning(
+                    "CASA: No matching refresh token for deleted device '%s' (user '%s'); session not revoked.",
                     device_id, username,
                 )
 
