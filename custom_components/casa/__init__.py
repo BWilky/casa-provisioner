@@ -24,7 +24,7 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, CONF_CREATE_DEVICES
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, CONF_CREATE_DEVICES
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from aiohttp import ClientTimeout
@@ -2024,6 +2024,87 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "button"])
 
     return True
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry
+) -> bool:
+    """Allow deleting a Casa device from the UI.
+
+    HA renders the Delete action (and its confirmation dialog) once this exists.
+    On delete we revoke the device's HA refresh token (killing its access) and
+    purge it from our storage before allowing the registry removal.
+    """
+    device_id = next(
+        (ident for domain, ident in device_entry.identifiers if domain == DOMAIN),
+        None,
+    )
+    if not device_id:
+        return True
+
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    store = hass.data[DOMAIN]["store"]
+
+    owner_user_id = None
+    refresh_token_id = None
+    proxy_token = None
+    username = "Unknown"
+
+    for uid, udata in stored_data.get("users", {}).items():
+        devices = udata.get("devices", {})
+        if device_id in devices:
+            owner_user_id = uid
+            refresh_token_id = devices[device_id].get("refresh_token_id")
+            proxy_token = devices[device_id].get("push_token")
+            username = udata.get("username", uid)
+            devices.pop(device_id, None)
+            break
+
+    if owner_user_id is None:
+        for uid, devices in stored_data.get("native_devices", {}).items():
+            if device_id in devices:
+                owner_user_id = uid
+                refresh_token_id = devices[device_id].get("refresh_token_id")
+                proxy_token = devices[device_id].get("push_token")
+                username = uid
+                devices.pop(device_id, None)
+                break
+
+    # Unregister the proxy token from the relay (possession of the token is the auth).
+    if proxy_token:
+        try:
+            session = async_get_clientsession(hass)
+            async with session.post(
+                RELAY_UNREGISTER_URL,
+                json={"proxy_token": proxy_token},
+                timeout=ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    _LOGGER.info("CASA: Unregistered proxy token for deleted device '%s' from relay.", device_id)
+                elif resp.status == 404:
+                    _LOGGER.info("CASA: Relay had no registration for deleted device '%s' (already gone).", device_id)
+                else:
+                    text = await resp.text()
+                    _LOGGER.warning("CASA: Relay /unregister returned %s for device '%s': %s", resp.status, device_id, text)
+        except Exception as err:
+            _LOGGER.warning("CASA: Failed to unregister proxy token for device '%s' from relay: %s", device_id, err)
+
+    # Revoke the HA session/refresh token so the device loses access (and can't
+    # silently re-register via heartbeat afterwards).
+    if owner_user_id and refresh_token_id:
+        user = await hass.auth.async_get_user(owner_user_id)
+        if user:
+            token = user.refresh_tokens.get(refresh_token_id)
+            if token:
+                hass.auth.async_remove_refresh_token(token)
+                _LOGGER.info(
+                    "CASA: Revoked refresh token for deleted device '%s' (user '%s').",
+                    device_id, username,
+                )
+
+    await store.async_save(stored_data)
+    _LOGGER.info("CASA: Deleted device '%s' from storage (user '%s').", device_id, username)
+    return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, ["sensor", "button"])
