@@ -234,6 +234,109 @@ class CasaAdminPanel extends HTMLElement {
         .btn-outline { background: transparent; color: var(--error-color, #db4437); border: 1px solid var(--error-color, #db4437); border-radius: 8px; padding: 8px 14px; font-size: 14px; font-weight: 500; cursor: pointer; }
         .btn-plain { background: var(--secondary-background-color, #e5e5e5); color: var(--primary-text-color, #212121); border: none; border-radius: 8px; padding: 8px 14px; font-size: 14px; cursor: pointer; }
         .regen-msg { margin-top: 12px; font-size: 13px; }
+
+        /* WireGuard profiles */
+        .wg-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+        .btn-primary { background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff); border: none; border-radius: 8px; padding: 8px 14px; font-size: 14px; font-weight: 500; cursor: pointer; }
+        .btn-primary:hover, .btn-plain:hover { filter: brightness(.93); }
+        .wg-card {
+          background: var(--secondary-background-color, #f5f5f5); border-radius: 10px; padding: 14px 16px;
+          margin-bottom: 10px; display: flex; align-items: flex-start; gap: 14px;
+        }
+        .wg-card .wg-info { flex: 1; min-width: 0; }
+        .wg-card .wg-alias { font-weight: 600; font-size: 14px; margin-bottom: 2px; }
+        .wg-card .wg-meta { font-size: 12px; color: var(--secondary-text-color, #727272); margin-bottom: 6px; }
+        .wg-card .wg-preview {
+          font-family: monospace; font-size: 11px; white-space: pre; overflow: hidden;
+          text-overflow: ellipsis; max-height: 48px; color: var(--secondary-text-color, #727272);
+          background: var(--card-background-color, #fff); border-radius: 6px; padding: 6px 8px;
+        }
+        .wg-card .wg-del {
+          background: none; border: none; cursor: pointer; color: var(--error-color, #db4437);
+          font-size: 18px; padding: 4px 6px; border-radius: 6px; line-height: 1; flex-shrink: 0;
+        }
+        .wg-card .wg-del:hover { background: rgba(219,68,55,.12); }
+        .wg-form { background: var(--secondary-background-color, #f5f5f5); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+        .wg-form .form-field { margin-bottom: 12px; }
+        .wg-form label { display: block; font-size: 13px; color: var(--secondary-text-color, #727272); margin-bottom: 4px; }
+        .wg-form input, .wg-form textarea {
+          width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px;
+          border: 1px solid var(--divider-color, #ddd); font-size: 13px; font-family: inherit;
+          background: var(--card-background-color, #fff); color: var(--primary-text-color, #212121);
+        }
+        .wg-form textarea { font-family: monospace; min-height: 100px; resize: vertical; }
+        .wg-form .form-btns { display: flex; gap: 8px; margin-top: 4px; }
+        .wg-empty { padding: 24px 0; text-align: center; color: var(--secondary-text-color, #727272); font-size: 14px; }
+
+        /* Provision profiles */
+        .pp-card {
+          background: var(--secondary-background-color, #f5f5f5); border-radius: 10px; padding: 14px 16px;
+          margin-bottom: 10px; display: flex; align-items: flex-start; gap: 14px;
+        }
+        .pp-card .pp-info { flex: 1; min-width: 0; }
+        .pp-card .pp-name { font-weight: 600; font-size: 14px; margin-bottom: 2px; }
+        .pp-card .pp-meta { font-size: 12px; color: var(--secondary-text-color, #727272); }
+        .pp-card .pp-actions { display: flex; gap: 4px; flex-shrink: 0; }
+        .pp-card .pp-btn {
+          background: none; border: none; cursor: pointer; font-size: 16px;
+          padding: 4px 6px; border-radius: 6px; line-height: 1;
+        }
+        .pp-card .pp-btn:hover { background: var(--divider-color, #e8e8e8); }
+        .pp-card .pp-btn.del { color: var(--error-color, #db4437); }
+        .pp-card .pp-btn.del:hover { background: rgba(219,68,55,.12); }
+
+        /* Profile editor overlay */
+        .editor-overlay {
+          position: fixed; inset: 0; z-index: 10001;
+          background: rgba(0,0,0,.42);
+          display: flex; align-items: center; justify-content: center;
+        }
+        .editor-overlay.hidden { display: none; }
+        .editor-modal {
+          background: var(--card-background-color, #fff); color: var(--primary-text-color, #212121);
+          border-radius: 16px; width: 680px; max-width: 94vw; max-height: 88vh;
+          display: flex; flex-direction: column; box-shadow: 0 24px 64px rgba(0,0,0,.36);
+        }
+        .editor-header {
+          display: flex; align-items: center; padding: 18px 24px; gap: 12px;
+          border-bottom: 1px solid var(--divider-color, #e0e0e0); flex-shrink: 0;
+        }
+        .editor-header h3 { flex: 1; margin: 0; font-size: 18px; }
+        .editor-header .close {
+          background: none; border: none; cursor: pointer; font-size: 22px;
+          color: var(--secondary-text-color, #727272); line-height: 1;
+        }
+        .editor-body { flex: 1; overflow-y: auto; padding: 20px 24px; }
+        .editor-footer {
+          display: flex; justify-content: flex-end; gap: 8px; padding: 16px 24px;
+          border-top: 1px solid var(--divider-color, #e0e0e0); flex-shrink: 0;
+        }
+        .editor-section { margin-bottom: 20px; }
+        .editor-section h4 {
+          margin: 0 0 10px; font-size: 13px; font-weight: 600; text-transform: uppercase;
+          letter-spacing: .5px; color: var(--secondary-text-color, #727272);
+        }
+        .editor-section hr {
+          border: none; border-top: 1px solid var(--divider-color, #eee); margin: 0 0 12px;
+        }
+        .editor-row { margin-bottom: 12px; }
+        .editor-row label { display: block; font-size: 13px; color: var(--secondary-text-color, #727272); margin-bottom: 4px; }
+        .editor-row input[type="text"], .editor-row input[type="number"], .editor-row input[type="password"],
+        .editor-row select, .editor-row textarea {
+          width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px;
+          border: 1px solid var(--divider-color, #ddd); font-size: 13px; font-family: inherit;
+          background: var(--card-background-color, #fff); color: var(--primary-text-color, #212121);
+        }
+        .editor-row textarea { font-family: monospace; min-height: 80px; resize: vertical; }
+        .editor-row select { appearance: auto; }
+        .editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+        .editor-toggle {
+          display: flex; align-items: center; gap: 8px; margin-bottom: 10px; cursor: pointer; font-size: 13px;
+        }
+        .editor-toggle input[type="checkbox"] {
+          width: 16px; height: 16px; margin: 0; accent-color: var(--primary-color, #03a9f4);
+        }
+        .editor-msg { font-size: 13px; margin-top: 8px; }
       </style>
       <div class="toolbar">
         <button class="icon-btn menu" id="menu" title="Menu">&#9776;</button>
@@ -260,8 +363,24 @@ class CasaAdminPanel extends HTMLElement {
           <div class="nav">
             <div class="title">Settings</div>
             <div class="tab active" data-tab="site">&#127760; Site</div>
+            <div class="tab" data-tab="wireguard">&#128274; WireGuard</div>
+            <div class="tab" data-tab="profiles">&#128203; Profiles</div>
           </div>
           <div class="pane" id="settings-pane"></div>
+        </div>
+      </div>
+      </div>
+      <div class="editor-overlay hidden" id="profile-overlay">
+        <div class="editor-modal">
+          <div class="editor-header">
+            <h3 id="editor-title">New Profile</h3>
+            <button class="close" id="editor-close" title="Close">&times;</button>
+          </div>
+          <div class="editor-body" id="editor-body"></div>
+          <div class="editor-footer">
+            <button class="btn-plain" id="editor-cancel">Cancel</button>
+            <button class="btn-primary" id="editor-save">Save</button>
+          </div>
         </div>
       </div>
     `;
@@ -274,6 +393,16 @@ class CasaAdminPanel extends HTMLElement {
     sr.getElementById("reconcile").addEventListener("click", () => this._reconcile());
     sr.getElementById("settings").addEventListener("click", () => this._openSettings());
     sr.getElementById("settings-close").addEventListener("click", () => this._closeSettings());
+
+    // Settings tab switching
+    sr.querySelectorAll(".modal .nav .tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        this._settingsTab = tab.dataset.tab;
+        sr.querySelectorAll(".modal .nav .tab").forEach((t) => t.classList.remove("active"));
+        tab.classList.add("active");
+        this._renderSettingsBody();
+      });
+    });
     sr.getElementById("overlay").addEventListener("click", (e) => {
       if (e.target === sr.getElementById("overlay")) this._closeSettings();
     });
@@ -284,6 +413,18 @@ class CasaAdminPanel extends HTMLElement {
   }
 
   _renderSettingsBody() {
+    if (this._settingsTab === "wireguard") {
+      this._renderWireGuardPane();
+      return;
+    }
+    if (this._settingsTab === "profiles") {
+      this._renderProfilesPane();
+      return;
+    }
+    this._renderSitePane();
+  }
+
+  _renderSitePane() {
     const pane = this.shadowRoot && this.shadowRoot.getElementById("settings-pane");
     if (!pane) return;
     const siteId = (this._data && this._data.site_id) || "—";
@@ -327,6 +468,461 @@ class CasaAdminPanel extends HTMLElement {
     pin("regen-start", () => { this._regenConfirm = true; this._regenMsg = ""; this._renderSettingsBody(); });
     pin("regen-cancel", () => { this._regenConfirm = false; this._renderSettingsBody(); });
     pin("regen-confirm", () => this._regenerate());
+  }
+
+  _renderWireGuardPane() {
+    const pane = this.shadowRoot && this.shadowRoot.getElementById("settings-pane");
+    if (!pane) return;
+
+    // Load profiles on first visit
+    if (!this._wgProfiles && !this._wgLoading) {
+      this._loadWgProfiles();
+    }
+
+    const profiles = this._wgProfiles || [];
+    const showForm = !!this._wgShowForm;
+
+    let formHtml = "";
+    if (showForm) {
+      formHtml = `
+        <div class="wg-form">
+          <div class="form-field">
+            <label>Alias (optional — auto-generated if blank)</label>
+            <input id="wg-alias" type="text" placeholder="e.g. Office VPN">
+          </div>
+          <div class="form-field">
+            <label>WireGuard Config *</label>
+            <textarea id="wg-config" placeholder="[Interface]\nPrivateKey = ...\nAddress = ...\n\n[Peer]\nPublicKey = ...\nEndpoint = ..."></textarea>
+          </div>
+          <div class="form-field">
+            <label>Excluded WiFi (optional)</label>
+            <input id="wg-excluded" type="text" placeholder="HomeSSID, OfficeSSID">
+          </div>
+          <div class="form-btns">
+            <button class="btn-primary" id="wg-save">Save</button>
+            <button class="btn-plain" id="wg-cancel">Cancel</button>
+          </div>
+          ${this._wgFormError ? `<div class="regen-msg" style="color:var(--error-color,#db4437)">${this._esc(this._wgFormError)}</div>` : ""}
+        </div>`;
+    }
+
+    let listHtml;
+    if (this._wgLoading) {
+      listHtml = `<div class="wg-empty">Loading…</div>`;
+    } else if (profiles.length === 0) {
+      listHtml = `<div class="wg-empty">No WireGuard profiles.</div>`;
+    } else {
+      listHtml = profiles.map((p) => {
+        const preview = (p.config || "").split("\n").slice(0, 3).join("\n");
+        return `
+          <div class="wg-card">
+            <div class="wg-info">
+              <div class="wg-alias">${this._esc(p.alias)}</div>
+              <div class="wg-meta">${this._fmtTime(p.created_at)}${p.excluded_wifi ? " · Excl: " + this._esc(p.excluded_wifi) : ""}</div>
+              <div class="wg-preview">${this._esc(preview)}</div>
+            </div>
+            <button class="wg-del" data-id="${this._esc(p.id)}" title="Delete profile">&#128465;</button>
+          </div>`;
+      }).join("");
+    }
+
+    pane.innerHTML = `
+      <h3>WireGuard Profiles</h3>
+      <p class="sub">Manage stored WireGuard VPN configurations.</p>
+      <div class="wg-toolbar">
+        <button class="btn-primary" id="wg-add">&#43; Add Profile</button>
+        <button class="btn-plain" id="wg-refresh">&#8635; Refresh</button>
+      </div>
+      ${formHtml}
+      ${listHtml}
+    `;
+
+    // Bind toolbar
+    pane.querySelector("#wg-add").addEventListener("click", () => {
+      this._wgShowForm = !this._wgShowForm;
+      this._wgFormError = "";
+      this._renderWireGuardPane();
+    });
+    pane.querySelector("#wg-refresh").addEventListener("click", () => this._loadWgProfiles());
+
+    // Bind form
+    if (showForm) {
+      pane.querySelector("#wg-save").addEventListener("click", () => {
+        const alias = pane.querySelector("#wg-alias").value;
+        const config = pane.querySelector("#wg-config").value;
+        const excluded = pane.querySelector("#wg-excluded").value;
+        this._addWgProfile(alias, config, excluded);
+      });
+      pane.querySelector("#wg-cancel").addEventListener("click", () => {
+        this._wgShowForm = false;
+        this._wgFormError = "";
+        this._renderWireGuardPane();
+      });
+    }
+
+    // Bind delete buttons
+    pane.querySelectorAll(".wg-del").forEach((btn) => {
+      btn.addEventListener("click", () => this._deleteWgProfile(btn.dataset.id));
+    });
+  }
+
+  async _loadWgProfiles() {
+    if (!this._hass) return;
+    this._wgLoading = true;
+    this._renderWireGuardPane();
+    try {
+      const res = await this._hass.callApi("GET", "casa/admin/wireguard_profiles");
+      this._wgProfiles = res.profiles || [];
+    } catch (err) {
+      this._wgProfiles = [];
+    }
+    this._wgLoading = false;
+    this._renderWireGuardPane();
+  }
+
+  async _addWgProfile(alias, config, excludedWifi) {
+    if (!this._hass) return;
+    if (!config || !config.trim()) {
+      this._wgFormError = "Config is required.";
+      this._renderWireGuardPane();
+      return;
+    }
+    try {
+      await this._hass.callApi("POST", "casa/admin/wireguard_profiles", {
+        alias: alias,
+        config: config,
+        excluded_wifi: excludedWifi,
+      });
+      this._wgShowForm = false;
+      this._wgFormError = "";
+      await this._loadWgProfiles();
+    } catch (err) {
+      this._wgFormError = "Failed: " + ((err && err.message) || err);
+      this._renderWireGuardPane();
+    }
+  }
+
+  async _deleteWgProfile(id) {
+    if (!this._hass) return;
+    try {
+      await this._hass.callApi("DELETE", "casa/admin/wireguard_profiles?id=" + encodeURIComponent(id));
+      await this._loadWgProfiles();
+    } catch (err) {
+      await this._loadWgProfiles();
+    }
+  }
+
+  /* ===== Provision Profiles ===== */
+
+  _renderProfilesPane() {
+    const pane = this.shadowRoot && this.shadowRoot.getElementById("settings-pane");
+    if (!pane) return;
+
+    if (!this._ppProfiles && !this._ppLoading) {
+      this._loadProvisionProfiles();
+    }
+
+    const profiles = this._ppProfiles || [];
+
+    let listHtml;
+    if (this._ppLoading) {
+      listHtml = `<div class="wg-empty">Loading…</div>`;
+    } else if (profiles.length === 0) {
+      listHtml = `<div class="wg-empty">No provisioning profiles saved.</div>`;
+    } else {
+      listHtml = profiles.map((p) => {
+        const f = p.fields || {};
+        return `
+          <div class="pp-card">
+            <div class="pp-info">
+              <div class="pp-name">${this._esc(p.name)}</div>
+              <div class="pp-meta">${this._esc(f.username || "—")} · ${this._esc(f.host_url || "—")} · ${this._fmtTime(p.created_at)}</div>
+            </div>
+            <div class="pp-actions">
+              <button class="pp-btn" data-id="${this._esc(p.id)}" data-action="edit" title="Edit">&#9998;</button>
+              <button class="pp-btn del" data-id="${this._esc(p.id)}" data-action="delete" title="Delete">&#128465;</button>
+            </div>
+          </div>`;
+      }).join("");
+    }
+
+    pane.innerHTML = `
+      <h3>Provisioning Profiles</h3>
+      <p class="sub">Saved provisioning templates for the casa.provision service.</p>
+      <div class="wg-toolbar">
+        <button class="btn-primary" id="pp-add">&#43; New Profile</button>
+        <button class="btn-plain" id="pp-refresh">&#8635; Refresh</button>
+      </div>
+      ${listHtml}
+    `;
+
+    pane.querySelector("#pp-add").addEventListener("click", () => this._openProfileEditor(null));
+    pane.querySelector("#pp-refresh").addEventListener("click", () => this._loadProvisionProfiles());
+
+    pane.querySelectorAll(".pp-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.dataset.id;
+        if (btn.dataset.action === "edit") {
+          const profile = (this._ppProfiles || []).find((p) => p.id === id);
+          if (profile) this._openProfileEditor(profile);
+        } else {
+          this._deleteProvisionProfile(id);
+        }
+      });
+    });
+  }
+
+  _openProfileEditor(profile) {
+    this._ppEditing = profile;
+    this._ppFormError = "";
+    const sr = this.shadowRoot;
+    const overlay = sr.getElementById("profile-overlay");
+    overlay.classList.remove("hidden");
+    sr.getElementById("editor-title").textContent = profile ? "Edit Profile" : "New Profile";
+    this._renderProfileEditorBody();
+
+    // Bind buttons
+    const bindOnce = (id, fn) => {
+      const el = sr.getElementById(id);
+      const clone = el.cloneNode(true);
+      el.parentNode.replaceChild(clone, el);
+      clone.addEventListener("click", fn);
+    };
+    bindOnce("editor-close", () => this._closeProfileEditor());
+    bindOnce("editor-cancel", () => this._closeProfileEditor());
+    bindOnce("editor-save", () => this._saveProfileFromEditor());
+    overlay.onclick = (e) => { if (e.target === overlay) this._closeProfileEditor(); };
+  }
+
+  _closeProfileEditor() {
+    this.shadowRoot.getElementById("profile-overlay").classList.add("hidden");
+  }
+
+  _renderProfileEditorBody() {
+    const body = this.shadowRoot.getElementById("editor-body");
+    if (!body) return;
+    const f = (this._ppEditing && this._ppEditing.fields) || {};
+    const v = (key, def) => this._esc(f[key] !== undefined ? f[key] : def);
+    const c = (key, def) => (f[key] !== undefined ? f[key] : def) ? "checked" : "";
+    const profileName = this._ppEditing ? this._ppEditing.name : "";
+
+    body.innerHTML = `
+      <div class="editor-section">
+        <h4>Profile</h4><hr>
+        <div class="editor-row">
+          <label>Profile Name</label>
+          <input type="text" id="pp-name" value="${this._esc(profileName)}" placeholder="Auto-generated if blank">
+        </div>
+      </div>
+      <div class="editor-section">
+        <h4>Connection</h4><hr>
+        <div class="editor-grid">
+          <div class="editor-row">
+            <label>Host URL *</label>
+            <input type="text" id="pp-host_url" value="${v("host_url", "")}" placeholder="http://192.168.1.21:8123">
+          </div>
+          <div class="editor-row">
+            <label>Username *</label>
+            <input type="text" id="pp-username" value="${v("username", "")}" placeholder="guest">
+          </div>
+          <div class="editor-row">
+            <label>Password (optional)</label>
+            <input type="text" id="pp-password" value="${v("password", "")}" placeholder="Auto-generated if blank">
+          </div>
+          <div class="editor-row">
+            <label>PIN (optional, max 6 digits)</label>
+            <input type="text" id="pp-pin" value="${v("pin", "")}" placeholder="123456" maxlength="6">
+          </div>
+        </div>
+      </div>
+      <div class="editor-section">
+        <h4>App UI</h4><hr>
+        <div class="editor-grid">
+          <div class="editor-row">
+            <label>Default Dashboard</label>
+            <input type="text" id="pp-default_dashboard" value="${v("default_dashboard", "")}" placeholder="/lovelace/home">
+          </div>
+          <div class="editor-row">
+            <label>Welcome URL</label>
+            <input type="text" id="pp-welcome_url" value="${v("welcome_url", "")}" placeholder="Optional URL shown after provisioning">
+          </div>
+          <div class="editor-row">
+            <label>Immersive Level</label>
+            <select id="pp-immersive_level">
+              <option value="1" ${v("immersive_level", "1") === "1" ? "selected" : ""}>Level 1 (Standard)</option>
+              <option value="2" ${v("immersive_level", "1") === "2" ? "selected" : ""}>Level 2 (Edge-to-Edge)</option>
+              <option value="3" ${v("immersive_level", "1") === "3" ? "selected" : ""}>Level 3 (Fullscreen)</option>
+            </select>
+          </div>
+          <div class="editor-row">
+            <label>Theme Color Mode</label>
+            <select id="pp-theme_color_mode">
+              <option value="inherit" ${v("theme_color_mode", "inherit") === "inherit" ? "selected" : ""}>Inherit from HA</option>
+              <option value="custom" ${v("theme_color_mode", "inherit") === "custom" ? "selected" : ""}>Custom Color</option>
+              <option value="inherit_with_fallback" ${v("theme_color_mode", "inherit") === "inherit_with_fallback" ? "selected" : ""}>Inherit with Fallback</option>
+            </select>
+          </div>
+          <div class="editor-row">
+            <label>Custom Color (Hex)</label>
+            <input type="text" id="pp-custom_color" value="${v("custom_color", "#000000")}" placeholder="#03A9F4">
+          </div>
+        </div>
+      </div>
+      <div class="editor-section">
+        <h4>Permissions</h4><hr>
+        <label class="editor-toggle"><input type="checkbox" id="pp-deauthenticate_existing" ${c("deauthenticate_existing", false)}> Deauthenticate Existing Connections</label>
+        <label class="editor-toggle"><input type="checkbox" id="pp-allow_all_pages" ${c("allow_all_pages", false)}> Allow All Pages</label>
+        <div class="editor-grid">
+          <div class="editor-row">
+            <label>Allowed Pages (comma-separated)</label>
+            <input type="text" id="pp-allowed_pages" value="${v("allowed_pages", "")}" placeholder="/lovelace/home, /dashboard-1/*">
+          </div>
+          <div class="editor-row">
+            <label>Allowed WiFi (comma-separated)</label>
+            <input type="text" id="pp-allowed_wifi" value="${v("allowed_wifi", "")}" placeholder="HomeSSID, OfficeSSID">
+          </div>
+        </div>
+      </div>
+      <div class="editor-section">
+        <h4>Push Notifications & VPN</h4><hr>
+        <div class="editor-grid">
+          <div class="editor-row">
+            <label>Push Notifications</label>
+            <select id="pp-push_notifications">
+              <option value="false" ${v("push_notifications", "false") === "false" ? "selected" : ""}>Disabled</option>
+              <option value="true" ${v("push_notifications", "false") === "true" ? "selected" : ""}>Enabled</option>
+              <option value="mandatory" ${v("push_notifications", "false") === "mandatory" ? "selected" : ""}>Mandatory</option>
+            </select>
+          </div>
+        </div>
+        <label class="editor-toggle"><input type="checkbox" id="pp-allow_wireguard" ${c("allow_wireguard", false)}> Allow WireGuard</label>
+        <div class="editor-row">
+          <label>WireGuard Config</label>
+          <textarea id="pp-wireguard_config" placeholder="[Interface]\nPrivateKey = ...">${this._esc(f.wireguard_config || "")}</textarea>
+        </div>
+        <div class="editor-row">
+          <label>WireGuard Excluded WiFi</label>
+          <input type="text" id="pp-wireguard_excluded_wifi" value="${v("wireguard_excluded_wifi", "")}" placeholder="HomeSSID">
+        </div>
+      </div>
+      <div class="editor-section">
+        <h4>Timing</h4><hr>
+        <div class="editor-grid">
+          <div class="editor-row">
+            <label>Timeout (minutes, 0 = permanent)</label>
+            <input type="number" id="pp-timeout_minutes" value="${f.timeout_minutes !== undefined ? f.timeout_minutes : 5}" min="0" max="60">
+          </div>
+          <div class="editor-row">
+            <label>Session Expiration (hours, 0 = permanent)</label>
+            <input type="number" id="pp-expiration_hours" value="${f.expiration_hours !== undefined ? f.expiration_hours : 336}" min="0" max="87600">
+          </div>
+        </div>
+        <label class="editor-toggle"><input type="checkbox" id="pp-password_scramble" ${c("password_scramble", true)}> Scramble Password After Window</label>
+        <div class="editor-row">
+          <label>Password Scramble In (minutes, 0 = inherit from timeout)</label>
+          <input type="number" id="pp-password_scramble_in" value="${f.password_scramble_in !== undefined ? f.password_scramble_in : 0}" min="0" max="120">
+        </div>
+        <div class="editor-row">
+          <label>Cache Control (hours, blank = default 48h)</label>
+          <input type="text" id="pp-cache_control_hours" value="${v("cache_control_hours", "")}" placeholder="48">
+        </div>
+      </div>
+      <div class="editor-section">
+        <h4>WiFi Provisioning</h4><hr>
+        <div class="editor-grid">
+          <div class="editor-row">
+            <label>Connect WiFi SSID</label>
+            <input type="text" id="pp-connect_wifi_ssid" value="${v("connect_wifi_ssid", "")}" placeholder="MyNetwork">
+          </div>
+          <div class="editor-row">
+            <label>Connect WiFi Password</label>
+            <input type="password" id="pp-connect_wifi_password" value="${v("connect_wifi_password", "")}" placeholder="Password">
+          </div>
+        </div>
+      </div>
+      ${this._ppFormError ? `<div class="editor-msg" style="color:var(--error-color,#db4437)">${this._esc(this._ppFormError)}</div>` : ""}
+    `;
+  }
+
+  async _saveProfileFromEditor() {
+    const sr = this.shadowRoot;
+    const body = sr.getElementById("editor-body");
+    const gv = (id) => { const el = body.querySelector("#" + id); return el ? el.value : ""; };
+    const gc = (id) => { const el = body.querySelector("#" + id); return el ? el.checked : false; };
+
+    const host_url = gv("pp-host_url").trim();
+    const username = gv("pp-username").trim();
+    if (!host_url || !username) {
+      this._ppFormError = "Host URL and Username are required.";
+      this._renderProfileEditorBody();
+      return;
+    }
+
+    const data = {
+      name: gv("pp-name"),
+      host_url: host_url,
+      username: username,
+      password: gv("pp-password"),
+      pin: gv("pp-pin"),
+      default_dashboard: gv("pp-default_dashboard"),
+      welcome_url: gv("pp-welcome_url"),
+      immersive_level: gv("pp-immersive_level"),
+      theme_color_mode: gv("pp-theme_color_mode"),
+      custom_color: gv("pp-custom_color"),
+      deauthenticate_existing: gc("pp-deauthenticate_existing"),
+      allow_all_pages: gc("pp-allow_all_pages"),
+      allowed_pages: gv("pp-allowed_pages"),
+      allowed_wifi: gv("pp-allowed_wifi"),
+      push_notifications: gv("pp-push_notifications"),
+      allow_wireguard: gc("pp-allow_wireguard"),
+      wireguard_config: gv("pp-wireguard_config"),
+      wireguard_excluded_wifi: gv("pp-wireguard_excluded_wifi"),
+      timeout_minutes: parseInt(gv("pp-timeout_minutes")) || 0,
+      password_scramble: gc("pp-password_scramble"),
+      password_scramble_in: parseInt(gv("pp-password_scramble_in")) || 0,
+      expiration_hours: parseInt(gv("pp-expiration_hours")) || 0,
+      connect_wifi_ssid: gv("pp-connect_wifi_ssid"),
+      connect_wifi_password: gv("pp-connect_wifi_password"),
+      cache_control_hours: gv("pp-cache_control_hours"),
+    };
+
+    try {
+      if (this._ppEditing) {
+        data.id = this._ppEditing.id;
+        await this._hass.callApi("PUT", "casa/admin/provision_profiles", data);
+      } else {
+        await this._hass.callApi("POST", "casa/admin/provision_profiles", data);
+      }
+      this._closeProfileEditor();
+      await this._loadProvisionProfiles();
+    } catch (err) {
+      this._ppFormError = "Failed: " + ((err && err.message) || err);
+      this._renderProfileEditorBody();
+    }
+  }
+
+  async _loadProvisionProfiles() {
+    if (!this._hass) return;
+    this._ppLoading = true;
+    this._renderProfilesPane();
+    try {
+      const res = await this._hass.callApi("GET", "casa/admin/provision_profiles");
+      this._ppProfiles = res.profiles || [];
+    } catch (err) {
+      this._ppProfiles = [];
+    }
+    this._ppLoading = false;
+    this._renderProfilesPane();
+  }
+
+  async _deleteProvisionProfile(id) {
+    if (!this._hass) return;
+    try {
+      await this._hass.callApi("DELETE", "casa/admin/provision_profiles?id=" + encodeURIComponent(id));
+      await this._loadProvisionProfiles();
+    } catch (err) {
+      await this._loadProvisionProfiles();
+    }
   }
 
   _update() {

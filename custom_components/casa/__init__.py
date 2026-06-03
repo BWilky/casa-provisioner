@@ -6,6 +6,7 @@ import secrets
 import base64
 import time
 import json
+import uuid
 import zlib
 import urllib.parse
 import re
@@ -477,6 +478,246 @@ class CasaAdminSummaryView(HomeAssistantView):
         })
 
 
+class CasaWireGuardProfilesView(HomeAssistantView):
+    """Admin-only CRUD for WireGuard profiles stored in Casa_WireGuardProfiles."""
+
+    url = "/api/casa/admin/wireguard_profiles"
+    name = "api:casa:admin:wireguard_profiles"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        wg_data = self.hass.data.get(DOMAIN, {}).get("wg_data", {"profiles": []})
+        return self.json({"profiles": wg_data.get("profiles", [])})
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        config = body.get("config", "").strip()
+        if not config:
+            return self.json({"error": "config is required"}, status_code=400)
+
+        alias = body.get("alias", "").strip()
+        if not alias:
+            suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+            alias = f"WireGuard {suffix}"
+
+        excluded_wifi = body.get("excluded_wifi", "").strip()
+
+        profile = {
+            "id": str(uuid.uuid4()),
+            "alias": alias,
+            "config": config,
+            "excluded_wifi": excluded_wifi,
+            "created_at": dt_util.now().isoformat(),
+        }
+
+        wg_data = self.hass.data[DOMAIN]["wg_data"]
+        wg_data.setdefault("profiles", []).append(profile)
+        wg_store = self.hass.data[DOMAIN]["wg_store"]
+        wg_store.async_delay_save(lambda: wg_data, 2.0)
+
+        _LOGGER.info("CASA: Created WireGuard profile '%s' (id=%s).", alias, profile["id"])
+        return self.json(profile, status_code=201)
+
+    async def delete(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        profile_id = request.query.get("id", "").strip()
+        if not profile_id:
+            return self.json({"error": "Missing id query parameter"}, status_code=400)
+
+        wg_data = self.hass.data[DOMAIN]["wg_data"]
+        profiles = wg_data.get("profiles", [])
+        before_len = len(profiles)
+        wg_data["profiles"] = [p for p in profiles if p.get("id") != profile_id]
+
+        if len(wg_data["profiles"]) == before_len:
+            return self.json({"error": "Profile not found"}, status_code=404)
+
+        wg_store = self.hass.data[DOMAIN]["wg_store"]
+        wg_store.async_delay_save(lambda: wg_data, 2.0)
+
+        _LOGGER.info("CASA: Deleted WireGuard profile id=%s.", profile_id)
+        return self.json({"status": "ok"})
+
+
+class CasaProvisionProfilesView(HomeAssistantView):
+    """Admin-only CRUD for static provisioning profiles stored in casa_provision_profiles."""
+
+    url = "/api/casa/admin/provision_profiles"
+    name = "api:casa:admin:provision_profiles"
+
+    _DEFAULT_FIELDS = {
+        "host_url": "",
+        "username": "",
+        "password": "",
+        "pin": "",
+        "default_dashboard": "",
+        "welcome_url": "",
+        "immersive_level": "1",
+        "theme_color_mode": "inherit",
+        "custom_color": "#000000",
+        "deauthenticate_existing": False,
+        "allow_all_pages": False,
+        "allowed_pages": "",
+        "allowed_wifi": "",
+        "push_notifications": "false",
+        "allow_wireguard": False,
+        "wireguard_config": "",
+        "wireguard_excluded_wifi": "",
+        "timeout_minutes": 5,
+        "password_scramble": True,
+        "password_scramble_in": 0,
+        "expiration_hours": 336,
+        "connect_wifi_ssid": "",
+        "connect_wifi_password": "",
+        "cache_control_hours": "",
+    }
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        pp_data = self.hass.data.get(DOMAIN, {}).get("pp_data", {"profiles": []})
+        return self.json({"profiles": pp_data.get("profiles", [])})
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        name = body.get("name", "").strip()
+        if not name:
+            suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+            name = f"Profile {suffix}"
+
+        fields = {}
+        for key, default in self._DEFAULT_FIELDS.items():
+            val = body.get(key, default)
+            if isinstance(default, bool):
+                fields[key] = bool(val)
+            elif isinstance(default, int) and not isinstance(default, bool):
+                try:
+                    fields[key] = int(val) if val != "" else default
+                except (TypeError, ValueError):
+                    fields[key] = default
+            else:
+                fields[key] = str(val) if val is not None else ""
+
+        now_iso = dt_util.now().isoformat()
+        profile = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "fields": fields,
+        }
+
+        pp_data = self.hass.data[DOMAIN]["pp_data"]
+        pp_data.setdefault("profiles", []).append(profile)
+        pp_store = self.hass.data[DOMAIN]["pp_store"]
+        pp_store.async_delay_save(lambda: pp_data, 2.0)
+
+        _LOGGER.info("CASA: Created provision profile '%s' (id=%s).", name, profile["id"])
+        return self.json(profile, status_code=201)
+
+    async def put(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        profile_id = body.get("id", "").strip()
+        if not profile_id:
+            return self.json({"error": "Missing id"}, status_code=400)
+
+        pp_data = self.hass.data[DOMAIN]["pp_data"]
+        target = None
+        for p in pp_data.get("profiles", []):
+            if p.get("id") == profile_id:
+                target = p
+                break
+        if not target:
+            return self.json({"error": "Profile not found"}, status_code=404)
+
+        name = body.get("name", "").strip()
+        if name:
+            target["name"] = name
+
+        fields = target.get("fields", {})
+        for key, default in self._DEFAULT_FIELDS.items():
+            if key in body:
+                val = body[key]
+                if isinstance(default, bool):
+                    fields[key] = bool(val)
+                elif isinstance(default, int) and not isinstance(default, bool):
+                    try:
+                        fields[key] = int(val) if val != "" else default
+                    except (TypeError, ValueError):
+                        fields[key] = default
+                else:
+                    fields[key] = str(val) if val is not None else ""
+        target["fields"] = fields
+        target["updated_at"] = dt_util.now().isoformat()
+
+        pp_store = self.hass.data[DOMAIN]["pp_store"]
+        pp_store.async_delay_save(lambda: pp_data, 2.0)
+
+        _LOGGER.info("CASA: Updated provision profile '%s' (id=%s).", target["name"], profile_id)
+        return self.json(target)
+
+    async def delete(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        profile_id = request.query.get("id", "").strip()
+        if not profile_id:
+            return self.json({"error": "Missing id query parameter"}, status_code=400)
+
+        pp_data = self.hass.data[DOMAIN]["pp_data"]
+        profiles = pp_data.get("profiles", [])
+        before_len = len(profiles)
+        pp_data["profiles"] = [p for p in profiles if p.get("id") != profile_id]
+
+        if len(pp_data["profiles"]) == before_len:
+            return self.json({"error": "Profile not found"}, status_code=404)
+
+        pp_store = self.hass.data[DOMAIN]["pp_store"]
+        pp_store.async_delay_save(lambda: pp_data, 2.0)
+
+        _LOGGER.info("CASA: Deleted provision profile id=%s.", profile_id)
+        return self.json({"status": "ok"})
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
@@ -507,6 +748,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _register_site(hass, stored_data, store)
 
     hass.data[DOMAIN]["stored_data"] = stored_data
+
+    # Initialize WireGuard profiles store (separate .storage file)
+    wg_store = Store(hass, 1, "Casa_WireGuardProfiles")
+    wg_data = await wg_store.async_load()
+    if wg_data is None:
+        wg_data = {"profiles": []}
+    hass.data[DOMAIN]["wg_store"] = wg_store
+    hass.data[DOMAIN]["wg_data"] = wg_data
+
+    # Initialize provision profiles store (separate .storage file)
+    pp_store = Store(hass, 1, "casa_provision_profiles")
+    pp_data = await pp_store.async_load()
+    if pp_data is None:
+        pp_data = {"profiles": []}
+    hass.data[DOMAIN]["pp_store"] = pp_store
+    hass.data[DOMAIN]["pp_data"] = pp_data
 
     create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
     
@@ -757,6 +1014,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
     hass.http.register_view(CasaHeartbeatView(hass, async_heartbeat))
     hass.http.register_view(CasaAdminSummaryView(hass))
+    hass.http.register_view(CasaWireGuardProfilesView(hass))
+    hass.http.register_view(CasaProvisionProfilesView(hass))
 
     # Serve the admin panel assets once per process; the route survives reloads.
     global _PANEL_STATIC_REGISTERED
