@@ -374,7 +374,13 @@ class CasaAdminPanel extends HTMLElement {
         </div>
         <div class="columns">
           <div class="card"><h2>Managed Devices</h2><div id="devices"></div></div>
-          <div class="card"><h2>Managed Accounts</h2><div id="accounts"></div></div>
+          <div class="card">
+            <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--divider-color, #e0e0e0); padding-right:16px;">
+              <h2 style="border-bottom:none;">Managed Accounts</h2>
+              <button class="icon-btn" id="add-account-dash" title="Add Guest Account" style="cursor:pointer; background:none; border:none; color:var(--primary-text-color); padding:4px; line-height:1;"><ha-icon icon="mdi:plus"></ha-icon></button>
+            </div>
+            <div id="accounts"></div>
+          </div>
         </div>
       </div>
       <div class="overlay hidden" id="overlay">
@@ -385,6 +391,7 @@ class CasaAdminPanel extends HTMLElement {
             <div class="tab active" data-tab="site"><ha-icon icon="mdi:earth"></ha-icon> Site</div>
             <div class="tab" data-tab="wireguard"><ha-icon icon="mdi:shield-key"></ha-icon> WireGuard</div>
             <div class="tab" data-tab="profiles"><ha-icon icon="mdi:clipboard-text-multiple-outline"></ha-icon> Profiles</div>
+            <div class="tab" data-tab="accounts"><ha-icon icon="mdi:account-multiple-outline"></ha-icon> Accounts</div>
           </div>
           <div class="pane" id="settings-pane"></div>
         </div>
@@ -428,6 +435,19 @@ class CasaAdminPanel extends HTMLElement {
           </div>
         </div>
       </div>
+      <div class="editor-overlay hidden" id="account-overlay">
+        <div class="editor-modal">
+          <div class="editor-header">
+            <h3 id="account-editor-title">Create Guest Account</h3>
+            <button class="close" id="account-editor-close" title="Close"><ha-icon icon="mdi:close"></ha-icon></button>
+          </div>
+          <div class="editor-body" id="account-editor-body"></div>
+          <div class="editor-footer" id="account-editor-footer">
+            <button class="btn-plain" id="account-editor-cancel">Cancel</button>
+            <button class="btn-primary" id="account-editor-save">Create</button>
+          </div>
+        </div>
+      </div>
     `;
 
     const sr = this.shadowRoot;
@@ -438,6 +458,7 @@ class CasaAdminPanel extends HTMLElement {
     sr.getElementById("reconcile").addEventListener("click", () => this._reconcile());
     sr.getElementById("settings").addEventListener("click", () => this._openSettings());
     sr.getElementById("settings-close").addEventListener("click", () => this._closeSettings());
+    sr.getElementById("add-account-dash").addEventListener("click", () => this._openAccountCreator());
 
     // Settings tab switching
     sr.querySelectorAll(".modal .nav .tab").forEach((tab) => {
@@ -464,6 +485,10 @@ class CasaAdminPanel extends HTMLElement {
     }
     if (this._settingsTab === "profiles") {
       this._renderProfilesPane();
+      return;
+    }
+    if (this._settingsTab === "accounts") {
+      this._renderAccountsPane();
       return;
     }
     this._renderSitePane();
@@ -927,6 +952,220 @@ class CasaAdminPanel extends HTMLElement {
       this._deviceWgError = "Failed to push: " + ((err && err.message) || err);
     }
     this._renderDeviceInspectorBody();
+  }
+
+  /* ===== Guest Account Creator & Management ===== */
+
+  _openAccountCreator() {
+    this._accCreatedCreds = null;
+    this._accFormError = "";
+    this._accFormLoading = false;
+
+    const sr = this.shadowRoot;
+    const overlay = sr.getElementById("account-overlay");
+    overlay.classList.remove("hidden");
+    this._renderAccountCreatorBody();
+
+    // Bind close/cancel triggers
+    const bindOnce = (id, fn) => {
+      const el = sr.getElementById(id);
+      if (el) {
+        const clone = el.cloneNode(true);
+        el.parentNode.replaceChild(clone, el);
+        clone.addEventListener("click", fn);
+      }
+    };
+    bindOnce("account-editor-close", () => this._closeAccountCreator());
+    overlay.onclick = (e) => { if (e.target === overlay) this._closeAccountCreator(); };
+  }
+
+  _closeAccountCreator() {
+    this.shadowRoot.getElementById("account-overlay").classList.add("hidden");
+    this._load();
+  }
+
+  _renderAccountCreatorBody() {
+    const sr = this.shadowRoot;
+    const body = sr.getElementById("account-editor-body");
+    const footer = sr.getElementById("account-editor-footer");
+    if (!body || !footer) return;
+
+    const esc = (val) => this._esc(val || "");
+
+    if (this._accCreatedCreds) {
+      body.innerHTML = `
+        <div style="text-align:center; padding:16px 0;">
+          <ha-icon icon="mdi:check-circle" style="color:var(--success-color,#43a047); --mdc-icon-size:48px; margin-bottom:12px;"></ha-icon>
+          <h4 style="margin:0 0 8px 0; font-size:16px;">Guest Account Created!</h4>
+          <p style="margin:0 0 16px 0; font-size:13px; color:var(--secondary-text-color,#727272);">Copy these credentials. The password is only shown once.</p>
+          <div style="background:var(--secondary-background-color,#f5f5f5); border-radius:8px; padding:16px; text-align:left; font-size:13px; display:inline-block; min-width:280px; box-sizing:border-box;">
+            <div style="margin-bottom:8px;"><strong>Full Name:</strong> <span>${esc(this._accCreatedCreds.name)}</span></div>
+            <div style="margin-bottom:8px;"><strong>Username:</strong> <code>${esc(this._accCreatedCreds.username)}</code></div>
+            <div><strong>Password:</strong> <code style="background:var(--card-background-color,#fff); padding:2px 6px; border-radius:4px; border:1px solid var(--divider-color,#ddd); font-size:14px; font-weight:bold; letter-spacing:0.5px;">${esc(this._accCreatedCreds.password)}</code></div>
+          </div>
+        </div>
+      `;
+      footer.innerHTML = `
+        <button class="btn-primary" id="acc-done">Done</button>
+      `;
+      footer.querySelector("#acc-done").addEventListener("click", () => this._closeAccountCreator());
+      return;
+    }
+
+    body.innerHTML = `
+      <div class="editor-section">
+        <h4>Account Details</h4><hr>
+        <div class="editor-row">
+          <label>Full Name *</label>
+          <input type="text" id="acc-name" placeholder="e.g. John Doe">
+        </div>
+        <div class="editor-row">
+          <label>Username *</label>
+          <input type="text" id="acc-username" placeholder="e.g. john" style="text-transform: lowercase;">
+        </div>
+        <div class="editor-row">
+          <label>Password (optional — secure password generated if blank)</label>
+          <input type="password" id="acc-password" placeholder="••••••••">
+        </div>
+      </div>
+      ${this._accFormError ? `<div class="editor-msg" style="color:var(--error-color,#db4437)">${esc(this._accFormError)}</div>` : ""}
+    `;
+
+    footer.innerHTML = `
+      <button class="btn-plain" id="account-editor-cancel">Cancel</button>
+      <button class="btn-primary" id="account-editor-save">${this._accFormLoading ? "Creating…" : "Create"}</button>
+    `;
+
+    footer.querySelector("#account-editor-cancel").addEventListener("click", () => this._closeAccountCreator());
+    footer.querySelector("#account-editor-save").addEventListener("click", () => this._createAccount());
+  }
+
+  async _createAccount() {
+    if (this._accFormLoading) return;
+
+    const sr = this.shadowRoot;
+    const body = sr.getElementById("account-editor-body");
+    const name = body.querySelector("#acc-name").value.trim();
+    const username = body.querySelector("#acc-username").value.trim().toLowerCase();
+    const password = body.querySelector("#acc-password").value.trim();
+
+    if (!name || !username) {
+      this._accFormError = "Name and Username are required.";
+      this._renderAccountCreatorBody();
+      return;
+    }
+
+    this._accFormLoading = true;
+    this._accFormError = "";
+    this._renderAccountCreatorBody();
+
+    try {
+      const res = await this._hass.callService("casa", "create_user", {
+        name: name,
+        username: username,
+        password: password || undefined,
+        local_only: true
+      });
+      
+      this._accCreatedCreds = {
+        name: name,
+        username: username,
+        password: (res && res.password) || password || "(Securely generated in backend)"
+      };
+    } catch (err) {
+      this._accFormError = "Failed: " + ((err && err.message) || err);
+    }
+    this._accFormLoading = false;
+    this._renderAccountCreatorBody();
+  }
+
+  async _scrambleAccountPassword(username) {
+    if (!confirm(`Are you sure you want to reset the password for guest '${username}'?\nThis will scramble their credentials and revoke all active login sessions.`)) {
+      return;
+    }
+
+    try {
+      const res = await this._hass.callService("casa", "scramble_guest_password", {
+        username: username,
+        deauthenticate: true
+      });
+      const newPwd = (res && res.password) || "(randomly scrambled)";
+      alert(`Password for guest '${username}' has been reset.\n\nNew Password: ${newPwd}\n(Please write this password down as it won't be shown again.)`);
+      this._load();
+    } catch (err) {
+      alert("Failed: " + ((err && err.message) || err));
+    }
+  }
+
+  async _removeAccount(username) {
+    if (!confirm(`Are you sure you want to delete guest account '${username}'?\nThis will remove their HA user profile, end all active sessions, and deregister all of their devices.`)) {
+      return;
+    }
+
+    try {
+      await this._hass.callService("casa", "remove_user", {
+        username: username
+      });
+      this._load();
+      const overlay = this.shadowRoot.getElementById("overlay");
+      if (overlay && !overlay.classList.contains("hidden") && this._settingsTab === "accounts") {
+        this._renderAccountsPane();
+      }
+    } catch (err) {
+      alert("Failed: " + ((err && err.message) || err));
+    }
+  }
+
+  _renderAccountsPane() {
+    const pane = this.shadowRoot && this.shadowRoot.getElementById("settings-pane");
+    if (!pane) return;
+
+    const accounts = (this._data && this._data.accounts) || [];
+
+    let listHtml;
+    if (accounts.length === 0) {
+      listHtml = `<div class="wg-empty">No guest accounts.</div>`;
+    } else {
+      listHtml = accounts.map((a) => {
+        return `
+          <div class="pp-card" style="display:flex; justify-content:space-between; align-items:center;">
+            <div class="pp-info">
+              <div class="pp-name" style="font-weight:600; font-size:14px;">${this._esc(a.name)}</div>
+              <div class="pp-meta" style="font-size:12px; color:var(--secondary-text-color,#727272); margin-top:2px;">
+                Username: <strong>${this._esc(a.username)}</strong> · Devices: ${a.device_count ?? 0} · Created: ${this._fmtTime(a.created_at)} ${a.created_by ? "by " + this._esc(a.created_by) : ""}
+              </div>
+            </div>
+            <div class="pp-actions" style="display:flex; gap:6px;">
+              <button class="btn-plain" style="padding: 6px 10px; font-size: 12px;" data-username="${this._esc(a.username)}" data-action="scramble" title="Scramble Password and revoke active sessions"><ha-icon icon="mdi:lock-reset" style="--mdc-icon-size:16px;"></ha-icon> Reset</button>
+              <button class="btn-plain del" style="padding: 6px 10px; font-size: 12px; color:var(--error-color,#db4437);" data-username="${this._esc(a.username)}" data-action="delete" title="Delete Guest Account"><ha-icon icon="mdi:delete" style="--mdc-icon-size:16px;"></ha-icon> Delete</button>
+            </div>
+          </div>`;
+      }).join("");
+    }
+
+    pane.innerHTML = `
+      <h3>Guest Accounts</h3>
+      <p class="sub">Manage local guest accounts and active logins.</p>
+      <div class="wg-toolbar">
+        <button class="btn-primary" id="acc-add"><ha-icon icon="mdi:plus"></ha-icon> Add Account</button>
+        <button class="btn-plain" id="acc-refresh"><ha-icon icon="mdi:refresh"></ha-icon> Refresh</button>
+      </div>
+      ${listHtml}
+    `;
+
+    pane.querySelector("#acc-add").addEventListener("click", () => this._openAccountCreator());
+    pane.querySelector("#acc-refresh").addEventListener("click", () => this._load());
+
+    pane.querySelectorAll(".pp-actions button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const username = btn.dataset.username;
+        if (btn.dataset.action === "scramble") {
+          this._scrambleAccountPassword(username);
+        } else if (btn.dataset.action === "delete") {
+          this._removeAccount(username);
+        }
+      });
+    });
   }
 
   /* ===== Provision Profiles ===== */

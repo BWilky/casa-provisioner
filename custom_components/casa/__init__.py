@@ -2023,6 +2023,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         return {
             "username": target_username,
+            "password": new_password,
             "scrambled": True,
             "deauthenticated": deauthenticate
         }
