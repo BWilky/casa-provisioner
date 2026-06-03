@@ -432,6 +432,11 @@ class CasaAdminSummaryView(HomeAssistantView):
                     "orphaned": bool(dinfo.get("needs_reregister", False)),
                     "stale": _stale(dinfo.get("last_seen_at")),
                     "native": False,
+                    "alias": dinfo.get("alias", ""),
+                    "registered_at": dinfo.get("registered_at"),
+                    "push_token": dinfo.get("push_token"),
+                    "last_12_token": dinfo.get("last_12_token"),
+                    "refresh_token_id": dinfo.get("refresh_token_id"),
                 })
 
         # Native devices (HA users not managed by the integration).
@@ -451,6 +456,11 @@ class CasaAdminSummaryView(HomeAssistantView):
                         "orphaned": bool(dinfo.get("needs_reregister", False)),
                         "stale": _stale(dinfo.get("last_seen_at")),
                         "native": True,
+                        "alias": dinfo.get("alias", ""),
+                        "registered_at": dinfo.get("registered_at"),
+                        "push_token": dinfo.get("push_token"),
+                        "last_12_token": dinfo.get("last_12_token"),
+                        "refresh_token_id": dinfo.get("refresh_token_id"),
                     })
 
         accounts = []
@@ -532,6 +542,46 @@ class CasaWireGuardProfilesView(HomeAssistantView):
         _LOGGER.info("CASA: Created WireGuard profile '%s' (id=%s).", alias, profile["id"])
         return self.json(profile, status_code=201)
 
+    async def put(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        profile_id = body.get("id", "").strip()
+        if not profile_id:
+            return self.json({"error": "Missing id"}, status_code=400)
+
+        wg_data = self.hass.data[DOMAIN]["wg_data"]
+        target = None
+        for p in wg_data.get("profiles", []):
+            if p.get("id") == profile_id:
+                target = p
+                break
+        if not target:
+            return self.json({"error": "Profile not found"}, status_code=404)
+
+        config = body.get("config", "").strip()
+        if config:
+            target["config"] = config
+
+        alias = body.get("alias", "").strip()
+        if alias:
+            target["alias"] = alias
+
+        if "excluded_wifi" in body:
+            target["excluded_wifi"] = body.get("excluded_wifi", "").strip()
+
+        wg_store = self.hass.data[DOMAIN]["wg_store"]
+        wg_store.async_delay_save(lambda: wg_data, 2.0)
+
+        _LOGGER.info("CASA: Updated WireGuard profile '%s' (id=%s).", target["alias"], profile_id)
+        return self.json(target)
+
     async def delete(self, request):
         user = request.get("hass_user")
         if not user or not getattr(user, "is_admin", False):
@@ -554,6 +604,59 @@ class CasaWireGuardProfilesView(HomeAssistantView):
 
         _LOGGER.info("CASA: Deleted WireGuard profile id=%s.", profile_id)
         return self.json({"status": "ok"})
+
+
+class CasaAdminDeviceView(HomeAssistantView):
+    """Admin-only API to inspect/update registered devices."""
+
+    url = "/api/casa/admin/device"
+    name = "api:casa:admin:device"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def put(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = body.get("device_id", "").strip()
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        alias = body.get("alias", "").strip()
+
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+
+        found = False
+        # 1. Check integration-managed users
+        for uid, udata in stored_data.get("users", {}).items():
+            if device_id in udata.get("devices", {}):
+                udata["devices"][device_id]["alias"] = alias
+                found = True
+                break
+
+        # 2. Check native devices
+        if not found:
+            for uid, devices in stored_data.get("native_devices", {}).items():
+                if device_id in devices:
+                    devices[device_id]["alias"] = alias
+                    found = True
+                    break
+
+        if not found:
+            return self.json({"error": "Device not found"}, status_code=404)
+
+        # Save store
+        store = self.hass.data[DOMAIN]["store"]
+        store.async_delay_save(lambda: stored_data, 2.0)
+
+        return self.json({"status": "ok", "device_id": device_id, "alias": alias})
 
 
 class CasaProvisionProfilesView(HomeAssistantView):
@@ -1017,6 +1120,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(CasaAdminSummaryView(hass))
     hass.http.register_view(CasaWireGuardProfilesView(hass))
     hass.http.register_view(CasaProvisionProfilesView(hass))
+    hass.http.register_view(CasaAdminDeviceView(hass))
 
     # Serve the admin panel assets once per process; the route survives reloads.
     global _PANEL_STATIC_REGISTERED
@@ -2118,6 +2222,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def handle_notify_user(call: ServiceCall):
         users = await _check_authorization(call)
+        device_id = str(call.data.get("device_id", "")).strip()
         username = str(call.data.get("username", "")).strip()
         title = str(call.data.get("title", "")).strip()
         message = str(call.data.get("message", "")).strip()
@@ -2134,31 +2239,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             else:
                 parsed_data = custom_data
 
-        if not username or not title or not message:
-            raise HomeAssistantError("Missing username, title, or message.")
+        if not (username or device_id) or not title or not message:
+            raise HomeAssistantError("Missing username or device_id, title, or message.")
 
-        target_user = next((u for u in users if u.name and u.name.casefold() == username.casefold()), None)
-        
-        if not target_user:
-            for u in users:
-                for cred in u.credentials:
-                    if cred.auth_provider_type == "homeassistant" and cred.data.get("username", "").casefold() == username.casefold():
-                        target_user = u
-                        break
-                if target_user:
-                    break
-
-        if not target_user:
-            raise HomeAssistantError(f"User '{username}' not found.")
-
-        user_id = target_user.id
         stored_data = hass.data[DOMAIN]["stored_data"]
 
-        if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
-            devices = stored_data["users"][user_id].get("devices", {})
+        devices = {}
+        if device_id:
+            found = None
+            for uid, udata in stored_data.get("users", {}).items():
+                if device_id in udata.get("devices", {}):
+                    found = (uid, udata["devices"][device_id], udata.get("username", "Unknown"))
+                    break
+            if not found:
+                for uid, devs in stored_data.get("native_devices", {}).items():
+                    if device_id in devs:
+                        users_list = await hass.auth.async_get_users()
+                        ha_user = next((u for u in users_list if u.id == uid), None)
+                        uname = ha_user.name or uid if ha_user else f"Native {uid[:6]}"
+                        found = (uid, devs[device_id], uname)
+                        break
+            if not found:
+                raise HomeAssistantError(f"Device '{device_id}' not found.")
+            uid, device_data, username = found
+            devices = {device_id: device_data}
         else:
-            native_devices = stored_data.get("native_devices", {})
-            devices = native_devices.get(user_id, {})
+            target_user = next((u for u in users if u.name and u.name.casefold() == username.casefold()), None)
+            if not target_user:
+                for u in users:
+                    for cred in u.credentials:
+                        if cred.auth_provider_type == "homeassistant" and cred.data.get("username", "").casefold() == username.casefold():
+                            target_user = u
+                            break
+                    if target_user:
+                        break
+
+            if not target_user:
+                raise HomeAssistantError(f"User '{username}' not found.")
+
+            user_id = target_user.id
+            if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
+                devices = stored_data["users"][user_id].get("devices", {})
+            else:
+                native_devices = stored_data.get("native_devices", {})
+                devices = native_devices.get(user_id, {})
 
         if not devices:
             _LOGGER.warning("CASA: No registered devices found for user '%s'.", username)

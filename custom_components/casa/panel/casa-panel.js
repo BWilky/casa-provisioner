@@ -176,6 +176,8 @@ class CasaAdminPanel extends HTMLElement {
         }
         th { color: var(--secondary-text-color, #727272); font-weight: 500; }
         tr:last-child td { border-bottom: none; }
+        tr.device-row { cursor: pointer; transition: background-color 0.2s; }
+        tr.device-row:hover { background-color: var(--secondary-background-color, #f5f5f5); }
         .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; margin-left: 4px; }
         .badge.ok { background: var(--success-color, #43a047); color: #fff; }
         .badge.stale { background: var(--warning-color, #ffa600); color: #222; }
@@ -251,11 +253,14 @@ class CasaAdminPanel extends HTMLElement {
           text-overflow: ellipsis; max-height: 48px; color: var(--secondary-text-color, #727272);
           background: var(--card-background-color, #fff); border-radius: 6px; padding: 6px 8px;
         }
-        .wg-card .wg-del {
-          background: none; border: none; cursor: pointer; color: var(--error-color, #db4437);
-          font-size: 18px; padding: 4px 6px; border-radius: 6px; line-height: 1; flex-shrink: 0;
+        .wg-card .wg-actions { display: flex; gap: 4px; flex-shrink: 0; }
+        .wg-card .wg-btn {
+          background: none; border: none; cursor: pointer; font-size: 16px;
+          padding: 4px 6px; border-radius: 6px; line-height: 1;
         }
-        .wg-card .wg-del:hover { background: rgba(219,68,55,.12); }
+        .wg-card .wg-btn:hover { background: var(--divider-color, #e8e8e8); }
+        .wg-card .wg-btn.del { color: var(--error-color, #db4437); }
+        .wg-card .wg-btn.del:hover { background: rgba(219,68,55,.12); }
         .wg-form { background: var(--secondary-background-color, #f5f5f5); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
         .wg-form .form-field { margin-bottom: 12px; }
         .wg-form label { display: block; font-size: 13px; color: var(--secondary-text-color, #727272); margin-bottom: 4px; }
@@ -337,12 +342,27 @@ class CasaAdminPanel extends HTMLElement {
           width: 16px; height: 16px; margin: 0; accent-color: var(--primary-color, #03a9f4);
         }
         .editor-msg { font-size: 13px; margin-top: 8px; }
+        ha-icon {
+          --mdc-icon-size: 24px;
+        }
+        .icon-btn ha-icon {
+          --mdc-icon-size: 24px;
+        }
+        .modal .close ha-icon, .editor-header .close ha-icon {
+          --mdc-icon-size: 20px;
+        }
+        .btn-primary ha-icon, .btn-plain ha-icon {
+          --mdc-icon-size: 16px;
+        }
+        .wg-btn ha-icon, .pp-btn ha-icon {
+          --mdc-icon-size: 18px;
+        }
       </style>
       <div class="toolbar">
-        <button class="icon-btn menu" id="menu" title="Menu">&#9776;</button>
+        <button class="icon-btn menu" id="menu" title="Menu"><ha-icon icon="mdi:menu"></ha-icon></button>
         <span>Casa Admin</span>
         <span class="spacer"></span>
-        <button class="icon-btn" id="settings" title="Settings">&#9881;</button>
+        <button class="icon-btn" id="settings" title="Settings"><ha-icon icon="mdi:cog"></ha-icon></button>
       </div>
       <div class="content">
         <div id="err"></div>
@@ -359,12 +379,12 @@ class CasaAdminPanel extends HTMLElement {
       </div>
       <div class="overlay hidden" id="overlay">
         <div class="modal">
-          <button class="close" id="settings-close" title="Close">&times;</button>
+          <button class="close" id="settings-close" title="Close"><ha-icon icon="mdi:close"></ha-icon></button>
           <div class="nav">
             <div class="title">Settings</div>
-            <div class="tab active" data-tab="site">&#127760; Site</div>
-            <div class="tab" data-tab="wireguard">&#128274; WireGuard</div>
-            <div class="tab" data-tab="profiles">&#128203; Profiles</div>
+            <div class="tab active" data-tab="site"><ha-icon icon="mdi:earth"></ha-icon> Site</div>
+            <div class="tab" data-tab="wireguard"><ha-icon icon="mdi:shield-key"></ha-icon> WireGuard</div>
+            <div class="tab" data-tab="profiles"><ha-icon icon="mdi:clipboard-text-multiple-outline"></ha-icon> Profiles</div>
           </div>
           <div class="pane" id="settings-pane"></div>
         </div>
@@ -374,12 +394,37 @@ class CasaAdminPanel extends HTMLElement {
         <div class="editor-modal">
           <div class="editor-header">
             <h3 id="editor-title">New Profile</h3>
-            <button class="close" id="editor-close" title="Close">&times;</button>
+            <button class="close" id="editor-close" title="Close"><ha-icon icon="mdi:close"></ha-icon></button>
           </div>
           <div class="editor-body" id="editor-body"></div>
           <div class="editor-footer">
             <button class="btn-plain" id="editor-cancel">Cancel</button>
             <button class="btn-primary" id="editor-save">Save</button>
+          </div>
+        </div>
+      </div>
+      <div class="editor-overlay hidden" id="wg-overlay">
+        <div class="editor-modal">
+          <div class="editor-header">
+            <h3 id="wg-editor-title">New WireGuard Profile</h3>
+            <button class="close" id="wg-editor-close" title="Close"><ha-icon icon="mdi:close"></ha-icon></button>
+          </div>
+          <div class="editor-body" id="wg-editor-body"></div>
+          <div class="editor-footer">
+            <button class="btn-plain" id="wg-editor-cancel">Cancel</button>
+            <button class="btn-primary" id="wg-editor-save">Save</button>
+          </div>
+        </div>
+      </div>
+      <div class="editor-overlay hidden" id="device-overlay">
+        <div class="editor-modal">
+          <div class="editor-header">
+            <h3 id="device-editor-title">Device Inspector</h3>
+            <button class="close" id="device-editor-close" title="Close"><ha-icon icon="mdi:close"></ha-icon></button>
+          </div>
+          <div class="editor-body" id="device-editor-body"></div>
+          <div class="editor-footer">
+            <button class="btn-plain" id="device-editor-cancel">Close</button>
           </div>
         </div>
       </div>
@@ -480,31 +525,6 @@ class CasaAdminPanel extends HTMLElement {
     }
 
     const profiles = this._wgProfiles || [];
-    const showForm = !!this._wgShowForm;
-
-    let formHtml = "";
-    if (showForm) {
-      formHtml = `
-        <div class="wg-form">
-          <div class="form-field">
-            <label>Alias (optional — auto-generated if blank)</label>
-            <input id="wg-alias" type="text" placeholder="e.g. Office VPN">
-          </div>
-          <div class="form-field">
-            <label>WireGuard Config *</label>
-            <textarea id="wg-config" placeholder="[Interface]\nPrivateKey = ...\nAddress = ...\n\n[Peer]\nPublicKey = ...\nEndpoint = ..."></textarea>
-          </div>
-          <div class="form-field">
-            <label>Excluded WiFi (optional)</label>
-            <input id="wg-excluded" type="text" placeholder="HomeSSID, OfficeSSID">
-          </div>
-          <div class="form-btns">
-            <button class="btn-primary" id="wg-save">Save</button>
-            <button class="btn-plain" id="wg-cancel">Cancel</button>
-          </div>
-          ${this._wgFormError ? `<div class="regen-msg" style="color:var(--error-color,#db4437)">${this._esc(this._wgFormError)}</div>` : ""}
-        </div>`;
-    }
 
     let listHtml;
     if (this._wgLoading) {
@@ -521,7 +541,10 @@ class CasaAdminPanel extends HTMLElement {
               <div class="wg-meta">${this._fmtTime(p.created_at)}${p.excluded_wifi ? " · Excl: " + this._esc(p.excluded_wifi) : ""}</div>
               <div class="wg-preview">${this._esc(preview)}</div>
             </div>
-            <button class="wg-del" data-id="${this._esc(p.id)}" title="Delete profile">&#128465;</button>
+            <div class="wg-actions">
+              <button class="wg-btn" data-id="${this._esc(p.id)}" data-action="edit" title="Edit"><ha-icon icon="mdi:pencil"></ha-icon></button>
+              <button class="wg-btn del" data-id="${this._esc(p.id)}" data-action="delete" title="Delete"><ha-icon icon="mdi:delete"></ha-icon></button>
+            </div>
           </div>`;
       }).join("");
     }
@@ -530,39 +553,25 @@ class CasaAdminPanel extends HTMLElement {
       <h3>WireGuard Profiles</h3>
       <p class="sub">Manage stored WireGuard VPN configurations.</p>
       <div class="wg-toolbar">
-        <button class="btn-primary" id="wg-add">&#43; Add Profile</button>
-        <button class="btn-plain" id="wg-refresh">&#8635; Refresh</button>
+        <button class="btn-primary" id="wg-add"><ha-icon icon="mdi:plus"></ha-icon> Add Profile</button>
+        <button class="btn-plain" id="wg-refresh"><ha-icon icon="mdi:refresh"></ha-icon> Refresh</button>
       </div>
-      ${formHtml}
       ${listHtml}
     `;
 
-    // Bind toolbar
-    pane.querySelector("#wg-add").addEventListener("click", () => {
-      this._wgShowForm = !this._wgShowForm;
-      this._wgFormError = "";
-      this._renderWireGuardPane();
-    });
+    pane.querySelector("#wg-add").addEventListener("click", () => this._openWgEditor(null));
     pane.querySelector("#wg-refresh").addEventListener("click", () => this._loadWgProfiles());
 
-    // Bind form
-    if (showForm) {
-      pane.querySelector("#wg-save").addEventListener("click", () => {
-        const alias = pane.querySelector("#wg-alias").value;
-        const config = pane.querySelector("#wg-config").value;
-        const excluded = pane.querySelector("#wg-excluded").value;
-        this._addWgProfile(alias, config, excluded);
+    pane.querySelectorAll(".wg-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.dataset.id;
+        if (btn.dataset.action === "edit") {
+          const profile = (this._wgProfiles || []).find((p) => p.id === id);
+          if (profile) this._openWgEditor(profile);
+        } else {
+          this._deleteWgProfile(id);
+        }
       });
-      pane.querySelector("#wg-cancel").addEventListener("click", () => {
-        this._wgShowForm = false;
-        this._wgFormError = "";
-        this._renderWireGuardPane();
-      });
-    }
-
-    // Bind delete buttons
-    pane.querySelectorAll(".wg-del").forEach((btn) => {
-      btn.addEventListener("click", () => this._deleteWgProfile(btn.dataset.id));
     });
   }
 
@@ -580,28 +589,92 @@ class CasaAdminPanel extends HTMLElement {
     this._renderWireGuardPane();
   }
 
-  async _addWgProfile(alias, config, excludedWifi) {
-    if (!this._hass) return;
-    if (!config || !config.trim()) {
+  _openWgEditor(profile) {
+    this._wgEditing = profile;
+    this._wgFormError = "";
+    const sr = this.shadowRoot;
+    const overlay = sr.getElementById("wg-overlay");
+    overlay.classList.remove("hidden");
+    sr.getElementById("wg-editor-title").textContent = profile ? "Edit WireGuard Profile" : "New WireGuard Profile";
+    this._renderWgEditorBody();
+
+    // Bind buttons
+    const bindOnce = (id, fn) => {
+      const el = sr.getElementById(id);
+      if (el) {
+        const clone = el.cloneNode(true);
+        el.parentNode.replaceChild(clone, el);
+        clone.addEventListener("click", fn);
+      }
+    };
+    bindOnce("wg-editor-close", () => this._closeWgEditor());
+    bindOnce("wg-editor-cancel", () => this._closeWgEditor());
+    bindOnce("wg-editor-save", () => this._saveWgProfileFromEditor());
+    overlay.onclick = (e) => { if (e.target === overlay) this._closeWgEditor(); };
+  }
+
+  _closeWgEditor() {
+    this.shadowRoot.getElementById("wg-overlay").classList.add("hidden");
+  }
+
+  _renderWgEditorBody() {
+    const body = this.shadowRoot.getElementById("wg-editor-body");
+    if (!body) return;
+    const p = this._wgEditing || {};
+    const esc = (val) => this._esc(val || "");
+
+    body.innerHTML = `
+      <div class="editor-section">
+        <h4>WireGuard Connection</h4><hr>
+        <div class="editor-row">
+          <label>Alias (optional — auto-generated if blank)</label>
+          <input type="text" id="wge-alias" value="${esc(p.alias)}" placeholder="e.g. Office VPN">
+        </div>
+        <div class="editor-row">
+          <label>WireGuard Config *</label>
+          <textarea id="wge-config" placeholder="[Interface]\nPrivateKey = ...\nAddress = ...\n\n[Peer]\nPublicKey = ...\nEndpoint = ...">${esc(p.config)}</textarea>
+        </div>
+        <div class="editor-row">
+          <label>Excluded WiFi (optional)</label>
+          <input type="text" id="wge-excluded" value="${esc(p.excluded_wifi)}" placeholder="HomeSSID, OfficeSSID">
+        </div>
+      </div>
+      ${this._wgFormError ? `<div class="editor-msg" style="color:var(--error-color,#db4437)">${this._esc(this._wgFormError)}</div>` : ""}
+    `;
+  }
+
+  async _saveWgProfileFromEditor() {
+    const sr = this.shadowRoot;
+    const body = sr.getElementById("wg-editor-body");
+    const gv = (id) => { const el = body.querySelector("#" + id); return el ? el.value : ""; };
+
+    const config = gv("wge-config").trim();
+    if (!config) {
       this._wgFormError = "Config is required.";
-      this._renderWireGuardPane();
+      this._renderWgEditorBody();
       return;
     }
+
+    const data = {
+      alias: gv("wge-alias"),
+      config: config,
+      excluded_wifi: gv("wge-excluded"),
+    };
+
     try {
-      await this._hass.callApi("POST", "casa/admin/wireguard_profiles", {
-        alias: alias,
-        config: config,
-        excluded_wifi: excludedWifi,
-      });
-      this._wgShowForm = false;
-      this._wgFormError = "";
+      if (this._wgEditing) {
+        data.id = this._wgEditing.id;
+        await this._hass.callApi("PUT", "casa/admin/wireguard_profiles", data);
+      } else {
+        await this._hass.callApi("POST", "casa/admin/wireguard_profiles", data);
+      }
+      this._closeWgEditor();
       await this._loadWgProfiles();
     } catch (err) {
       this._wgFormError = "Failed: " + ((err && err.message) || err);
-      this._renderWireGuardPane();
+      this._renderWgEditorBody();
     }
   }
-
   async _deleteWgProfile(id) {
     if (!this._hass) return;
     try {
@@ -610,6 +683,250 @@ class CasaAdminPanel extends HTMLElement {
     } catch (err) {
       await this._loadWgProfiles();
     }
+  }
+
+  /* ===== Device Inspector ===== */
+
+  _openDeviceInspector(device) {
+    this._inspectingDevice = device;
+    this._deviceFormError = "";
+    this._deviceFormSuccess = "";
+    this._devicePushError = "";
+    this._devicePushSuccess = "";
+    this._deviceWgError = "";
+    this._deviceWgSuccess = "";
+
+    const sr = this.shadowRoot;
+    const overlay = sr.getElementById("device-overlay");
+    overlay.classList.remove("hidden");
+    this._renderDeviceInspectorBody();
+
+    // Bind close/cancel buttons
+    const bindOnce = (id, fn) => {
+      const el = sr.getElementById(id);
+      if (el) {
+        const clone = el.cloneNode(true);
+        el.parentNode.replaceChild(clone, el);
+        clone.addEventListener("click", fn);
+      }
+    };
+    bindOnce("device-editor-close", () => this._closeDeviceInspector());
+    bindOnce("device-editor-cancel", () => this._closeDeviceInspector());
+    overlay.onclick = (e) => { if (e.target === overlay) this._closeDeviceInspector(); };
+
+    // Fetch WireGuard profiles if not loaded so they are available in dropdown
+    if (!this._wgProfiles && !this._wgLoading) {
+      this._loadWgProfiles().then(() => this._renderDeviceInspectorBody());
+    }
+  }
+
+  _closeDeviceInspector() {
+    this.shadowRoot.getElementById("device-overlay").classList.add("hidden");
+  }
+
+  _renderDeviceInspectorBody() {
+    const body = this.shadowRoot.getElementById("device-editor-body");
+    if (!body) return;
+    const d = this._inspectingDevice || {};
+    const esc = (val) => this._esc(val || "");
+
+    const wgList = this._wgProfiles || [];
+
+    body.innerHTML = `
+      <style>
+        .device-info-grid {
+          display: grid;
+          grid-template-columns: auto 1fr;
+          gap: 8px 16px;
+          font-size: 13px;
+          margin-bottom: 8px;
+        }
+        .device-info-grid strong {
+          color: var(--secondary-text-color, #727272);
+          font-weight: 500;
+        }
+        .device-sec-box {
+          background: var(--secondary-background-color, #f5f5f5);
+          padding: 12px;
+          border-radius: 8px;
+          margin-bottom: 12px;
+        }
+        .device-sec-box h5 {
+          margin: 0 0 8px 0;
+          font-size: 13px;
+          font-weight: 600;
+        }
+      </style>
+      <div class="editor-section">
+        <h4>Device Info</h4><hr>
+        <div class="device-info-grid">
+          <strong>Device ID</strong>
+          <span><code>${esc(d.device_id)}</code></span>
+          <strong>Associated User</strong>
+          <span>${esc(d.username)}${d.native ? ' <span class="badge" style="background:var(--secondary-background-color);color:var(--primary-text-color)">native</span>' : ""}</span>
+          <strong>IP Address</strong>
+          <span>${esc(d.ip) || "—"}</span>
+          <strong>Registered At</strong>
+          <span>${this._fmtTime(d.registered_at)}</span>
+          <strong>Last Seen</strong>
+          <span>${this._fmtTime(d.last_seen)}</span>
+          <strong>Push Status</strong>
+          <span>${d.push_registered ? "Registered" : "Not Registered"}</span>
+          <strong>Token Suffix</strong>
+          <span>${d.last_12_token ? "..." + esc(d.last_12_token) : "—"}</span>
+          <strong>Status</strong>
+          <span>
+            ${d.orphaned ? '<span class="badge orphan">orphan</span>' : ""}
+            ${d.stale ? '<span class="badge stale">stale</span>' : ""}
+            ${!d.orphaned && !d.stale && d.push_registered ? '<span class="badge ok">ok</span>' : ""}
+          </span>
+        </div>
+      </div>
+
+      <div class="editor-section">
+        <h4>Device Settings</h4><hr>
+        <div class="editor-row">
+          <label>Device Alias (Friendly Name)</label>
+          <div style="display:flex; gap:8px; align-items: center;">
+            <input type="text" id="de-alias" value="${esc(d.alias)}" placeholder="e.g. Bryce's iPad" style="flex:1;">
+            <button class="btn-primary" id="de-save-alias">Save</button>
+          </div>
+          ${this._deviceFormError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 4px;">${esc(this._deviceFormError)}</div>` : ""}
+          ${this._deviceFormSuccess ? `<div class="editor-msg" style="color:var(--success-color,#43a047); margin-top: 4px;">${esc(this._deviceFormSuccess)}</div>` : ""}
+        </div>
+      </div>
+
+      <div class="editor-section">
+        <h4>Actions</h4><hr>
+        
+        <div class="device-sec-box">
+          <h5>Test Push Notification</h5>
+          <div class="editor-row">
+            <label>Title</label>
+            <input type="text" id="de-push-title" value="Test Notification">
+          </div>
+          <div class="editor-row">
+            <label>Message</label>
+            <input type="text" id="de-push-message" value="Hello from Home Assistant!">
+          </div>
+          <button class="btn-primary" id="de-send-push">Send Notification</button>
+          ${this._devicePushError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 4px;">${esc(this._devicePushError)}</div>` : ""}
+          ${this._devicePushSuccess ? `<div class="editor-msg" style="color:var(--success-color,#43a047); margin-top: 4px;">${esc(this._devicePushSuccess)}</div>` : ""}
+        </div>
+
+        <div class="device-sec-box">
+          <h5>Push WireGuard VPN Profile</h5>
+          <div class="editor-row">
+            <label>WireGuard Profile</label>
+            <select id="de-wg-profile" style="width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--divider-color, #ddd); font-size: 13px; font-family: inherit; background: var(--card-background-color, #fff); color: var(--primary-text-color, #212121);">
+              <option value="">-- None / Revoke VPN --</option>
+              ${wgList.map(p => `<option value="${esc(p.id)}">${esc(p.alias)}</option>`).join("")}
+            </select>
+          </div>
+          <button class="btn-primary" id="de-push-wg">Push VPN Profile</button>
+          ${this._deviceWgError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 4px;">${esc(this._deviceWgError)}</div>` : ""}
+          ${this._deviceWgSuccess ? `<div class="editor-msg" style="color:var(--success-color,#43a047); margin-top: 4px;">${esc(this._deviceWgSuccess)}</div>` : ""}
+        </div>
+      </div>
+    `;
+
+    // Bind event listeners inside inspector body
+    body.querySelector("#de-save-alias").addEventListener("click", () => this._saveDeviceAlias());
+    body.querySelector("#de-send-push").addEventListener("click", () => this._sendDeviceTestPush());
+    body.querySelector("#de-push-wg").addEventListener("click", () => this._pushDeviceWg());
+  }
+
+  async _saveDeviceAlias() {
+    const sr = this.shadowRoot;
+    const input = sr.getElementById("de-alias");
+    if (!input) return;
+    const alias = input.value.trim();
+
+    this._deviceFormError = "";
+    this._deviceFormSuccess = "";
+    this._renderDeviceInspectorBody();
+
+    try {
+      await this._hass.callApi("PUT", "casa/admin/device", {
+        device_id: this._inspectingDevice.device_id,
+        alias: alias
+      });
+      this._deviceFormSuccess = "Alias updated successfully.";
+      this._inspectingDevice.alias = alias;
+      this._load();
+    } catch (err) {
+      this._deviceFormError = "Failed: " + ((err && err.message) || err);
+    }
+    this._renderDeviceInspectorBody();
+  }
+
+  async _sendDeviceTestPush() {
+    const sr = this.shadowRoot;
+    const titleEl = sr.getElementById("de-push-title");
+    const msgEl = sr.getElementById("de-push-message");
+    if (!titleEl || !msgEl) return;
+
+    const title = titleEl.value.trim();
+    const message = msgEl.value.trim();
+
+    if (!title || !message) {
+      this._devicePushError = "Title and message are required.";
+      this._renderDeviceInspectorBody();
+      return;
+    }
+
+    this._devicePushError = "";
+    this._devicePushSuccess = "";
+    this._renderDeviceInspectorBody();
+
+    try {
+      await this._hass.callService("casa", "notify_user", {
+        device_id: this._inspectingDevice.device_id,
+        title: title,
+        message: message
+      });
+      this._devicePushSuccess = "Push notification command sent.";
+    } catch (err) {
+      this._devicePushError = "Failed to send: " + ((err && err.message) || err);
+    }
+    this._renderDeviceInspectorBody();
+  }
+
+  async _pushDeviceWg() {
+    const sr = this.shadowRoot;
+    const select = sr.getElementById("de-wg-profile");
+    if (!select) return;
+
+    const profileId = select.value;
+    
+    this._deviceWgError = "";
+    this._deviceWgSuccess = "";
+    this._renderDeviceInspectorBody();
+
+    try {
+      if (profileId) {
+        const profile = (this._wgProfiles || []).find((p) => p.id === profileId);
+        if (!profile) {
+          throw new Error("Selected WireGuard profile not found.");
+        }
+        await this._hass.callService("casa", "update_wireguard", {
+          device_id: this._inspectingDevice.device_id,
+          action: "update",
+          wireguard_config: profile.config,
+          wireguard_excluded_wifi: profile.excluded_wifi || ""
+        });
+        this._deviceWgSuccess = `WireGuard profile '${profile.alias}' push command sent.`;
+      } else {
+        await this._hass.callService("casa", "update_wireguard", {
+          device_id: this._inspectingDevice.device_id,
+          action: "revoke"
+        });
+        this._deviceWgSuccess = "WireGuard revoke command sent.";
+      }
+    } catch (err) {
+      this._deviceWgError = "Failed to push: " + ((err && err.message) || err);
+    }
+    this._renderDeviceInspectorBody();
   }
 
   /* ===== Provision Profiles ===== */
@@ -639,8 +956,8 @@ class CasaAdminPanel extends HTMLElement {
               <div class="pp-meta">${this._esc(f.username || "—")} · ${this._esc(f.host_url || "—")} · ${this._fmtTime(p.created_at)}</div>
             </div>
             <div class="pp-actions">
-              <button class="pp-btn" data-id="${this._esc(p.id)}" data-action="edit" title="Edit">&#9998;</button>
-              <button class="pp-btn del" data-id="${this._esc(p.id)}" data-action="delete" title="Delete">&#128465;</button>
+              <button class="pp-btn" data-id="${this._esc(p.id)}" data-action="edit" title="Edit"><ha-icon icon="mdi:pencil"></ha-icon></button>
+              <button class="pp-btn del" data-id="${this._esc(p.id)}" data-action="delete" title="Delete"><ha-icon icon="mdi:delete"></ha-icon></button>
             </div>
           </div>`;
       }).join("");
@@ -650,8 +967,8 @@ class CasaAdminPanel extends HTMLElement {
       <h3>Provisioning Profiles</h3>
       <p class="sub">Saved provisioning templates for the casa.provision service.</p>
       <div class="wg-toolbar">
-        <button class="btn-primary" id="pp-add">&#43; New Profile</button>
-        <button class="btn-plain" id="pp-refresh">&#8635; Refresh</button>
+        <button class="btn-primary" id="pp-add"><ha-icon icon="mdi:plus"></ha-icon> New Profile</button>
+        <button class="btn-plain" id="pp-refresh"><ha-icon icon="mdi:refresh"></ha-icon> Refresh</button>
       </div>
       ${listHtml}
     `;
@@ -994,9 +1311,9 @@ class CasaAdminPanel extends HTMLElement {
       ? `<table>
           <thead><tr><th>User</th><th>Device</th><th>IP</th><th>Last Seen</th><th>Status</th></tr></thead>
           <tbody>${devices.map((d) => `
-            <tr>
+            <tr class="device-row" data-id="${this._esc(d.device_id)}">
               <td>${this._esc(d.username)}${d.native ? ' <span class="badge" style="background:var(--secondary-background-color);color:var(--primary-text-color)">native</span>' : ""}</td>
-              <td><code>${this._esc((d.device_id || "").slice(0, 8))}…</code></td>
+              <td>${d.alias ? `<strong>${this._esc(d.alias)}</strong> <small style="color:var(--secondary-text-color)">(${this._esc((d.device_id || "").slice(0, 8))}…)</small>` : `<code>${this._esc((d.device_id || "").slice(0, 8))}…</code>`}</td>
               <td>${this._esc(d.ip) || "—"}</td>
               <td>${this._fmtTime(d.last_seen)}</td>
               <td>${d.orphaned ? '<span class="badge orphan">orphan</span>' : ""}${d.stale ? '<span class="badge stale">stale</span>' : ""}${!d.orphaned && !d.stale && d.push_registered ? '<span class="badge ok">ok</span>' : ""}</td>
@@ -1004,6 +1321,15 @@ class CasaAdminPanel extends HTMLElement {
           </tbody>
         </table>`
       : `<div class="empty">No devices registered.</div>`;
+
+    // Add click listeners to rows
+    root.querySelectorAll(".device-row").forEach((row) => {
+      row.addEventListener("click", () => {
+        const id = row.dataset.id;
+        const device = (devices || []).find((d) => d.device_id === id);
+        if (device) this._openDeviceInspector(device);
+      });
+    });
 
     const accounts = data.accounts || [];
     root.getElementById("accounts").innerHTML = accounts.length

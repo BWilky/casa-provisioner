@@ -759,8 +759,14 @@ notify_user:
   fields:
     username:
       name: "Username"
-      description: "The guest user username to notify."
-      required: true
+      description: "The guest user username to notify. Optional if device_id is provided."
+      required: false
+      selector:
+        text: {}
+    device_id:
+      name: "Device ID"
+      description: "The unique ID (UUID) of the specific device to notify. Optional if username is provided."
+      required: false
       selector:
         text: {}
     title:
