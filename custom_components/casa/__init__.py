@@ -24,7 +24,7 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, CONF_CREATE_DEVICES
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -2226,6 +2226,76 @@ async def async_remove_config_entry_device(
     await store.async_save(stored_data)
     _LOGGER.info("CASA: Deleted device '%s' from storage (user '%s').", device_id, username)
     return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Purge persistent state when the integration is permanently deleted.
+
+    Runs only on entry removal (not reload/unload). Best-effort: revoke each device's
+    HA refresh token to cut access, tear down the whole site on the relay via
+    /remove_site (destructive cascade, frees the site_id to re-register), then delete
+    the integration's Store so a reinstall starts fresh. HA user accounts are left intact.
+    """
+    store = Store(hass, 1, "casa_users")
+    try:
+        stored_data = await store.async_load()
+    except Exception as err:
+        _LOGGER.warning("CASA: Could not load store during entry removal: %s", err)
+        stored_data = None
+
+    if stored_data:
+        session = async_get_clientsession(hass)
+
+        # 1. Revoke each device's HA refresh token (cut access). HA accounts kept.
+        device_entries = []
+        for uid, udata in stored_data.get("users", {}).items():
+            for dinfo in udata.get("devices", {}).values():
+                device_entries.append((uid, dinfo))
+        for uid, devices in stored_data.get("native_devices", {}).items():
+            for dinfo in devices.values():
+                device_entries.append((uid, dinfo))
+
+        for owner_user_id, dinfo in device_entries:
+            refresh_token_id = dinfo.get("refresh_token_id")
+            if owner_user_id and refresh_token_id:
+                try:
+                    user = await hass.auth.async_get_user(owner_user_id)
+                    if user:
+                        token = user.refresh_tokens.get(refresh_token_id)
+                        if token:
+                            hass.auth.async_remove_refresh_token(token)
+                except Exception as err:
+                    _LOGGER.warning("CASA: removal token revoke failed for a device: %s", err)
+
+        # 2. Destructive cascade on the relay: remove the whole site in one call.
+        # This unregisters all of the site's proxy tokens and frees the site_id.
+        site_id = stored_data.get("site_id")
+        site_key = stored_data.get("site_key")
+        if site_id and site_key:
+            try:
+                async with session.post(
+                    RELAY_REMOVE_SITE_URL,
+                    json={"site_id": site_id, "site_key": site_key},
+                    timeout=ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        _LOGGER.info(
+                            "CASA: Removed site '%s' from relay (removed_count=%s).",
+                            site_id, data.get("removed_count"),
+                        )
+                    else:
+                        text = await resp.text()
+                        _LOGGER.warning("CASA: /remove_site returned %s: %s", resp.status, text)
+            except Exception as err:
+                _LOGGER.warning("CASA: /remove_site failed: %s", err)
+
+    # 3. Delete the persistent store so a reinstall starts fresh.
+    try:
+        await store.async_remove()
+        _LOGGER.info("CASA: Removed integration store on entry deletion.")
+    except Exception as err:
+        _LOGGER.warning("CASA: Failed to remove store on entry deletion: %s", err)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
