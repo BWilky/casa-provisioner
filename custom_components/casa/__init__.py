@@ -24,13 +24,18 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.components.http import HomeAssistantView
+from homeassistant.components.http import HomeAssistantView, StaticPathConfig
+from homeassistant.components import frontend
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from aiohttp import ClientTimeout
 
 _LOGGER = logging.getLogger(__name__)
+
+# The panel static path is registered on the http app and survives entry reloads,
+# so only register it once per HA process.
+_PANEL_STATIC_REGISTERED = False
 
 def generate_random_password(length=12):
     chars = string.ascii_letters + string.digits
@@ -381,6 +386,97 @@ class CasaHeartbeatView(HomeAssistantView):
         return self.json({"status": "success", "reregister": bool(reregister)})
 
 
+class CasaAdminSummaryView(HomeAssistantView):
+    """Admin-only JSON summary backing the Casa sidebar panel."""
+
+    url = "/api/casa/admin/summary"
+    name = "api:casa:admin:summary"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        from datetime import datetime
+        from .const import STALE_DAYS
+
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data", {})
+        now = dt_util.now()
+
+        def _stale(last_seen) -> bool:
+            if not last_seen:
+                return True
+            try:
+                return (now - datetime.fromisoformat(last_seen)).days >= STALE_DAYS
+            except Exception:
+                return False
+
+        devices = []
+
+        # Integration-managed users + their devices.
+        for udata in stored_data.get("users", {}).values():
+            if udata.get("deleted", False):
+                continue
+            username = udata.get("username", "Unknown")
+            for did, dinfo in udata.get("devices", {}).items():
+                devices.append({
+                    "username": username,
+                    "device_id": did,
+                    "ip": dinfo.get("ip_address"),
+                    "last_seen": dinfo.get("last_seen_at"),
+                    "push_registered": bool(dinfo.get("push_token")),
+                    "orphaned": bool(dinfo.get("needs_reregister", False)),
+                    "stale": _stale(dinfo.get("last_seen_at")),
+                    "native": False,
+                })
+
+        # Native devices (HA users not managed by the integration).
+        native = stored_data.get("native_devices", {})
+        if native:
+            ha_users = await self.hass.auth.async_get_users()
+            user_map = {u.id: (u.name or u.id) for u in ha_users}
+            for uid, devs in native.items():
+                username = user_map.get(uid) or f"Native {uid[:6]}"
+                for did, dinfo in devs.items():
+                    devices.append({
+                        "username": username,
+                        "device_id": did,
+                        "ip": dinfo.get("ip_address"),
+                        "last_seen": dinfo.get("last_seen_at"),
+                        "push_registered": bool(dinfo.get("push_token")),
+                        "orphaned": bool(dinfo.get("needs_reregister", False)),
+                        "stale": _stale(dinfo.get("last_seen_at")),
+                        "native": True,
+                    })
+
+        accounts = []
+        for uid, udata in stored_data.get("users", {}).items():
+            if udata.get("deleted", False):
+                continue
+            accounts.append({
+                "name": udata.get("name"),
+                "username": udata.get("username"),
+                "created_at": udata.get("created_at"),
+                "created_by": udata.get("created_by"),
+                "device_count": len(udata.get("devices", {})),
+            })
+
+        return self.json({
+            "site_id": stored_data.get("site_id"),
+            "stats": {
+                "devices": len(devices),
+                "managed_users": len(accounts),
+                "orphaned": sum(1 for d in devices if d["orphaned"]),
+                "stale": sum(1 for d in devices if d["stale"]),
+            },
+            "devices": devices,
+            "accounts": accounts,
+        })
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
@@ -660,6 +756,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register the HTTP views
     hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
     hass.http.register_view(CasaHeartbeatView(hass, async_heartbeat))
+    hass.http.register_view(CasaAdminSummaryView(hass))
+
+    # Serve the admin panel assets once per process; the route survives reloads.
+    global _PANEL_STATIC_REGISTERED
+    if not _PANEL_STATIC_REGISTERED:
+        panel_dir = os.path.join(os.path.dirname(__file__), "panel")
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig("/casa_static", panel_dir, False)]
+        )
+        _PANEL_STATIC_REGISTERED = True
+
+    # Optionally add the Casa admin dashboard to the sidebar.
+    if entry.options.get(CONF_SHOW_PANEL, False):
+        try:
+            frontend.async_remove_panel(hass, "casa")
+        except Exception:
+            pass
+        frontend.async_register_built_in_panel(
+            hass,
+            component_name="custom",
+            sidebar_title="Casa",
+            sidebar_icon="mdi:shield-home",
+            frontend_url_path="casa",
+            require_admin=True,
+            config={
+                "_panel_custom": {
+                    "name": "casa-admin-panel",
+                    "embed_iframe": False,
+                    "trust_external": False,
+                    "module_url": "/casa_static/casa-panel.js",
+                }
+            },
+        )
+
+    # Reload the entry when options change so toggles (panel, devices) apply at once.
+    async def _options_update_listener(hass_, updated_entry):
+        await hass_.config_entries.async_reload(updated_entry.entry_id)
+
+    entry.async_on_unload(entry.add_update_listener(_options_update_listener))
 
     async def _check_authorization(call: ServiceCall):
         """Check if the service call is authorized."""
@@ -2321,6 +2456,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     reconcile_unsub = hass.data[DOMAIN].get("reconcile_unsub")
     if reconcile_unsub:
         reconcile_unsub()
+
+    try:
+        frontend.async_remove_panel(hass, "casa")
+    except Exception:
+        pass
 
     for task in hass.data[DOMAIN].get("timers", {}).values():
         task.cancel()

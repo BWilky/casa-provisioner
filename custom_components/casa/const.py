@@ -1,6 +1,10 @@
 DOMAIN = "casa"
 CONF_ADMIN_SYSTEM_ONLY = "admin_system_only"
 CONF_CREATE_DEVICES = "create_devices"
+CONF_SHOW_PANEL = "show_panel"
+
+# A device is considered stale if not seen for this many days.
+STALE_DAYS = 14
 
 RELAY_BASE_URL = "https://push.bonjour.casa"
 RELAY_REGISTER_SITE_URL = f"{RELAY_BASE_URL}/register_site"
