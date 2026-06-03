@@ -24,8 +24,7 @@
         "data": {
           "admin_system_only": "Admin / System context only (restrict direct service calls by non-admins)",
           "create_devices": "Create Home Assistant device entries for provisioned devices",
-          "show_panel": "Add the Casa admin dashboard to the sidebar",
-          "regenerate_site_id": "Regenerate Site ID (Warning: rotates the site; all existing devices must be re-provisioned)"
+          "show_panel": "Add the Casa admin dashboard to the sidebar"
         }
       }
     }

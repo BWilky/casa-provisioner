@@ -7,6 +7,7 @@ class CasaAdminPanel extends HTMLElement {
     this._hass = hass;
     if (!this._initialized) {
       this._initialized = true;
+      this._settingsTab = "site";
       this._render();
       this._load();
     }
@@ -53,6 +54,22 @@ class CasaAdminPanel extends HTMLElement {
     }
   }
 
+  async _regenerate() {
+    if (!this._hass) return;
+    this._regenBusy = true;
+    this._renderSettingsBody();
+    try {
+      await this._hass.callService("casa", "regenerate_site");
+      await this._load();
+      this._regenMsg = "Site regenerated. All devices must be re-provisioned.";
+    } catch (err) {
+      this._regenMsg = "Failed: " + ((err && err.message) || err);
+    }
+    this._regenBusy = false;
+    this._regenConfirm = false;
+    this._renderSettingsBody();
+  }
+
   _setStatus(text) {
     const el = this.shadowRoot && this.shadowRoot.getElementById("status");
     if (el) el.textContent = text || "";
@@ -76,6 +93,18 @@ class CasaAdminPanel extends HTMLElement {
     }
   }
 
+  _openSettings() {
+    this._regenConfirm = false;
+    this._regenBusy = false;
+    this._regenMsg = "";
+    this.shadowRoot.getElementById("overlay").classList.remove("hidden");
+    this._renderSettingsBody();
+  }
+
+  _closeSettings() {
+    this.shadowRoot.getElementById("overlay").classList.add("hidden");
+  }
+
   _render() {
     this.attachShadow({ mode: "open" });
     this.shadowRoot.innerHTML = `
@@ -88,20 +117,20 @@ class CasaAdminPanel extends HTMLElement {
           font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif);
         }
         .toolbar {
-          display: flex;
-          align-items: center;
-          height: var(--header-height, 56px);
-          padding: 0 16px;
+          display: flex; align-items: center;
+          height: var(--header-height, 56px); padding: 0 16px;
           background: var(--app-header-background-color, var(--primary-color, #03a9f4));
           color: var(--app-header-text-color, var(--text-primary-color, #fff));
-          font-size: 20px;
-          font-weight: 400;
+          font-size: 20px; font-weight: 400;
           box-shadow: var(--ha-card-box-shadow, 0 2px 2px rgba(0,0,0,.1));
         }
-        .menu {
+        .toolbar .spacer { flex: 1; }
+        .icon-btn {
           background: none; border: none; color: inherit; cursor: pointer;
-          font-size: 24px; margin-right: 16px; line-height: 1; padding: 4px 8px;
+          font-size: 22px; line-height: 1; padding: 6px 8px; border-radius: 50%;
         }
+        .icon-btn:hover { background: rgba(255,255,255,.15); }
+        .menu { margin-right: 12px; }
         .content { padding: 16px; max-width: 1400px; margin: 0 auto; }
         .stats {
           display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -111,7 +140,6 @@ class CasaAdminPanel extends HTMLElement {
           background: var(--ha-card-background, var(--card-background-color, #fff));
           border-radius: var(--ha-card-border-radius, 12px);
           box-shadow: var(--ha-card-box-shadow, 0 2px 4px rgba(0,0,0,.08));
-          border: var(--ha-card-border-width, 0) solid var(--ha-card-border-color, var(--divider-color, #e0e0e0));
         }
         .stat { padding: 16px; }
         .stat .value { font-size: 28px; font-weight: 500; }
@@ -122,9 +150,7 @@ class CasaAdminPanel extends HTMLElement {
         .stat.warn .value { color: var(--warning-color, #ffa600); }
         .stat.err .value { color: var(--error-color, #db4437); }
         .stat.site .value { font-size: 13px; font-family: monospace; word-break: break-all; font-weight: 400; }
-        .actions {
-          display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px;
-        }
+        .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
         button.action {
           background: var(--primary-color, #03a9f4); color: var(--text-primary-color, #fff);
           border: none; border-radius: 8px; padding: 8px 16px; font-size: 14px;
@@ -150,23 +176,70 @@ class CasaAdminPanel extends HTMLElement {
         }
         th { color: var(--secondary-text-color, #727272); font-weight: 500; }
         tr:last-child td { border-bottom: none; }
-        .badge {
-          display: inline-block; padding: 1px 8px; border-radius: 10px;
-          font-size: 11px; font-weight: 500; margin-left: 4px;
-        }
+        .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; margin-left: 4px; }
         .badge.ok { background: var(--success-color, #43a047); color: #fff; }
         .badge.stale { background: var(--warning-color, #ffa600); color: #222; }
         .badge.orphan { background: var(--error-color, #db4437); color: #fff; }
         .empty { padding: 16px; color: var(--secondary-text-color, #727272); }
-        .errbar {
-          background: var(--error-color, #db4437); color: #fff;
-          padding: 10px 16px; border-radius: 8px; margin-bottom: 16px;
-        }
+        .errbar { background: var(--error-color, #db4437); color: #fff; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; }
         code { font-family: monospace; }
+
+        /* Settings overlay (claude.ai-style) */
+        .overlay {
+          position: fixed; inset: 0; z-index: 9999;
+          background: rgba(0,0,0,.32);
+          display: flex; align-items: center; justify-content: center;
+        }
+        .overlay.hidden { display: none; }
+        .modal {
+          position: relative; display: flex;
+          width: 860px; max-width: 92vw; height: 560px; max-height: 86vh;
+          background: var(--card-background-color, #fff);
+          color: var(--primary-text-color, #212121);
+          border-radius: 16px; overflow: hidden;
+          box-shadow: 0 24px 64px rgba(0,0,0,.32);
+        }
+        .modal .nav {
+          width: 220px; flex-shrink: 0; padding: 16px 12px;
+          border-right: 1px solid var(--divider-color, #e0e0e0);
+          display: flex; flex-direction: column; gap: 2px;
+          background: var(--secondary-background-color, #f5f5f5);
+        }
+        .modal .nav .title { font-size: 18px; font-weight: 600; padding: 6px 12px 14px; }
+        .tab {
+          display: flex; align-items: center; gap: 10px;
+          padding: 9px 12px; border-radius: 8px; cursor: pointer; font-size: 14px;
+        }
+        .tab:hover { background: var(--divider-color, #e8e8e8); }
+        .tab.active { background: var(--card-background-color, #fff); font-weight: 500; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+        .modal .pane { flex: 1; padding: 28px; overflow: auto; }
+        .modal .close {
+          position: absolute; top: 14px; right: 16px;
+          background: none; border: none; cursor: pointer; font-size: 22px;
+          color: var(--secondary-text-color, #727272); line-height: 1;
+        }
+        .pane h3 { margin: 0 0 4px; font-size: 20px; }
+        .pane .sub { color: var(--secondary-text-color, #727272); font-size: 13px; margin: 0 0 24px; }
+        .field { margin-bottom: 24px; }
+        .field label { display: block; font-size: 13px; color: var(--secondary-text-color, #727272); margin-bottom: 6px; }
+        .field .val {
+          font-family: monospace; font-size: 13px; word-break: break-all;
+          background: var(--secondary-background-color, #f5f5f5); padding: 10px 12px; border-radius: 8px;
+        }
+        .danger { border: 1px solid var(--error-color, #db4437); border-radius: 12px; padding: 16px; }
+        .danger h4 { margin: 0 0 6px; color: var(--error-color, #db4437); font-size: 15px; }
+        .danger p { margin: 0 0 12px; font-size: 13px; color: var(--secondary-text-color, #727272); }
+        .row-btns { display: flex; gap: 8px; }
+        .btn-danger { background: var(--error-color, #db4437); color: #fff; border: none; border-radius: 8px; padding: 8px 14px; font-size: 14px; font-weight: 500; cursor: pointer; }
+        .btn-outline { background: transparent; color: var(--error-color, #db4437); border: 1px solid var(--error-color, #db4437); border-radius: 8px; padding: 8px 14px; font-size: 14px; font-weight: 500; cursor: pointer; }
+        .btn-plain { background: var(--secondary-background-color, #e5e5e5); color: var(--primary-text-color, #212121); border: none; border-radius: 8px; padding: 8px 14px; font-size: 14px; cursor: pointer; }
+        .regen-msg { margin-top: 12px; font-size: 13px; }
       </style>
       <div class="toolbar">
-        <button class="menu" id="menu" title="Menu">&#9776;</button>
+        <button class="icon-btn menu" id="menu" title="Menu">&#9776;</button>
         <span>Casa Admin</span>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="settings" title="Settings">&#9881;</button>
       </div>
       <div class="content">
         <div id="err"></div>
@@ -177,27 +250,83 @@ class CasaAdminPanel extends HTMLElement {
           <span id="status"></span>
         </div>
         <div class="columns">
-          <div class="card">
-            <h2>Managed Devices</h2>
-            <div id="devices"></div>
+          <div class="card"><h2>Managed Devices</h2><div id="devices"></div></div>
+          <div class="card"><h2>Managed Accounts</h2><div id="accounts"></div></div>
+        </div>
+      </div>
+      <div class="overlay hidden" id="overlay">
+        <div class="modal">
+          <button class="close" id="settings-close" title="Close">&times;</button>
+          <div class="nav">
+            <div class="title">Settings</div>
+            <div class="tab active" data-tab="site">&#127760; Site</div>
           </div>
-          <div class="card">
-            <h2>Managed Accounts</h2>
-            <div id="accounts"></div>
-          </div>
+          <div class="pane" id="settings-pane"></div>
         </div>
       </div>
     `;
 
-    this.shadowRoot.getElementById("menu").addEventListener("click", () => {
+    const sr = this.shadowRoot;
+    sr.getElementById("menu").addEventListener("click", () => {
       this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true }));
     });
-    this.shadowRoot.getElementById("refresh").addEventListener("click", () => this._load());
-    this.shadowRoot.getElementById("reconcile").addEventListener("click", () => this._reconcile());
+    sr.getElementById("refresh").addEventListener("click", () => this._load());
+    sr.getElementById("reconcile").addEventListener("click", () => this._reconcile());
+    sr.getElementById("settings").addEventListener("click", () => this._openSettings());
+    sr.getElementById("settings-close").addEventListener("click", () => this._closeSettings());
+    sr.getElementById("overlay").addEventListener("click", (e) => {
+      if (e.target === sr.getElementById("overlay")) this._closeSettings();
+    });
 
     if (this.isConnected && !this._timer) {
       this._timer = setInterval(() => this._load(), 30000);
     }
+  }
+
+  _renderSettingsBody() {
+    const pane = this.shadowRoot && this.shadowRoot.getElementById("settings-pane");
+    if (!pane) return;
+    const siteId = (this._data && this._data.site_id) || "—";
+
+    let dangerInner;
+    if (this._regenBusy) {
+      dangerInner = `<p>Regenerating…</p>`;
+    } else if (this._regenConfirm) {
+      dangerInner = `
+        <p>This removes the current site on the relay and mints a new Site ID. Every existing
+        device profile becomes invalid — all devices must be re-provisioned. Continue?</p>
+        <div class="row-btns">
+          <button class="btn-danger" id="regen-confirm">Regenerate</button>
+          <button class="btn-plain" id="regen-cancel">Cancel</button>
+        </div>`;
+    } else {
+      dangerInner = `
+        <p>Rotate this site's identity. Removes it from the relay and registers a fresh
+        Site ID + key. Destructive — all devices must be re-provisioned afterward.</p>
+        <button class="btn-outline" id="regen-start">Regenerate Site ID</button>`;
+    }
+
+    pane.innerHTML = `
+      <h3>Site</h3>
+      <p class="sub">Relay site identity for this Home Assistant instance.</p>
+      <div class="field">
+        <label>Site ID</label>
+        <div class="val">${this._esc(siteId)}</div>
+      </div>
+      <div class="danger">
+        <h4>Regenerate Site</h4>
+        ${dangerInner}
+        ${this._regenMsg ? `<div class="regen-msg">${this._esc(this._regenMsg)}</div>` : ""}
+      </div>
+    `;
+
+    const pin = (id, fn) => {
+      const el = pane.querySelector("#" + id);
+      if (el) el.addEventListener("click", fn);
+    };
+    pin("regen-start", () => { this._regenConfirm = true; this._regenMsg = ""; this._renderSettingsBody(); });
+    pin("regen-cancel", () => { this._regenConfirm = false; this._renderSettingsBody(); });
+    pin("regen-confirm", () => this._regenerate());
   }
 
   _update() {
@@ -250,6 +379,12 @@ class CasaAdminPanel extends HTMLElement {
           </tbody>
         </table>`
       : `<div class="empty">No managed accounts.</div>`;
+
+    // Keep the open settings pane's Site ID in sync after a refresh.
+    const overlay = root.getElementById("overlay");
+    if (overlay && !overlay.classList.contains("hidden")) {
+      this._renderSettingsBody();
+    }
   }
 }
 

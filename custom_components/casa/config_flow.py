@@ -41,40 +41,6 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
         """Manage the options."""
         if user_input is not None:
-            if user_input.pop("regenerate_site_id", False):
-                import logging
-                from aiohttp import ClientTimeout
-                from homeassistant.helpers.aiohttp_client import async_get_clientsession
-                from . import _register_site
-                from .const import RELAY_REMOVE_SITE_URL
-
-                _LOGGER = logging.getLogger(__name__)
-                stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data")
-                store = self.hass.data.get(DOMAIN, {}).get("store")
-
-                if stored_data is not None and store is not None:
-                    # Tear down the existing site on the relay so the old site_id is freed.
-                    old_site_id = stored_data.get("site_id")
-                    old_site_key = stored_data.get("site_key")
-                    if old_site_id and old_site_key:
-                        try:
-                            session = async_get_clientsession(self.hass)
-                            async with session.post(
-                                RELAY_REMOVE_SITE_URL,
-                                json={"site_id": old_site_id, "site_key": old_site_key},
-                                timeout=ClientTimeout(total=15),
-                            ) as resp:
-                                if resp.status != 200:
-                                    text = await resp.text()
-                                    _LOGGER.warning("CASA: regenerate /remove_site returned %s: %s", resp.status, text)
-                        except Exception as err:
-                            _LOGGER.warning("CASA: regenerate /remove_site failed: %s", err)
-
-                    # Drop local creds and mint a fresh relay-issued site.
-                    stored_data.pop("site_id", None)
-                    stored_data.pop("site_key", None)
-                    await _register_site(self.hass, stored_data, store)
-
             return self.async_create_entry(title="", data=user_input)
 
         stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data", {})
@@ -147,7 +113,6 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
                     CONF_SHOW_PANEL,
                     default=self.config_entry.options.get(CONF_SHOW_PANEL, False)
                 ): bool,
-                vol.Optional("regenerate_site_id", default=False): bool,
             }),
             description_placeholders={
                 "site_id": site_id,

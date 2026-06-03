@@ -2265,6 +2265,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.OPTIONAL
     )
 
+    async def handle_regenerate_site(call: ServiceCall):
+        """Rotate the site: remove it on the relay, then register a fresh one.
+
+        Destructive — invalidates every existing device profile (they carry the old
+        site_id), so all devices must be re-provisioned afterward.
+        """
+        await _check_authorization(call)
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        session = async_get_clientsession(hass)
+
+        old_site_id = stored_data.get("site_id")
+        old_site_key = stored_data.get("site_key")
+        if old_site_id and old_site_key:
+            try:
+                async with session.post(
+                    RELAY_REMOVE_SITE_URL,
+                    json={"site_id": old_site_id, "site_key": old_site_key},
+                    timeout=ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        _LOGGER.warning("CASA: regenerate /remove_site returned %s: %s", resp.status, text)
+            except Exception as err:
+                _LOGGER.warning("CASA: regenerate /remove_site failed: %s", err)
+
+        stored_data.pop("site_id", None)
+        stored_data.pop("site_key", None)
+        ok = await _register_site(hass, stored_data, store)
+        return {"success": bool(ok), "site_id": stored_data.get("site_id")}
+
+    hass.services.async_register(
+        DOMAIN, "regenerate_site", handle_regenerate_site,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
     async def _scheduled_reconcile(now):
         await _reconcile_site()
 
@@ -2452,6 +2487,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "reload_device")
     hass.services.async_remove(DOMAIN, "update_wireguard")
     hass.services.async_remove(DOMAIN, "reconcile")
+    hass.services.async_remove(DOMAIN, "regenerate_site")
 
     reconcile_unsub = hass.data[DOMAIN].get("reconcile_unsub")
     if reconcile_unsub:

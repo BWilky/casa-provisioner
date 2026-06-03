@@ -779,6 +779,10 @@ reconcile:
   name: "Reconcile Relay Registrations"
   description: "Diffs the relay's live proxy tokens against HA's device records. Unregisters orphaned tokens from the relay and flags devices whose registration the relay lost so they re-register on next heartbeat. Runs automatically once a day."
 
+regenerate_site:
+  name: "Regenerate Site"
+  description: "Destructive: removes the current site on the relay and registers a brand-new site_id + site_key. Every existing device profile becomes invalid and must be re-provisioned."
+
 reload_device:
   name: "Reload Casa Device"
   description: "Sends a silent background push notification to clear cache and reload the default URL on a registered device."
