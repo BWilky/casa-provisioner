@@ -24,7 +24,8 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, CONF_CREATE_DEVICES
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, CONF_CREATE_DEVICES
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from aiohttp import ClientTimeout
@@ -120,7 +121,7 @@ def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
 async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
     """Register this HA instance's site with the relay and persist the issued site_key.
 
-    site_id is a 124-char [A-Za-z0-9] value (secrets.token_hex(62)). The relay issues
+    site_id is a 32-char [A-Za-z0-9] value (secrets.token_hex(16)). The relay issues
     the site_key exactly once (HTTP 201) and never returns it again, so it must be
     persisted. A 409 means the site_id exists but we hold no key (unrecoverable lockout)
     — recovery is to register a brand-new site_id, not retry the same one.
@@ -129,8 +130,8 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
 
     for _attempt in range(3):
         site_id = stored_data.get("site_id")
-        if not site_id or len(site_id) != 124:
-            site_id = secrets.token_hex(62)  # 124 hex chars
+        if not site_id:
+            site_id = secrets.token_hex(16)  # 32 hex chars
             stored_data["site_id"] = site_id
 
         try:
@@ -149,12 +150,12 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
                 if resp.status == 409:
                     # site_id taken but we have no key -> lockout; rotate to a fresh site_id.
                     _LOGGER.warning("CASA: site_id already registered with no local key; rotating site_id and retrying.")
-                    stored_data["site_id"] = secrets.token_hex(62)
+                    stored_data["site_id"] = secrets.token_hex(16)
                     continue
 
                 if resp.status == 422:
                     _LOGGER.warning("CASA: Relay rejected site_id as malformed (422); regenerating.")
-                    stored_data["site_id"] = secrets.token_hex(62)
+                    stored_data["site_id"] = secrets.token_hex(16)
                     continue
 
                 if resp.status == 400:
@@ -359,7 +360,7 @@ class CasaHeartbeatView(HomeAssistantView):
         current_url = data.get("current_url")
 
         try:
-            await self.heartbeat_func(
+            reregister = await self.heartbeat_func(
                 user.id,
                 device_id,
                 last_12_token=last_12_token,
@@ -375,7 +376,9 @@ class CasaHeartbeatView(HomeAssistantView):
             _LOGGER.exception("CASA: Unexpected error during heartbeat: %s", err)
             return self.json({"error": "Internal server error"}, status_code=500)
 
-        return self.json({"status": "success"})
+        # reregister=true tells the device its relay registration was lost (detected
+        # by /reconcile) and it should re-register and report a fresh proxy token.
+        return self.json({"status": "success", "reregister": bool(reregister)})
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -403,12 +406,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         stored_data = {"users": {}}
 
     # Register the site with the relay once. The relay issues the site_key (never
-    # generated locally); we skip registration whenever we already hold a valid one.
-    if not stored_data.get("site_key") or len(stored_data.get("site_id", "")) != 124:
-        # Drop any legacy/invalid credentials so a fresh 124-char site_id is minted.
-        if len(stored_data.get("site_id", "")) != 124:
-            stored_data.pop("site_id", None)
-            stored_data.pop("site_key", None)
+    # generated locally); we skip registration whenever we already hold one.
+    if not stored_data.get("site_key"):
         await _register_site(hass, stored_data, store)
 
     hass.data[DOMAIN]["stored_data"] = stored_data
@@ -526,14 +525,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         existing_ip = devices.get(device_id, {}).get("ip_address")
         final_ip = ip_address if ip_address is not None else existing_ip
-        
+
+        # Reporting a fresh proxy token clears any pending re-register flag;
+        # a token-less update preserves it.
+        existing_reregister = devices.get(device_id, {}).get("needs_reregister", False)
+        final_reregister = False if push_token is not None else existing_reregister
+
         devices[device_id] = {
             "push_token": final_token,
             "registered_at": devices.get(device_id, {}).get("registered_at", now_iso),
             "last_seen_at": now_iso,
             "last_12_token": final_last_12,
             "refresh_token_id": final_refresh_id,
-            "ip_address": final_ip
+            "ip_address": final_ip,
+            "needs_reregister": final_reregister
         }
         
         store.async_delay_save(lambda: stored_data, 2.0)
@@ -649,6 +654,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 async_dispatcher_send(hass, f"casa_device_updated_{device_id}")
 
         _LOGGER.debug("CASA: Processed heartbeat for device '%s' for user '%s'.", device_id, username)
+
+        return bool(device_info.get("needs_reregister", False))
 
     # Register the HTTP views
     hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
@@ -2024,6 +2031,112 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         supports_response=SupportsResponse.OPTIONAL
     )
 
+    # ==========================================
+    # RELAY RECONCILIATION
+    # ==========================================
+    async def _reconcile_site() -> dict:
+        """Diff the relay's live proxy tokens against HA's records.
+
+        /reconcile is silent-mode-exempt, so it is the source of truth. Tokens the
+        relay has but HA doesn't are unregistered; tokens HA has but the relay lost
+        are flagged so the device re-registers on its next heartbeat.
+        """
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        site_id = stored_data.get("site_id")
+        site_key = stored_data.get("site_key")
+        if not site_id or not site_key:
+            _LOGGER.warning("CASA: Skipping reconcile — site not registered.")
+            return {"error": "Site not registered"}
+
+        session = async_get_clientsession(hass)
+        try:
+            async with session.post(
+                RELAY_RECONCILE_URL,
+                json={"site_id": site_id, "site_key": site_key},
+                timeout=ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    _LOGGER.warning("CASA: /reconcile returned status %s: %s", resp.status, text)
+                    return {"error": f"reconcile status {resp.status}"}
+                data = await resp.json()
+        except Exception as err:
+            _LOGGER.warning("CASA: /reconcile request failed: %s", err)
+            return {"error": str(err)}
+
+        # Accept either {"proxy_tokens": [...]} or a bare list.
+        if isinstance(data, dict):
+            relay_tokens = set(data.get("proxy_tokens", []))
+        elif isinstance(data, list):
+            relay_tokens = set(data)
+        else:
+            relay_tokens = set()
+
+        # Map every proxy token HA knows about to its (devices_dict, device_id).
+        ha_map = {}
+        for udata in stored_data.get("users", {}).values():
+            for did, dinfo in udata.get("devices", {}).items():
+                tok = dinfo.get("push_token")
+                if tok:
+                    ha_map[tok] = (udata["devices"], did)
+        for devices in stored_data.get("native_devices", {}).values():
+            for did, dinfo in devices.items():
+                tok = dinfo.get("push_token")
+                if tok:
+                    ha_map[tok] = (devices, did)
+        ha_tokens = set(ha_map.keys())
+
+        # Relay has, HA doesn't -> unregister the orphan from the relay.
+        orphaned = relay_tokens - ha_tokens
+        for tok in orphaned:
+            try:
+                async with session.post(
+                    RELAY_UNREGISTER_URL,
+                    json={"proxy_token": tok},
+                    timeout=ClientTimeout(total=10),
+                ) as r:
+                    if r.status not in (200, 404):
+                        text = await r.text()
+                        _LOGGER.warning("CASA: reconcile /unregister returned %s: %s", r.status, text)
+            except Exception as err:
+                _LOGGER.warning("CASA: reconcile /unregister failed for an orphan token: %s", err)
+
+        # HA has, relay doesn't -> flag the device to re-register on next heartbeat.
+        stale = ha_tokens - relay_tokens
+        for tok in stale:
+            devices, did = ha_map[tok]
+            devices[did]["needs_reregister"] = True
+
+        if orphaned or stale:
+            await store.async_save(stored_data)
+
+        result = {
+            "live": len(relay_tokens),
+            "orphaned_unregistered": len(orphaned),
+            "flagged_reregister": len(stale),
+        }
+        _LOGGER.info(
+            "CASA: Reconcile complete — live=%s, unregistered=%s, flagged_reregister=%s.",
+            result["live"], result["orphaned_unregistered"], result["flagged_reregister"],
+        )
+        return result
+
+    async def handle_reconcile(call: ServiceCall):
+        await _check_authorization(call)
+        return await _reconcile_site()
+
+    hass.services.async_register(
+        DOMAIN, "reconcile", handle_reconcile,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    async def _scheduled_reconcile(now):
+        await _reconcile_site()
+
+    hass.data[DOMAIN]["reconcile_unsub"] = async_track_time_interval(
+        hass, _scheduled_reconcile, timedelta(days=1)
+    )
+
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "button"])
 
@@ -2133,6 +2246,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "notify_user")
     hass.services.async_remove(DOMAIN, "reload_device")
     hass.services.async_remove(DOMAIN, "update_wireguard")
+    hass.services.async_remove(DOMAIN, "reconcile")
+
+    reconcile_unsub = hass.data[DOMAIN].get("reconcile_unsub")
+    if reconcile_unsub:
+        reconcile_unsub()
 
     for task in hass.data[DOMAIN].get("timers", {}).values():
         task.cancel()
