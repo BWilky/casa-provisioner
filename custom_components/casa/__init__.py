@@ -580,6 +580,7 @@ class CasaProvisionProfilesView(HomeAssistantView):
         "allow_wireguard": False,
         "wireguard_config": "",
         "wireguard_excluded_wifi": "",
+        "wireguard_profile_id": "",
         "timeout_minutes": 5,
         "password_scramble": True,
         "password_scramble_in": 0,
@@ -1160,8 +1161,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("CASA CRITICAL CRASH: Failed to load public key. Error: %s", str(e))
             return {"error": "Missing Public Key"}
 
-        final_server_url = str(service_data.get("host_url", "")).strip()
-        target_username = str(service_data.get("username", "")).strip()
+        # 1. Resolve Profile data if present
+        profile_key = str(service_data.get("profile", "")).strip()
+        profile_fields = {}
+        if profile_key:
+            pp_data = hass.data.get(DOMAIN, {}).get("pp_data", {"profiles": []})
+            matched_profile = None
+            for p in pp_data.get("profiles", []):
+                if p.get("id") == profile_key or p.get("name") == profile_key:
+                    matched_profile = p
+                    break
+            if not matched_profile:
+                _LOGGER.error("CASA ERROR: Provision profile '%s' not found.", profile_key)
+                return {"error": f"Provision profile '{profile_key}' not found"}
+            profile_fields = matched_profile.get("fields", {})
+
+        # Helper to resolve fields: service_data overrides profile_fields
+        def get_field(key, default=None):
+            val = service_data.get(key)
+            if val is not None and val != "":
+                if isinstance(default, bool):
+                    if isinstance(val, str):
+                        return val.lower() == "true"
+                    return bool(val)
+                if isinstance(default, int) and not isinstance(default, bool):
+                    try:
+                        return int(val)
+                    except (TypeError, ValueError):
+                        return default
+                return val
+            
+            p_val = profile_fields.get(key)
+            if p_val is not None:
+                if isinstance(default, bool):
+                    if isinstance(p_val, str):
+                        return p_val.lower() == "true"
+                    return bool(p_val)
+                if isinstance(default, int) and not isinstance(default, bool):
+                    try:
+                        return int(p_val)
+                    except (TypeError, ValueError):
+                        return default
+                return p_val
+            return default
+
+        final_server_url = str(get_field("host_url", "")).strip()
+        target_username = str(get_field("username", "")).strip()
 
         if not final_server_url or not target_username:
             _LOGGER.error("CASA ERROR: Missing mandatory host_url or username.")
@@ -1177,40 +1222,43 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.error("CASA ERROR: Missing mandatory ESPHome services for BLE method.")
                 return {"error": "Missing ESPHome Services"}
 
-        target_pin = str(service_data.get("pin", "")).strip()[:6]
-        connect_wifi_ssid = str(service_data.get("connect_wifi_ssid", "")).strip()
-        connect_wifi_password = str(service_data.get("connect_wifi_password", "")).strip()
+        target_pin = str(get_field("pin", "")).strip()[:6]
+        connect_wifi_ssid = str(get_field("connect_wifi_ssid", "")).strip()
+        connect_wifi_password = str(get_field("connect_wifi_password", "")).strip()
 
-        deauthenticate_existing = service_data.get("deauthenticate_existing", False)
+        deauthenticate_existing = get_field("deauthenticate_existing", False)
 
-        allow_all_pages = service_data.get("allow_all_pages", False)
+        allow_all_pages = get_field("allow_all_pages", False)
         if allow_all_pages:
             allowed_paths_str = "/*"
         else:
-            allowed_pages_input = service_data.get("allowed_pages", [])
+            allowed_pages_input = get_field("allowed_pages", [])
             if isinstance(allowed_pages_input, list):
                 clean_paths = [str(p).strip() for p in allowed_pages_input if str(p).strip()]
                 allowed_paths_str = ",".join(clean_paths)
             else:
                 allowed_paths_str = str(allowed_pages_input).strip()
 
-        allowed_wifi_input = service_data.get("allowed_wifi", [])
+        allowed_wifi_input = get_field("allowed_wifi", [])
         if isinstance(allowed_wifi_input, list):
             clean_wifi = [str(w).strip() for w in allowed_wifi_input if str(w).strip()]
             allowed_wifi = ",".join(clean_wifi)
         else:
             allowed_wifi = str(allowed_wifi_input).strip()
 
-        default_dashboard = str(service_data.get("default_dashboard", ""))
-        welcome_url = str(service_data.get("welcome_url", "")).strip()
+        default_dashboard = str(get_field("default_dashboard", ""))
+        welcome_url = str(get_field("welcome_url", "")).strip()
 
-        immersive_level = str(service_data.get("immersive_level", "1"))
-        theme_color_mode = str(service_data.get("theme_color_mode", "inherit"))
-        custom_color = str(service_data.get("custom_color", "#000000")).strip().replace("|", "")
+        immersive_level = str(get_field("immersive_level", "1"))
+        theme_color_mode = str(get_field("theme_color_mode", "inherit"))
+        custom_color = str(get_field("custom_color", "#000000")).strip().replace("|", "")
 
+        val_hours = get_field("expiration_hours", 336)
+        try:
+            expiration_hours = int(val_hours)
+        except (TypeError, ValueError):
+            expiration_hours = 336
 
-        val_hours = service_data.get("expiration_hours")
-        expiration_hours = int(val_hours) if val_hours is not None else 336
         if expiration_hours == 0:
             session_expiration_unix = 0
         else:
@@ -1218,15 +1266,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             session_expiration_unix = int(future_dt.timestamp())
 
         # Extract Time Windows
-        val_timeout = service_data.get("timeout_minutes")
-        if val_timeout is not None:
+        val_timeout = get_field("timeout_minutes", 5)
+        try:
             timeout_mins = int(val_timeout)
-        else:
+        except (TypeError, ValueError):
             timeout_mins = 5
 
-        password_scramble = service_data.get("password_scramble", True)
-        val_scramble = service_data.get("password_scramble_in")
-        password_scramble_in = int(val_scramble) if val_scramble is not None else 0
+        password_scramble = get_field("password_scramble", True)
+        val_scramble = get_field("password_scramble_in", 0)
+        try:
+            password_scramble_in = int(val_scramble)
+        except (TypeError, ValueError):
+            password_scramble_in = 0
 
         # Inheritance & Validation Logic
         if password_scramble:
@@ -1248,7 +1299,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             timeout_secs = 0
 
         # Extract Cache Control Hours
-        val_cache_control = service_data.get("cache_control_hours")
+        val_cache_control = get_field("cache_control_hours", "")
         cache_control_hours_str = str(val_cache_control) if val_cache_control is not None else ""
 
         if users is None:
@@ -1273,7 +1324,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not provider:
             return {"error": "Home Assistant core auth provider not found"}
 
-        target_password = str(service_data.get("password", "")).strip()
+        target_password = str(get_field("password", "")).strip()
 
         if target_password:
             login_password = target_password
@@ -1291,7 +1342,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Construct payload field values (shared by v1 and v2)
         site_id = stored_data.get("site_id", "")
-        push_val = service_data.get("push_notifications", "false")
+        push_val = get_field("push_notifications", "false")
         if push_val is True or (isinstance(push_val, str) and push_val.lower() == "true"):
             normalized_push = "true"
         elif isinstance(push_val, str) and push_val.lower() == "mandatory":
@@ -1299,16 +1350,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             normalized_push = "false"
 
-        allow_wireguard = service_data.get("allow_wireguard", False)
-        normalized_wireguard = "true" if (allow_wireguard is True or (isinstance(allow_wireguard, str) and allow_wireguard.lower() == "true")) else "false"
+        allow_wireguard = get_field("allow_wireguard", False)
+        normalized_wireguard = "true" if allow_wireguard else "false"
 
-        wireguard_config_raw = service_data.get("wireguard_config", "")
+        wireguard_config_raw = ""
+        wireguard_excluded_wifi_raw = ""
+
+        # Fetch from linked WireGuard profile if specified
+        wg_profile_key = get_field("wireguard_profile_id", "") or get_field("wireguard_profile", "")
+        if wg_profile_key:
+            wg_data = hass.data.get(DOMAIN, {}).get("wg_data", {"profiles": []})
+            wg_profile = None
+            for wp in wg_data.get("profiles", []):
+                if wp.get("id") == wg_profile_key or wp.get("alias") == wg_profile_key:
+                    wg_profile = wp
+                    break
+            if wg_profile:
+                wireguard_config_raw = wg_profile.get("config", "")
+                wireguard_excluded_wifi_raw = wg_profile.get("excluded_wifi", "")
+                _LOGGER.info("CASA: Linked WireGuard profile '%s' resolved.", wg_profile.get("alias"))
+
+        # Fallback to direct field values if not linked/not found
+        if not wireguard_config_raw:
+            wireguard_config_raw = get_field("wireguard_config", "")
+        if not wireguard_excluded_wifi_raw:
+            wireguard_excluded_wifi_raw = get_field("wireguard_excluded_wifi", "")
+
         if wireguard_config_raw:
             wireguard_config_encoded = base64.b64encode(str(wireguard_config_raw).encode("utf-8")).decode("utf-8")
         else:
             wireguard_config_encoded = ""
 
-        wireguard_excluded_wifi = str(service_data.get("wireguard_excluded_wifi", "")).strip().replace("|", "")
+        wireguard_excluded_wifi = str(wireguard_excluded_wifi_raw).strip().replace("|", "")
 
         try:
             payload_version = int(service_data.get("payload_version", 2))

@@ -672,26 +672,58 @@ class CasaAdminPanel extends HTMLElement {
     });
   }
 
-  _openProfileEditor(profile) {
+  async _openProfileEditor(profile) {
     this._ppEditing = profile;
     this._ppFormError = "";
     const sr = this.shadowRoot;
     const overlay = sr.getElementById("profile-overlay");
     overlay.classList.remove("hidden");
     sr.getElementById("editor-title").textContent = profile ? "Edit Profile" : "New Profile";
-    this._renderProfileEditorBody();
-
-    // Bind buttons
+    
+    // Bind buttons (cancel/close can be bound immediately)
     const bindOnce = (id, fn) => {
       const el = sr.getElementById(id);
-      const clone = el.cloneNode(true);
-      el.parentNode.replaceChild(clone, el);
-      clone.addEventListener("click", fn);
+      if (el) {
+        const clone = el.cloneNode(true);
+        el.parentNode.replaceChild(clone, el);
+        clone.addEventListener("click", fn);
+      }
     };
     bindOnce("editor-close", () => this._closeProfileEditor());
     bindOnce("editor-cancel", () => this._closeProfileEditor());
-    bindOnce("editor-save", () => this._saveProfileFromEditor());
     overlay.onclick = (e) => { if (e.target === overlay) this._closeProfileEditor(); };
+
+    const body = sr.getElementById("editor-body");
+    if (body) {
+      body.innerHTML = `<div style="padding: 20px; text-align: center; color: var(--secondary-text-color, #727272);">Loading config options…</div>`;
+    }
+
+    // Ensure WireGuard profiles are loaded
+    if (!this._wgProfiles) {
+      try {
+        const res = await this._hass.callApi("GET", "casa/admin/wireguard_profiles");
+        this._wgProfiles = res.profiles || [];
+      } catch (err) {
+        this._wgProfiles = [];
+      }
+    }
+
+    this._renderProfileEditorBody();
+    bindOnce("editor-save", () => this._saveProfileFromEditor());
+
+    // Visibility toggles for linked WireGuard configuration
+    const wgSelect = sr.getElementById("pp-wireguard_profile_id");
+    const updateWgFieldsVisibility = () => {
+      const isLinked = wgSelect && wgSelect.value !== "";
+      const configRow = sr.getElementById("pp-wireguard_config-row");
+      const exclRow = sr.getElementById("pp-wireguard_excluded_wifi-row");
+      if (configRow) configRow.style.display = isLinked ? "none" : "";
+      if (exclRow) exclRow.style.display = isLinked ? "none" : "";
+    };
+    if (wgSelect) {
+      wgSelect.addEventListener("change", updateWgFieldsVisibility);
+    }
+    updateWgFieldsVisibility();
   }
 
   _closeProfileEditor() {
@@ -797,10 +829,21 @@ class CasaAdminPanel extends HTMLElement {
         </div>
         <label class="editor-toggle"><input type="checkbox" id="pp-allow_wireguard" ${c("allow_wireguard", false)}> Allow WireGuard</label>
         <div class="editor-row">
+          <label>Link WireGuard Profile</label>
+          <select id="pp-wireguard_profile_id">
+            <option value="" ${v("wireguard_profile_id", "") === "" ? "selected" : ""}>-- None / Custom (Paste Below) --</option>
+            ${(this._wgProfiles || []).map(p => `
+              <option value="${this._esc(p.id)}" ${v("wireguard_profile_id", "") === p.id ? "selected" : ""}>
+                ${this._esc(p.alias)}
+              </option>
+            `).join("")}
+          </select>
+        </div>
+        <div class="editor-row" id="pp-wireguard_config-row">
           <label>WireGuard Config</label>
           <textarea id="pp-wireguard_config" placeholder="[Interface]\nPrivateKey = ...">${this._esc(f.wireguard_config || "")}</textarea>
         </div>
-        <div class="editor-row">
+        <div class="editor-row" id="pp-wireguard_excluded_wifi-row">
           <label>WireGuard Excluded WiFi</label>
           <input type="text" id="pp-wireguard_excluded_wifi" value="${v("wireguard_excluded_wifi", "")}" placeholder="HomeSSID">
         </div>
@@ -875,6 +918,7 @@ class CasaAdminPanel extends HTMLElement {
       allowed_wifi: gv("pp-allowed_wifi"),
       push_notifications: gv("pp-push_notifications"),
       allow_wireguard: gc("pp-allow_wireguard"),
+      wireguard_profile_id: gv("pp-wireguard_profile_id"),
       wireguard_config: gv("pp-wireguard_config"),
       wireguard_excluded_wifi: gv("pp-wireguard_excluded_wifi"),
       timeout_minutes: parseInt(gv("pp-timeout_minutes")) || 0,
