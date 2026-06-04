@@ -364,6 +364,20 @@ class CasaHeartbeatView(HomeAssistantView):
         provisioned_at = data.get("provisioned_at")
         expires_at = data.get("expires_at")
         current_url = data.get("current_url")
+        app_version = data.get("app_version")
+        wireguard_configured = data.get("wireguard_configured")
+        wireguard_connected = data.get("wireguard_connected")
+
+        if expires_at is not None:
+            try:
+                expires_at = int(expires_at)
+            except (ValueError, TypeError):
+                expires_at = None
+
+        if wireguard_configured is not None:
+            wireguard_configured = bool(wireguard_configured)
+        if wireguard_connected is not None:
+            wireguard_connected = bool(wireguard_connected)
 
         try:
             reregister = await self.heartbeat_func(
@@ -374,7 +388,10 @@ class CasaHeartbeatView(HomeAssistantView):
                 ip_address=ip_address,
                 provisioned_at=provisioned_at,
                 expires_at=expires_at,
-                current_url=current_url
+                current_url=current_url,
+                app_version=app_version,
+                wireguard_configured=wireguard_configured,
+                wireguard_connected=wireguard_connected
             )
         except HomeAssistantError as err:
             return self.json({"error": str(err)}, status_code=400)
@@ -437,6 +454,12 @@ class CasaAdminSummaryView(HomeAssistantView):
                     "push_token": dinfo.get("push_token"),
                     "last_12_token": dinfo.get("last_12_token"),
                     "refresh_token_id": dinfo.get("refresh_token_id"),
+                    "app_version": dinfo.get("app_version"),
+                    "wireguard_configured": dinfo.get("wireguard_configured"),
+                    "wireguard_connected": dinfo.get("wireguard_connected"),
+                    "current_url": dinfo.get("current_url"),
+                    "provisioned_at": dinfo.get("provisioned_at"),
+                    "expires_at": dinfo.get("expires_at"),
                 })
 
         # Native devices (HA users not managed by the integration).
@@ -461,6 +484,12 @@ class CasaAdminSummaryView(HomeAssistantView):
                         "push_token": dinfo.get("push_token"),
                         "last_12_token": dinfo.get("last_12_token"),
                         "refresh_token_id": dinfo.get("refresh_token_id"),
+                        "app_version": dinfo.get("app_version"),
+                        "wireguard_configured": dinfo.get("wireguard_configured"),
+                        "wireguard_connected": dinfo.get("wireguard_connected"),
+                        "current_url": dinfo.get("current_url"),
+                        "provisioned_at": dinfo.get("provisioned_at"),
+                        "expires_at": dinfo.get("expires_at"),
                     })
 
         accounts = []
@@ -1032,8 +1061,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         refresh_token_id: str = None,
         ip_address: str = None,
         provisioned_at: str = None,
-        expires_at: str = None,
-        current_url: str = None
+        expires_at: int = None,
+        current_url: str = None,
+        app_version: str = None,
+        wireguard_configured: bool = None,
+        wireguard_connected: bool = None
     ) -> None:
         """Process heartbeat from a device."""
         if DOMAIN not in hass.data:
@@ -1083,6 +1115,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             device_info["expires_at"] = expires_at
         if current_url is not None:
             device_info["current_url"] = current_url
+        if app_version is not None:
+            device_info["app_version"] = app_version
+        if wireguard_configured is not None:
+            device_info["wireguard_configured"] = wireguard_configured
+        if wireguard_connected is not None:
+            device_info["wireguard_connected"] = wireguard_connected
 
         device_info["last_seen_at"] = now_iso
 

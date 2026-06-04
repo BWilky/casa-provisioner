@@ -93,6 +93,16 @@ class CasaAdminPanel extends HTMLElement {
     }
   }
 
+  _fmtExpiry(v) {
+    if (!v) return "never";
+    const num = Number(v);
+    if (!isNaN(num)) {
+      return this._fmtTime(num * 1000);
+    }
+    return this._fmtTime(v);
+  }
+
+
   _openSettings() {
     this._regenConfirm = false;
     this._regenBusy = false;
@@ -362,6 +372,7 @@ class CasaAdminPanel extends HTMLElement {
         <button class="icon-btn menu" id="menu" title="Menu"><ha-icon icon="mdi:menu"></ha-icon></button>
         <span>Casa Admin</span>
         <span class="spacer"></span>
+        <button class="icon-btn" id="quick-provision" title="Quick Provision Device" style="margin-right: 8px;"><ha-icon icon="mdi:qrcode-scan"></ha-icon></button>
         <button class="icon-btn" id="settings" title="Settings"><ha-icon icon="mdi:cog"></ha-icon></button>
       </div>
       <div class="content">
@@ -448,6 +459,18 @@ class CasaAdminPanel extends HTMLElement {
           </div>
         </div>
       </div>
+      <div class="editor-overlay hidden" id="provision-overlay">
+        <div class="editor-modal" style="width: 600px;">
+          <div class="editor-header">
+            <h3>Quick Provision Device</h3>
+            <button class="close" id="provision-close" title="Close"><ha-icon icon="mdi:close"></ha-icon></button>
+          </div>
+          <div class="editor-body" id="provision-body"></div>
+          <div class="editor-footer">
+            <button class="btn-plain" id="provision-cancel">Close</button>
+          </div>
+        </div>
+      </div>
     `;
 
     const sr = this.shadowRoot;
@@ -459,6 +482,9 @@ class CasaAdminPanel extends HTMLElement {
     sr.getElementById("settings").addEventListener("click", () => this._openSettings());
     sr.getElementById("settings-close").addEventListener("click", () => this._closeSettings());
     sr.getElementById("add-account-dash").addEventListener("click", () => this._openAccountCreator());
+    sr.getElementById("quick-provision").addEventListener("click", () => this._openQuickProvision());
+    sr.getElementById("provision-close").addEventListener("click", () => this._closeQuickProvision());
+    sr.getElementById("provision-cancel").addEventListener("click", () => this._closeQuickProvision());
 
     // Settings tab switching
     sr.querySelectorAll(".modal .nav .tab").forEach((tab) => {
@@ -804,6 +830,26 @@ class CasaAdminPanel extends HTMLElement {
             ${d.orphaned ? '<span class="badge orphan">orphan</span>' : ""}
             ${d.stale ? '<span class="badge stale">stale</span>' : ""}
             ${!d.orphaned && !d.stale && d.push_registered ? '<span class="badge ok">ok</span>' : ""}
+          </span>
+          <strong>App Version</strong>
+          <span>${esc(d.app_version) || "—"}</span>
+          <strong>Provisioned At</strong>
+          <span>${d.provisioned_at ? this._fmtTime(d.provisioned_at) : "—"}</span>
+          <strong>Expires At</strong>
+          <span>${d.expires_at ? this._fmtExpiry(d.expires_at) : "Never"}</span>
+          <strong>VPN Configuration</strong>
+          <span>
+            ${d.wireguard_configured === true ? '<span class="badge ok">Installed</span>' :
+              d.wireguard_configured === false ? '<span class="badge" style="background:var(--secondary-background-color);color:var(--primary-text-color)">Not Installed</span>' : "—"}
+          </span>
+          <strong>VPN Connection</strong>
+          <span>
+            ${d.wireguard_connected === true ? '<span class="badge ok">Connected</span>' :
+              d.wireguard_connected === false ? '<span class="badge stale">Disconnected</span>' : "—"}
+          </span>
+          <strong>Active URL</strong>
+          <span>
+            ${d.current_url ? `<a href="${esc(d.current_url)}" target="_blank" rel="noopener noreferrer" style="color:var(--primary-color,#03a9f4);text-decoration:none;word-break:break-all;">${esc(d.current_url)}</a>` : "—"}
           </span>
         </div>
       </div>
@@ -1589,6 +1635,179 @@ class CasaAdminPanel extends HTMLElement {
     const overlay = root.getElementById("overlay");
     if (overlay && !overlay.classList.contains("hidden")) {
       this._renderSettingsBody();
+    }
+  }
+
+  _openQuickProvision() {
+    this._provisionProfileSearch = "";
+    this._provisionSelectedProfileId = "";
+    this._provisionHostUrl = this._data?.site_id ? window.location.origin : "";
+    this._provisionUsername = "";
+    this._provisionPin = "";
+    this._provisionResult = null;
+    this._provisionError = "";
+    this._provisionLoading = false;
+
+    this.shadowRoot.getElementById("provision-overlay").classList.remove("hidden");
+    this._loadProvisionProfiles().then(() => this._renderQuickProvisionBody());
+  }
+
+  _closeQuickProvision() {
+    this.shadowRoot.getElementById("provision-overlay").classList.add("hidden");
+  }
+
+  _renderQuickProvisionBody() {
+    const body = this.shadowRoot.getElementById("provision-body");
+    if (!body) return;
+    const esc = (val) => this._esc(val || "");
+    const profiles = this._ppProfiles || [];
+
+    body.innerHTML = `
+      <div class="editor-section">
+        <h4>Select Profile & Parameters</h4>
+        <hr>
+        <div class="editor-row">
+          <label>Filter Profiles</label>
+          <input type="text" id="qp-profile-search" placeholder="Type to search profiles...">
+        </div>
+        <div class="editor-row">
+          <label>Provisioning Profile</label>
+          <select id="qp-profile-select">
+            <option value="">-- No Profile / Manual Entry --</option>
+            ${profiles.map(p => `<option value="${esc(p.id)}" ${this._provisionSelectedProfileId === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="editor-row">
+          <label>Host URL</label>
+          <input type="text" id="qp-host-url" value="${esc(this._provisionHostUrl)}" placeholder="e.g. http://192.168.1.50:8123">
+        </div>
+        <div class="editor-row">
+          <label>Username</label>
+          <input type="text" id="qp-username" value="${esc(this._provisionUsername)}" placeholder="e.g. guest_user">
+        </div>
+        <div class="editor-row">
+          <label>PIN (Optional 6-digit PIN)</label>
+          <input type="text" id="qp-pin" value="${esc(this._provisionPin)}" placeholder="e.g. 123456" maxlength="6">
+        </div>
+        
+        ${this._provisionError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-bottom: 12px;">${esc(this._provisionError)}</div>` : ""}
+        
+        <button class="btn-primary" id="qp-generate" style="width: 100%; margin-top: 12px; height: 40px; font-weight: 600;">
+          ${this._provisionLoading ? "Generating..." : "Generate Link & QR Code"}
+        </button>
+      </div>
+
+      <div id="qp-result-container">
+        ${this._provisionResult ? `
+          <div class="device-sec-box" style="text-align: center; margin-top: 16px;">
+            <h5 style="margin-bottom: 12px; font-size: 14px;">Scan with Casa App or click link</h5>
+            <div style="margin: 16px 0;">
+              <img src="${esc(this._provisionResult.url_path)}" style="width: 220px; height: 220px; border: 1px solid var(--divider-color, #ddd); border-radius: 8px; padding: 12px; background: white;" />
+            </div>
+            <div class="editor-row" style="text-align: left;">
+              <label>Setup Deep Link</label>
+              <div style="display:flex; gap:8px; align-items: center;">
+                <input type="text" id="qp-link-val" value="${esc(this._provisionResult.deep_link)}" readonly style="flex:1; font-family: monospace; font-size: 11px;">
+                <button class="btn-primary" id="qp-copy-link" style="padding: 8px 16px;">Copy</button>
+              </div>
+              <div id="qp-copy-msg" style="color:var(--success-color,#43a047); font-size: 12px; margin-top: 4px; display:none;">Link copied to clipboard!</div>
+            </div>
+          </div>
+        ` : ""}
+      </div>
+    `;
+
+    const searchInput = body.querySelector("#qp-profile-search");
+    const selectEl = body.querySelector("#qp-profile-select");
+    const hostInput = body.querySelector("#qp-host-url");
+    const userInput = body.querySelector("#qp-username");
+    const pinInput = body.querySelector("#qp-pin");
+    const generateBtn = body.querySelector("#qp-generate");
+
+    if (searchInput && selectEl) {
+      searchInput.addEventListener("input", (e) => {
+        const q = e.target.value.toLowerCase();
+        for (let i = 1; i < selectEl.options.length; i++) {
+          const opt = selectEl.options[i];
+          const match = opt.text.toLowerCase().includes(q);
+          opt.style.display = match ? "" : "none";
+        }
+      });
+    }
+
+    if (selectEl) {
+      selectEl.addEventListener("change", (e) => {
+        const val = e.target.value;
+        this._provisionSelectedProfileId = val;
+        if (val) {
+          const p = profiles.find(x => x.id === val);
+          if (p && p.fields) {
+            hostInput.value = p.fields.host_url || "";
+            userInput.value = p.fields.username || "";
+            pinInput.value = p.fields.pin || "";
+            this._provisionHostUrl = p.fields.host_url || "";
+            this._provisionUsername = p.fields.username || "";
+            this._provisionPin = p.fields.pin || "";
+          }
+        }
+      });
+    }
+
+    if (hostInput) hostInput.addEventListener("input", (e) => { this._provisionHostUrl = e.target.value; });
+    if (userInput) userInput.addEventListener("input", (e) => { this._provisionUsername = e.target.value; });
+    if (pinInput) pinInput.addEventListener("input", (e) => { this._provisionPin = e.target.value; });
+
+    generateBtn.addEventListener("click", () => this._generateProvisionLink());
+
+    const copyBtn = body.querySelector("#qp-copy-link");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", () => {
+        const linkVal = body.querySelector("#qp-link-val");
+        if (linkVal) {
+          linkVal.select();
+          navigator.clipboard.writeText(linkVal.value).then(() => {
+            const msg = body.querySelector("#qp-copy-msg");
+            if (msg) {
+              msg.style.display = "block";
+              setTimeout(() => { msg.style.display = "none"; }, 2000);
+            }
+          });
+        }
+      });
+    }
+  }
+
+  async _generateProvisionLink() {
+    const hostVal = this._provisionHostUrl.trim();
+    const userVal = this._provisionUsername.trim();
+    
+    if (!hostVal || !userVal) {
+      this._provisionError = "Host URL and Username are required.";
+      this._renderQuickProvisionBody();
+      return;
+    }
+
+    this._provisionError = "";
+    this._provisionLoading = true;
+    this._provisionResult = null;
+    this._renderQuickProvisionBody();
+
+    try {
+      const payload = {
+        method: "qr",
+        host_url: hostVal,
+        username: userVal,
+        pin: this._provisionPin.trim() || undefined,
+        profile: this._provisionSelectedProfileId || undefined
+      };
+      
+      const res = await this._hass.callService("casa", "provision", payload);
+      this._provisionResult = res || null;
+    } catch (err) {
+      this._provisionError = (err && err.message) || String(err);
+    } finally {
+      this._provisionLoading = false;
+      this._renderQuickProvisionBody();
     }
   }
 }
