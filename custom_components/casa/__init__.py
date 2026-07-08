@@ -3025,6 +3025,79 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         return {"status": "success", "device_id": device_id, "expires_at_override": value}
 
+    async def handle_deprovision_device(call: ServiceCall):
+        await _check_authorization(call)
+        device_id = str(call.data.get("device_id", "")).strip()
+
+        if not device_id:
+            raise HomeAssistantError("Missing device_id parameter.")
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        device_info, _, username = _find_device_record(stored_data, device_id)
+        if device_info is None:
+            raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
+
+        # Send the silent wipe push first, while the proxy token is still
+        # registered on the relay. Best-effort: an offline or push-less device is
+        # still cut off below (revoked refresh token -> next heartbeat/refresh
+        # 401s and the app wipes itself on auth failure).
+        push_sent = False
+        push_token = device_info.get("push_token")
+        if push_token:
+            session = async_get_clientsession(hass)
+            payload = {
+                "title": "",
+                "message": "",
+                "target": push_token,
+                "site_id": stored_data.get("site_id"),
+                "site_key": stored_data.get("site_key"),
+                "command": "deprovision"
+            }
+            _LOGGER.info(
+                "CASA: Sending silent deprovision push to device '%s' of user '%s'. Target: %s",
+                device_id, username or "Unknown", push_token[:10] + "..."
+            )
+            for url in RELAY_URLS:
+                try:
+                    async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
+                        if response.status == 200:
+                            push_sent = True
+                            break
+                        text = await response.text()
+                        _LOGGER.warning("CASA: Relay %s returned status %s: %s", url, response.status, text)
+                except Exception as err:
+                    _LOGGER.warning("CASA: Failed to connect to relay %s: %s", url, err)
+            if not push_sent:
+                _LOGGER.warning(
+                    "CASA: Deprovision push for device '%s' was not delivered; device will be wiped lazily on next contact.",
+                    device_id
+                )
+        else:
+            _LOGGER.warning(
+                "CASA: Device '%s' has no push token; skipping deprovision push (device will be wiped lazily on next contact).",
+                device_id
+            )
+
+        purge_result = await _purge_device(hass, device_id)
+
+        # Remove the device from the HA registry. Direct registry removal does not
+        # re-invoke async_remove_config_entry_device, so nothing is purged twice.
+        try:
+            from homeassistant.helpers import device_registry as dr
+            dev_reg = dr.async_get(hass)
+            reg_device = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+            if reg_device:
+                dev_reg.async_remove_device(reg_device.id)
+        except Exception as err:
+            _LOGGER.warning("CASA: Failed to remove device '%s' from the HA device registry: %s", device_id, err)
+
+        return {
+            "status": "success",
+            "device_id": device_id,
+            "push_sent": push_sent,
+            "access_revoked": purge_result.get("access_revoked", False),
+        }
+
     async def handle_update_wireguard(call: ServiceCall):
         import json
 
@@ -3206,6 +3279,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     hass.services.async_register(
+        DOMAIN, "deprovision_device", handle_deprovision_device,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    hass.services.async_register(
         DOMAIN, "update_wireguard", handle_update_wireguard,
         supports_response=SupportsResponse.OPTIONAL
     )
@@ -3356,22 +3434,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     return True
 
-async def async_remove_config_entry_device(
-    hass: HomeAssistant, config_entry: ConfigEntry, device_entry
-) -> bool:
-    """Allow deleting a Casa device from the UI.
+async def _purge_device(hass: HomeAssistant, device_id: str) -> dict:
+    """Remove a device's server-side footprint.
 
-    HA renders the Delete action (and its confirmation dialog) once this exists.
-    On delete we revoke the device's HA refresh token (killing its access) and
-    purge it from our storage before allowing the registry removal.
+    Pops the record from storage (managed and native maps), unregisters the proxy
+    token from the relay, revokes the device's HA refresh token, and drops any
+    queued updates. Network/auth steps are best-effort.
+    Returns {"found", "username", "push_token", "access_revoked"}.
     """
-    device_id = next(
-        (ident for domain, ident in device_entry.identifiers if domain == DOMAIN),
-        None,
-    )
-    if not device_id:
-        return True
-
     stored_data = hass.data[DOMAIN]["stored_data"]
     store = hass.data[DOMAIN]["store"]
 
@@ -3379,6 +3449,7 @@ async def async_remove_config_entry_device(
     refresh_token_id = None
     proxy_token = None
     username = "Unknown"
+    access_revoked = False
 
     for uid, udata in stored_data.get("users", {}).items():
         devices = udata.get("devices", {})
@@ -3399,6 +3470,9 @@ async def async_remove_config_entry_device(
                 username = uid
                 devices.pop(device_id, None)
                 break
+
+    if owner_user_id is None:
+        return {"found": False, "username": username, "push_token": None, "access_revoked": False}
 
     # Unregister the proxy token from the relay (possession of the token is the auth).
     if proxy_token:
@@ -3421,12 +3495,13 @@ async def async_remove_config_entry_device(
 
     # Revoke this device's HA session so it loses access (and can't silently
     # re-register via heartbeat). Scoped to the device's own token only.
-    if owner_user_id and refresh_token_id:
+    if refresh_token_id:
         user = await hass.auth.async_get_user(owner_user_id)
         if user:
             token = user.refresh_tokens.get(refresh_token_id)
             if token:
                 hass.auth.async_remove_refresh_token(token)
+                access_revoked = True
                 _LOGGER.info(
                     "CASA: Revoked refresh token for deleted device '%s' (user '%s').",
                     device_id, username,
@@ -3437,8 +3512,35 @@ async def async_remove_config_entry_device(
                     device_id, username,
                 )
 
+    # Drop any queued updates addressed to this device.
+    qu_data = hass.data[DOMAIN].get("qu_data")
+    if qu_data and qu_data.get("updates", {}).pop(device_id, None) is not None:
+        qu_store = hass.data[DOMAIN].get("qu_store")
+        if qu_store:
+            qu_store.async_delay_save(lambda: qu_data, 2.0)
+
     await store.async_save(stored_data)
     _LOGGER.info("CASA: Deleted device '%s' from storage (user '%s').", device_id, username)
+    return {"found": True, "username": username, "push_token": proxy_token, "access_revoked": access_revoked}
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry
+) -> bool:
+    """Allow deleting a Casa device from the UI.
+
+    HA renders the Delete action (and its confirmation dialog) once this exists.
+    On delete we revoke the device's HA refresh token (killing its access) and
+    purge it from our storage before allowing the registry removal.
+    """
+    device_id = next(
+        (ident for domain, ident in device_entry.identifiers if domain == DOMAIN),
+        None,
+    )
+    if not device_id:
+        return True
+
+    await _purge_device(hass, device_id)
     return True
 
 
@@ -3530,6 +3632,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "notify_user")
     hass.services.async_remove(DOMAIN, "reload_device")
     hass.services.async_remove(DOMAIN, "set_device_expiration")
+    hass.services.async_remove(DOMAIN, "deprovision_device")
     hass.services.async_remove(DOMAIN, "update_wireguard")
     hass.services.async_remove(DOMAIN, "reconcile")
     hass.services.async_remove(DOMAIN, "regenerate_site")

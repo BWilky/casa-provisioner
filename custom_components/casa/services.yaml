@@ -807,6 +807,17 @@ reload_device:
       selector:
         text: {}
 
+deprovision_device:
+  name: "Deprovision Device"
+  description: "DESTRUCTIVE: remotely wipes a Casa device and removes it from the server. Sends a silent deprovision push (the app immediately wipes its session), revokes the device's HA session token, unregisters its push relay token, and deletes its record. If the device is offline or has no push registration, it is wiped lazily the next time it contacts the server and its session token fails."
+  fields:
+    device_id:
+      name: "Device ID"
+      description: "The unique identifier (UUID) of the device to deprovision."
+      required: true
+      selector:
+        text: {}
+
 set_device_expiration:
   name: "Set Device Expiration"
   description: "Sets, extends, or clears a device's session expiration after provisioning. The new value is delivered on the device's next heartbeat (up to ~5 minutes); until then it shows as pending. Provide exactly one of: expires_at, expires_in_hours, or permanent."

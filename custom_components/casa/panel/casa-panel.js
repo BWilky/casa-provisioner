@@ -798,6 +798,7 @@ class CasaAdminPanel extends HTMLElement {
     this._devicePendingError = "";
     this._deviceExpError = "";
     this._deviceExpSuccess = "";
+    this._deviceDeprovError = "";
 
     const sr = this.shadowRoot;
     const overlay = sr.getElementById("device-overlay");
@@ -1027,6 +1028,17 @@ class CasaAdminPanel extends HTMLElement {
           ${this._deviceExpError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 4px;">${esc(this._deviceExpError)}</div>` : ""}
           ${this._deviceExpSuccess ? `<div class="editor-msg" style="color:var(--success-color,#43a047); margin-top: 4px;">${esc(this._deviceExpSuccess)}</div>` : ""}
         </div>
+
+        <div class="device-sec-box" style="border: 1px solid var(--error-color, #db4437);">
+          <h5 style="color:var(--error-color,#db4437);">Danger Zone</h5>
+          <p style="font-size:12px; color:var(--secondary-text-color,#727272); margin:0 0 8px 0;">
+            Remotely wipes the Casa app on this device, revokes its access, and deletes this record.
+          </p>
+          <button class="btn-plain del" id="de-deprovision" style="padding:8px 14px; font-size:13px; color:var(--error-color,#db4437); border:1px solid var(--error-color,#db4437); border-radius:6px;">
+            <ha-icon icon="mdi:cellphone-remove" style="--mdc-icon-size:16px;"></ha-icon> Deprovision Device
+          </button>
+          ${this._deviceDeprovError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 6px;">${esc(this._deviceDeprovError)}</div>` : ""}
+        </div>
       </div>
     `;
 
@@ -1076,6 +1088,16 @@ class CasaAdminPanel extends HTMLElement {
         this._setDeviceExpiration(null);
       });
     }
+
+    body.querySelector("#de-deprovision").addEventListener("click", () => {
+      const label = d.alias || d.device_id;
+      this._showConfirm({
+        title: "Deprovision device",
+        message: `Deprovision "${label}"? This wipes the Casa app on the device, revokes its Home Assistant session, unregisters its push token, and deletes this record. If the device is offline it is wiped the next time it contacts the server. This cannot be undone.`,
+        confirmLabel: "Deprovision",
+        onConfirm: () => this._deprovisionDevice(),
+      });
+    });
 
     body.querySelectorAll(".pu-del").forEach((btn) => {
       btn.addEventListener("click", (e) => {
@@ -1136,6 +1158,31 @@ class CasaAdminPanel extends HTMLElement {
       await this._refreshInspectingDevice();
     } catch (err) {
       this._deviceExpError = "Failed: " + ((err && err.message) || err);
+      this._renderDeviceInspectorBody();
+    }
+  }
+
+  async _deprovisionDevice() {
+    if (!this._inspectingDevice) return;
+    this._deviceDeprovError = "";
+    this._renderDeviceInspectorBody();
+
+    try {
+      const res = await this._hass.callWS({
+        type: "call_service",
+        domain: "casa",
+        service: "deprovision_device",
+        service_data: { device_id: this._inspectingDevice.device_id },
+        return_response: true,
+      });
+      const response = (res && res.response) || res || {};
+      this._closeDeviceInspector();
+      await this._load();
+      if (response.push_sent === false) {
+        alert("Device record removed and access revoked, but the wipe push could not be delivered (no push registration or relay unreachable). The device will wipe itself the next time it contacts the server.");
+      }
+    } catch (err) {
+      this._deviceDeprovError = "Failed: " + ((err && err.message) || err);
       this._renderDeviceInspectorBody();
     }
   }
