@@ -1,6 +1,6 @@
 # Casa Provisioner
 
-Home Assistant custom integration for provisioning and managing [Casa](https://bonjour.casa) iOS devices. Handles user creation, encrypted provisioning (QR / BLE / deep link), push notifications, WireGuard VPN configuration, and device lifecycle management.
+Home Assistant custom integration for provisioning and managing [Casa](https://bonjour.casa) iOS devices. Handles user creation, encrypted provisioning (QR / BLE / deep link / manual entry), push notifications, WireGuard VPN configuration, device lifecycle management (expiration, remote deprovision), and an admin sidebar panel.
 
 ## Installation (HACS)
 
@@ -15,7 +15,19 @@ Home Assistant custom integration for provisioning and managing [Casa](https://b
 |--------|---------|-------------|
 | Admin / System Only | `true` | Restrict service calls to admin users and automations |
 | Create Devices | `true` | Register Casa devices in the HA Device Registry |
+| Show Panel | `false` | Add the **Casa** admin panel to the sidebar (admin users only) |
 | Regenerate Site ID | — | Regenerates both the site ID and site key (breaks existing push registrations) |
+
+---
+
+## Admin Panel
+
+Enable **Show Panel** in the integration options to get a **Casa** sidebar entry (admins only). From the panel you can:
+
+- **Dashboard** — device and account tables with orphan/stale badges, pending-update counts, reconcile and refresh actions.
+- **Quick Provision** — provision from a saved profile (or ad-hoc host/user/PIN) with three output methods: **QR Code**, **Deep Link** (`hascasa://` + universal link), or **Manual Entry** (plaintext values to read into the app's manual provisioning sheet, with copy buttons and the password-validity window).
+- **Device Inspector** — full device details; edit alias; test push; queue WireGuard/provisioning-profile updates; **Session Expiration** management (set/extend a date, quick +24h/+7d/+30d, Make Permanent, Expire Now — applied on the device's next heartbeat); **Deprovision** (remote wipe + full cleanup).
+- **Settings** — site key rotation, WireGuard profile CRUD, provisioning profile CRUD, guest account management.
 
 ---
 
@@ -23,13 +35,14 @@ Home Assistant custom integration for provisioning and managing [Casa](https://b
 
 ### `casa.provision`
 
-Generates an encrypted provisioning payload. Supports three methods: `qr`, `ble`, and `deep_link`. Returns response data.
+Generates an encrypted provisioning payload. Supports four methods: `qr`, `ble`, `deep_link`, and `manual`. Returns response data — `qr` and `deep_link` include both a `deep_link` (`hascasa://setup?data=…`) and a `universal_link` (`https://bonjour.casa/setup?d=…`); `manual` returns the resolved plaintext `fields` for the app's manual entry sheet (no payload is built) plus an `unsupported` map of settings manual entry cannot carry over (PIN, push/site binding, WireGuard).
 
 **Connection**
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `method` | ✅ | — | `qr`, `ble`, or `deep_link` |
+| `method` | ✅ | — | `qr`, `ble`, `deep_link`, or `manual` |
+| `profile` | | — | Saved provisioning profile (ID or name) to load template settings from |
 | `host_url` | ✅ | — | HA URL the device connects to (e.g., `http://192.168.1.100:8123`) |
 | `username` | ✅ | — | Target HA guest user account |
 | `password` | | auto-generated | Specific password (otherwise random 12-char) |
@@ -82,7 +95,10 @@ Generates an encrypted provisioning payload. Supports three methods: `qr`, `ble`
 | `esphome_service` | BLE | List of ESPHome services to push payload to |
 | `connect_wifi_ssid` | All | Wi-Fi SSID the device should auto-join |
 | `connect_wifi_password` | All | Password for the above network |
+| `payload_version` | All | `2` (default, JSON + hybrid encryption) or `1` (legacy pipe-delimited) |
 | `payload_decrypted` | All | `true` = plaintext payload (debugging only) |
+
+> **Universal links:** the `universal_link` output only opens the app directly if `https://bonjour.casa/.well-known/apple-app-site-association` is served (JSON, no redirect) with the app's ID and a path matching `/setup`, and `/setup` should serve a fallback page (App Store link) for devices without the app. This is relay-server configuration, outside this integration.
 
 ---
 
@@ -111,11 +127,12 @@ Deletes a user account created via this integration and updates the internal tra
 
 ### `casa.notify_user`
 
-Sends a push notification to all registered devices for a user via the relay (`push.bonjour.casa` with automatic failover to `push2.bonjour.casa`). Returns `{ success, sent_count, failed_count }`.
+Sends a push notification via the relay (`push.bonjour.casa`) to all registered devices of a user, or to a single device. Returns `{ success, sent_count, failed_count }`.
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `username` | ✅ | Target user |
+| `username` | * | Target user (all their devices). Provide this OR `device_id` |
+| `device_id` | * | Target a single device UUID |
 | `title` | ✅ | Notification title |
 | `message` | ✅ | Notification body |
 | `data` | | Custom payload object/dictionary to pass with the notification |
@@ -129,6 +146,57 @@ Sends a silent background push to clear cache and reload the default URL on a sp
 | Field | Required | Description |
 |-------|----------|-------------|
 | `device_id` | ✅ | Target device UUID |
+
+---
+
+### `casa.set_device_expiration`
+
+Sets, extends, or clears a device's session expiration after provisioning. Delivered on the device's next heartbeat (up to ~5 minutes); shown as *pending* in the panel until the device confirms. Provide exactly one of the three value fields.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `device_id` | ✅ | Target device UUID |
+| `expires_at` | * | Absolute expiry (unix epoch seconds); `0` = never |
+| `expires_in_hours` | * | Relative expiry: hours from now |
+| `permanent` | * | `true` = remove the expiration entirely |
+
+---
+
+### `casa.deprovision_device`
+
+**Destructive.** Remotely wipes a device and removes it from the server: sends a silent `deprovision` push (the app immediately wipes its session), revokes the device's HA refresh token, unregisters its relay proxy token, drops queued updates, and deletes the record. Offline or push-less devices are wiped lazily the next time they contact the server and their revoked session fails. Returns `{ status, push_sent, access_revoked }`.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `device_id` | ✅ | Target device UUID |
+
+---
+
+### `casa.update_wireguard`
+
+Pushes a new WireGuard configuration (or revokes the existing one) to a device or all of a user's devices. End-to-end encrypted by default so the relay can never read the config.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `device_id` | * | Target device UUID. Provide this OR `username` |
+| `username` | * | Target all devices of this user |
+| `action` | | `update` (default) or `revoke` |
+| `wireguard_config` | | Client config file content (required for `update`) |
+| `wireguard_excluded_wifi` | | Comma-separated SSIDs where WireGuard stays off |
+| `encrypt_config` | | Default `true`; disable only for debugging |
+| `silent` | | Default `true`; disable to also show a notification |
+
+---
+
+### `casa.reconcile`
+
+Diffs the relay's live proxy tokens against HA's device records, unregisters orphans, and flags devices needing re-registration. Also runs automatically once a day.
+
+---
+
+### `casa.regenerate_site`
+
+**Destructive.** Rotates the site ID and site key on the relay. Breaks all existing push registrations; devices must re-register.
 
 ---
 
@@ -215,7 +283,10 @@ These are called by the Casa iOS app directly (authenticated via HA long-lived o
 | `POST` | `/api/casa/register_device` | Register/update a device for push notifications |
 | `GET` | `/api/casa/register_device?device_id=X` | Check if a device is registered |
 | `DELETE` | `/api/casa/register_device?device_id=X` | Unregister a device |
-| `POST` | `/api/casa/heartbeat` | Device heartbeat with metadata (IP, token, URL) |
+| `POST` | `/api/casa/heartbeat` | Device heartbeat. Response carries `reregister`, `updates`, `device_key`/`device_key_id`, and — while an admin override is pending — `expires_at` (the app applies it; `0` = permanent) |
+| `GET`/`POST` | `/api/casa/profile_updates` | Pull / acknowledge queued profile & WireGuard updates |
+
+Admin-only endpoints (used by the panel): `/api/casa/admin/summary`, `/api/casa/admin/device` (alias + `expires_at_override`), `/api/casa/admin/wireguard_profiles`, `/api/casa/admin/provision_profiles`, `/api/casa/admin/queue_update`, `/api/casa/admin/regenerate_device_key`.
 
 ---
 
@@ -229,7 +300,9 @@ These are called by the Casa iOS app directly (authenticated via HA long-lived o
 
 ## Provisioning Payload Format
 
-The payload is a pipe-delimited string of 21 fields, base64-encoded (or RSA-encrypted with the bundled public key):
+**v2 (default):** a JSON profile object, DEFLATE-compressed and hybrid-encrypted (AES-256-GCM body, AES key RSA-OAEP-wrapped with the bundled public key), base64url-encoded. Field names match the JSON keys shown in `casa.provision`.
+
+**v1 (legacy, `payload_version: 1`):** a pipe-delimited string of 21 fields, base64-encoded (or RSA-encrypted with the bundled public key):
 
 | Index | Field |
 |-------|-------|
