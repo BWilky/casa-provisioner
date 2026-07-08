@@ -24,7 +24,7 @@ Home Assistant custom integration for provisioning and managing [Casa](https://b
 
 Enable **Show Panel** in the integration options to get a **Casa** sidebar entry (admins only). From the panel you can:
 
-- **Dashboard** — device and account tables with orphan/stale badges, pending-update counts, reconcile and refresh actions.
+- **Dashboard** — device and account tables with orphan/stale badges, pending-update counts, reconcile and refresh actions. Each device row has quick actions: **Delete Record** (revoke tokens + remove record, no wipe — for stale/orphaned entries) and **Deprovision** (remote wipe).
 - **Quick Provision** — provision from a saved profile (or ad-hoc host/user/PIN) with three output methods: **QR Code**, **Deep Link** (`hascasa://` + universal link), or **Manual Entry** (plaintext values to read into the app's manual provisioning sheet, with copy buttons and the password-validity window).
 - **Device Inspector** — full device details; edit alias; test push; queue WireGuard/provisioning-profile updates; **Session Expiration** management (set/extend a date, quick +24h/+7d/+30d, Make Permanent, Expire Now — applied on the device's next heartbeat); **Deprovision** (remote wipe + full cleanup).
 - **Settings** — site key rotation, WireGuard profile CRUD, provisioning profile CRUD, guest account management.
@@ -165,6 +165,16 @@ Sets, extends, or clears a device's session expiration after provisioning. Deliv
 ### `casa.deprovision_device`
 
 **Destructive.** Remotely wipes a device and removes it from the server: sends a silent `deprovision` push (the app immediately wipes its session), revokes the device's HA refresh token, unregisters its relay proxy token, drops queued updates, and deletes the record. Offline or push-less devices are wiped lazily the next time they contact the server and their revoked session fails. Returns `{ status, push_sent, access_revoked }`.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `device_id` | ✅ | Target device UUID |
+
+---
+
+### `casa.delete_device`
+
+Removes a device's server-side record and revokes its access **without** wiping the app: revokes the HA session token, unregisters the relay proxy token, drops queued updates, and deletes the record. The app keeps its local session until its revoked token next fails. Use for stale/orphaned records; use `casa.deprovision_device` to remotely wipe. Returns `{ status, access_revoked }`.
 
 | Field | Required | Description |
 |-------|----------|-------------|

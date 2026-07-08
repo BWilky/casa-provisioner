@@ -1031,12 +1031,18 @@ class CasaAdminPanel extends HTMLElement {
 
         <div class="device-sec-box" style="border: 1px solid var(--error-color, #db4437);">
           <h5 style="color:var(--error-color,#db4437);">Danger Zone</h5>
-          <p style="font-size:12px; color:var(--secondary-text-color,#727272); margin:0 0 8px 0;">
-            Remotely wipes the Casa app on this device, revokes its access, and deletes this record.
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn-plain" id="de-delete-record" style="padding:8px 14px; font-size:13px; color:var(--secondary-text-color,#727272); border:1px solid var(--divider-color,#ddd); border-radius:6px;">
+              <ha-icon icon="mdi:delete-outline" style="--mdc-icon-size:16px;"></ha-icon> Delete Record
+            </button>
+            <button class="btn-plain del" id="de-deprovision" style="padding:8px 14px; font-size:13px; color:var(--error-color,#db4437); border:1px solid var(--error-color,#db4437); border-radius:6px;">
+              <ha-icon icon="mdi:cellphone-remove" style="--mdc-icon-size:16px;"></ha-icon> Deprovision Device
+            </button>
+          </div>
+          <p style="font-size:12px; color:var(--secondary-text-color,#727272); margin:8px 0 0 0;">
+            <strong>Delete Record</strong> removes the record and revokes access without touching the app — for stale/orphaned entries.
+            <strong>Deprovision</strong> additionally wipes the Casa app on the device via push.
           </p>
-          <button class="btn-plain del" id="de-deprovision" style="padding:8px 14px; font-size:13px; color:var(--error-color,#db4437); border:1px solid var(--error-color,#db4437); border-radius:6px;">
-            <ha-icon icon="mdi:cellphone-remove" style="--mdc-icon-size:16px;"></ha-icon> Deprovision Device
-          </button>
           ${this._deviceDeprovError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 6px;">${esc(this._deviceDeprovError)}</div>` : ""}
         </div>
       </div>
@@ -1089,15 +1095,8 @@ class CasaAdminPanel extends HTMLElement {
       });
     }
 
-    body.querySelector("#de-deprovision").addEventListener("click", () => {
-      const label = d.alias || d.device_id;
-      this._showConfirm({
-        title: "Deprovision device",
-        message: `Deprovision "${label}"? This wipes the Casa app on the device, revokes its Home Assistant session, unregisters its push token, and deletes this record. If the device is offline it is wiped the next time it contacts the server. This cannot be undone.`,
-        confirmLabel: "Deprovision",
-        onConfirm: () => this._deprovisionDevice(),
-      });
-    });
+    body.querySelector("#de-deprovision").addEventListener("click", () => this._confirmDeviceAction(d, "deprovision"));
+    body.querySelector("#de-delete-record").addEventListener("click", () => this._confirmDeviceAction(d, "delete"));
 
     body.querySelectorAll(".pu-del").forEach((btn) => {
       btn.addEventListener("click", (e) => {
@@ -1162,28 +1161,57 @@ class CasaAdminPanel extends HTMLElement {
     }
   }
 
-  async _deprovisionDevice() {
-    if (!this._inspectingDevice) return;
-    this._deviceDeprovError = "";
-    this._renderDeviceInspectorBody();
+  // Confirmation + execution for destructive device actions, shared by the
+  // devices-table row buttons and the inspector's Danger Zone.
+  // kind: "delete" (record + token revoke, no wipe) or "deprovision" (remote wipe).
+  _confirmDeviceAction(device, kind) {
+    const label = device.alias || device.device_id;
+    if (kind === "delete") {
+      this._showConfirm({
+        title: "Delete device record",
+        message: `Delete the record for "${label}"? This revokes its Home Assistant session and push relay token and removes it from the server, but does NOT wipe the app — the device loses access when its session next fails. Use Deprovision to remotely wipe.`,
+        confirmLabel: "Delete",
+        onConfirm: () => this._runDeviceAction(device, "delete_device"),
+      });
+    } else {
+      this._showConfirm({
+        title: "Deprovision device",
+        message: `Deprovision "${label}"? This wipes the Casa app on the device, revokes its Home Assistant session, unregisters its push token, and deletes this record. If the device is offline it is wiped the next time it contacts the server. This cannot be undone.`,
+        confirmLabel: "Deprovision",
+        onConfirm: () => this._runDeviceAction(device, "deprovision_device"),
+      });
+    }
+  }
+
+  async _runDeviceAction(device, service) {
+    const inspectingThis = this._inspectingDevice && this._inspectingDevice.device_id === device.device_id;
+    if (inspectingThis) {
+      this._deviceDeprovError = "";
+      this._renderDeviceInspectorBody();
+    }
 
     try {
       const res = await this._hass.callWS({
         type: "call_service",
         domain: "casa",
-        service: "deprovision_device",
-        service_data: { device_id: this._inspectingDevice.device_id },
+        service: service,
+        service_data: { device_id: device.device_id },
         return_response: true,
       });
       const response = (res && res.response) || res || {};
-      this._closeDeviceInspector();
+      if (inspectingThis) this._closeDeviceInspector();
       await this._load();
-      if (response.push_sent === false) {
+      if (service === "deprovision_device" && response.push_sent === false) {
         alert("Device record removed and access revoked, but the wipe push could not be delivered (no push registration or relay unreachable). The device will wipe itself the next time it contacts the server.");
       }
     } catch (err) {
-      this._deviceDeprovError = "Failed: " + ((err && err.message) || err);
-      this._renderDeviceInspectorBody();
+      const msg = "Failed: " + ((err && err.message) || err);
+      if (inspectingThis) {
+        this._deviceDeprovError = msg;
+        this._renderDeviceInspectorBody();
+      } else {
+        alert(msg);
+      }
     }
   }
 
@@ -1972,7 +2000,7 @@ class CasaAdminPanel extends HTMLElement {
     const devices = data.devices || [];
     root.getElementById("devices").innerHTML = devices.length
       ? `<table>
-          <thead><tr><th>User</th><th>Device</th><th>IP</th><th>Last Seen</th><th>Status</th></tr></thead>
+          <thead><tr><th>User</th><th>Device</th><th>IP</th><th>Last Seen</th><th>Status</th><th></th></tr></thead>
           <tbody>${devices.map((d) => `
             <tr class="device-row" data-id="${this._esc(d.device_id)}">
               <td>${this._esc(d.username)}${d.native ? ' <span class="badge" style="background:var(--secondary-background-color);color:var(--primary-text-color)">native</span>' : ""}</td>
@@ -1980,6 +2008,10 @@ class CasaAdminPanel extends HTMLElement {
               <td>${this._esc(d.ip) || "—"}</td>
               <td>${this._fmtTime(d.last_seen)}</td>
               <td>${d.orphaned ? '<span class="badge orphan">orphan</span>' : ""}${d.stale ? '<span class="badge stale">stale</span>' : ""}${(d.pending_updates ?? 0) > 0 ? `<span class="badge pending">${d.pending_updates} pending</span>` : ""}${!d.orphaned && !d.stale && d.push_registered ? '<span class="badge ok">ok</span>' : ""}</td>
+              <td style="white-space:nowrap; text-align:right;">
+                <button class="dev-act" data-id="${this._esc(d.device_id)}" data-action="delete" title="Delete record (revoke access, no wipe)" style="background:none; border:none; cursor:pointer; color:var(--secondary-text-color,#727272); padding:2px 4px; line-height:1;"><ha-icon icon="mdi:delete-outline" style="--mdc-icon-size:18px;"></ha-icon></button>
+                <button class="dev-act" data-id="${this._esc(d.device_id)}" data-action="deprovision" title="Deprovision (remote wipe)" style="background:none; border:none; cursor:pointer; color:var(--error-color,#db4437); padding:2px 4px; line-height:1;"><ha-icon icon="mdi:cellphone-remove" style="--mdc-icon-size:18px;"></ha-icon></button>
+              </td>
             </tr>`).join("")}
           </tbody>
         </table>`
@@ -1991,6 +2023,15 @@ class CasaAdminPanel extends HTMLElement {
         const id = row.dataset.id;
         const device = (devices || []).find((d) => d.device_id === id);
         if (device) this._openDeviceInspector(device);
+      });
+    });
+
+    // Row action buttons (don't open the inspector).
+    root.querySelectorAll(".dev-act").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const device = (devices || []).find((d) => d.device_id === btn.dataset.id);
+        if (device) this._confirmDeviceAction(device, btn.dataset.action);
       });
     });
 

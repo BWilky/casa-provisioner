@@ -1680,6 +1680,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             frontend.async_remove_panel(hass, "casa")
         except Exception:
             pass
+        # Cache-bust the module URL with the file's mtime so browsers pick up a
+        # new panel after the file changes + HA restarts, without a hard refresh.
+        panel_js_path = os.path.join(os.path.dirname(__file__), "panel", "casa-panel.js")
+        try:
+            panel_version = int(os.path.getmtime(panel_js_path))
+        except OSError:
+            panel_version = int(time.time())
         frontend.async_register_built_in_panel(
             hass,
             component_name="custom",
@@ -1692,7 +1699,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "name": "casa-admin-panel",
                     "embed_iframe": False,
                     "trust_external": False,
-                    "module_url": "/casa_static/casa-panel.js",
+                    "module_url": f"/casa_static/casa-panel.js?v={panel_version}",
                 }
             },
         )
@@ -3115,22 +3122,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
 
         purge_result = await _purge_device(hass, device_id)
-
-        # Remove the device from the HA registry. Direct registry removal does not
-        # re-invoke async_remove_config_entry_device, so nothing is purged twice.
-        try:
-            from homeassistant.helpers import device_registry as dr
-            dev_reg = dr.async_get(hass)
-            reg_device = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
-            if reg_device:
-                dev_reg.async_remove_device(reg_device.id)
-        except Exception as err:
-            _LOGGER.warning("CASA: Failed to remove device '%s' from the HA device registry: %s", device_id, err)
+        _remove_registry_device(hass, device_id)
 
         return {
             "status": "success",
             "device_id": device_id,
             "push_sent": push_sent,
+            "access_revoked": purge_result.get("access_revoked", False),
+        }
+
+    async def handle_delete_device(call: ServiceCall):
+        """Delete a device's server-side record and revoke its access.
+
+        Unlike deprovision_device this sends no wipe push — the app keeps its
+        local session until its revoked token next fails. Intended for stale or
+        orphaned records where the app is already gone.
+        """
+        await _check_authorization(call)
+        device_id = str(call.data.get("device_id", "")).strip()
+
+        if not device_id:
+            raise HomeAssistantError("Missing device_id parameter.")
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        device_info, _, _ = _find_device_record(stored_data, device_id)
+        if device_info is None:
+            raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
+
+        purge_result = await _purge_device(hass, device_id)
+        _remove_registry_device(hass, device_id)
+
+        return {
+            "status": "success",
+            "device_id": device_id,
             "access_revoked": purge_result.get("access_revoked", False),
         }
 
@@ -3320,6 +3344,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     hass.services.async_register(
+        DOMAIN, "delete_device", handle_delete_device,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    hass.services.async_register(
         DOMAIN, "update_wireguard", handle_update_wireguard,
         supports_response=SupportsResponse.OPTIONAL
     )
@@ -3469,6 +3498,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "button"])
 
     return True
+
+def _remove_registry_device(hass: HomeAssistant, device_id: str) -> None:
+    """Best-effort removal of a Casa device from the HA device registry.
+
+    Direct registry removal does not re-invoke async_remove_config_entry_device,
+    so nothing is purged twice.
+    """
+    try:
+        from homeassistant.helpers import device_registry as dr
+        dev_reg = dr.async_get(hass)
+        reg_device = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+        if reg_device:
+            dev_reg.async_remove_device(reg_device.id)
+    except Exception as err:
+        _LOGGER.warning("CASA: Failed to remove device '%s' from the HA device registry: %s", device_id, err)
+
 
 async def _purge_device(hass: HomeAssistant, device_id: str) -> dict:
     """Remove a device's server-side footprint.
@@ -3669,6 +3714,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "reload_device")
     hass.services.async_remove(DOMAIN, "set_device_expiration")
     hass.services.async_remove(DOMAIN, "deprovision_device")
+    hass.services.async_remove(DOMAIN, "delete_device")
     hass.services.async_remove(DOMAIN, "update_wireguard")
     hass.services.async_remove(DOMAIN, "reconcile")
     hass.services.async_remove(DOMAIN, "regenerate_site")

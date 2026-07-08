@@ -820,6 +820,17 @@ deprovision_device:
       selector:
         text: {}
 
+delete_device:
+  name: "Delete Device Record"
+  description: "Removes a device's server-side record and revokes its access WITHOUT wiping the app: revokes the HA session token, unregisters the push relay token, drops queued updates, and deletes the record. The app keeps its local session until its revoked token next fails. Use this for stale/orphaned records; use Deprovision Device to remotely wipe."
+  fields:
+    device_id:
+      name: "Device ID"
+      description: "The unique identifier (UUID) of the device record to delete."
+      required: true
+      selector:
+        text: {}
+
 set_device_expiration:
   name: "Set Device Expiration"
   description: "Sets, extends, or clears a device's session expiration after provisioning. The new value is delivered on the device's next heartbeat (up to ~5 minutes); until then it shows as pending. Provide exactly one of: expires_at, expires_in_hours, or permanent."
