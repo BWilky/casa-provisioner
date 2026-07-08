@@ -15,3 +15,8 @@ RELAY_REMOVE_SITE_URL = f"{RELAY_BASE_URL}/remove_site"
 RELAY_URLS = [
     f"{RELAY_BASE_URL}/send",
 ]
+
+# Universal (https) links open the app via its applinks:bonjour.casa entitlement.
+# Requires bonjour.casa to serve /.well-known/apple-app-site-association covering /setup.
+UNIVERSAL_LINK_BASE_URL = "https://bonjour.casa"
+UNIVERSAL_LINK_SETUP_URL = f"{UNIVERSAL_LINK_BASE_URL}/setup"

@@ -1946,6 +1946,16 @@ class CasaAdminPanel extends HTMLElement {
               </div>
               <div id="qp-copy-msg" style="color:var(--success-color,#43a047); font-size: 12px; margin-top: 4px; display:none;">Link copied to clipboard!</div>
             </div>
+            ${this._provisionResult.universal_link ? `
+            <div class="editor-row" style="text-align: left;">
+              <label>Universal Link (opens from Safari / iMessage)</label>
+              <div style="display:flex; gap:8px; align-items: center;">
+                <input type="text" id="qp-ulink-val" value="${esc(this._provisionResult.universal_link)}" readonly style="flex:1; font-family: monospace; font-size: 11px;">
+                <button class="btn-primary" id="qp-copy-ulink" style="padding: 8px 16px;">Copy</button>
+              </div>
+              <div id="qp-ucopy-msg" style="color:var(--success-color,#43a047); font-size: 12px; margin-top: 4px; display:none;">Link copied to clipboard!</div>
+            </div>
+            ` : ""}
           </div>
         ` : ""}
       </div>
@@ -1993,22 +2003,24 @@ class CasaAdminPanel extends HTMLElement {
 
     generateBtn.addEventListener("click", () => this._generateProvisionLink());
 
-    const copyBtn = body.querySelector("#qp-copy-link");
-    if (copyBtn) {
-      copyBtn.addEventListener("click", () => {
-        const linkVal = body.querySelector("#qp-link-val");
-        if (linkVal) {
-          linkVal.select();
-          navigator.clipboard.writeText(linkVal.value).then(() => {
-            const msg = body.querySelector("#qp-copy-msg");
-            if (msg) {
-              msg.style.display = "block";
-              setTimeout(() => { msg.style.display = "none"; }, 2000);
-            }
-          });
-        }
+    const bindCopy = (btnId, inputId, msgId) => {
+      const btn = body.querySelector(`#${btnId}`);
+      if (!btn) return;
+      btn.addEventListener("click", () => {
+        const input = body.querySelector(`#${inputId}`);
+        if (!input) return;
+        input.select();
+        navigator.clipboard.writeText(input.value).then(() => {
+          const msg = body.querySelector(`#${msgId}`);
+          if (msg) {
+            msg.style.display = "block";
+            setTimeout(() => { msg.style.display = "none"; }, 2000);
+          }
+        });
       });
-    }
+    };
+    bindCopy("qp-copy-link", "qp-link-val", "qp-copy-msg");
+    bindCopy("qp-copy-ulink", "qp-ulink-val", "qp-ucopy-msg");
   }
 
   async _generateProvisionLink() {

@@ -26,7 +26,7 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.components import frontend
@@ -2011,6 +2011,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("CASA ERROR: Failed to encrypt v1 payload. Error: %s", str(e))
                     return {"error": "Encryption failed"}
             deep_link = f"hascasa://setup?data={urllib.parse.quote(final_payload)}"
+            # v1 payloads are standard base64 ('+', '/', '=') so must be percent-encoded.
+            universal_link = f"{UNIVERSAL_LINK_SETUP_URL}?d={urllib.parse.quote(final_payload, safe='')}"
         else:
             # v2: JSON profile, hybrid encryption (AES-256-GCM body + RSA-wrapped key), base64url.
             # No size cap, '|' is no longer a delimiter, and fields are named instead of positional.
@@ -2054,6 +2056,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.error("CASA ERROR: Failed to encrypt v2 payload. Error: %s", str(e))
                     return {"error": "Encryption failed"}
             deep_link = f"hascasa://setup?data={final_payload}"
+            # v2 payloads are padding-stripped base64url — already URL-safe.
+            universal_link = f"{UNIVERSAL_LINK_SETUP_URL}?d={final_payload}"
 
         # Setup method-specific fields
         delete_qr = False
@@ -2191,12 +2195,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "filename": final_filename,
                 "url_path": f"/local/{final_filename}",
                 "expires_at": expiration_unix,
-                "deep_link": deep_link
+                "deep_link": deep_link,
+                "universal_link": universal_link
             }
         elif method == "deep_link":
             return {
                 "method": "deep_link",
                 "deep_link": deep_link,
+                "universal_link": universal_link,
                 "expires_at": expiration_unix
             }
         else:
