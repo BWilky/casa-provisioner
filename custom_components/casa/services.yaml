@@ -807,6 +807,42 @@ reload_device:
       selector:
         text: {}
 
+set_device_expiration:
+  name: "Set Device Expiration"
+  description: "Sets, extends, or clears a device's session expiration after provisioning. The new value is delivered on the device's next heartbeat (up to ~5 minutes); until then it shows as pending. Provide exactly one of: expires_at, expires_in_hours, or permanent."
+  fields:
+    device_id:
+      name: "Device ID"
+      description: "The unique identifier (UUID) of the target device."
+      required: true
+      selector:
+        text: {}
+    expires_at:
+      name: "Expires At (Unix Timestamp)"
+      description: "Absolute expiration time as unix epoch seconds. Use 0 (or the Permanent toggle) to remove the expiration."
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 99999999999
+          mode: box
+    expires_in_hours:
+      name: "Expires In (Hours)"
+      description: "Relative expiration: hours from now."
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 87600
+          mode: box
+          unit_of_measurement: "hours"
+    permanent:
+      name: "Permanent"
+      description: "Remove the session expiration entirely (device never expires)."
+      default: false
+      selector:
+        boolean: {}
+
 update_wireguard:
   name: "Update WireGuard Configuration"
   description: "Pushes a new WireGuard configuration (or revokes the existing one) to a provisioned device over push notification. The config is end-to-end encrypted so the push relay can never read it."

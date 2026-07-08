@@ -214,6 +214,26 @@ def _find_device_record(stored_data: dict, device_id: str):
     return None, None, None
 
 
+def _set_expiry_override(stored_data: dict, device_id: str, value):
+    """Set or cancel a device's pending expiration override.
+
+    value: int epoch seconds (0 = make permanent) to set, None to cancel.
+    Returns the device_info dict, or None if the device was not found.
+    """
+    device_info, _, _ = _find_device_record(stored_data, device_id)
+    if device_info is None:
+        return None
+    if value is None:
+        device_info.pop("expires_at_override", None)
+        device_info.pop("expires_at_override_set_at", None)
+        device_info.pop("expires_at_override_sent", None)
+    else:
+        device_info["expires_at_override"] = int(value)
+        device_info["expires_at_override_set_at"] = dt_util.now().isoformat()
+        device_info.pop("expires_at_override_sent", None)
+    return device_info
+
+
 def _enqueue_update(qu_data: dict, device_id: str, update_type: str, action: str, payload: dict, created_by: str) -> str:
     """Append a queued update entry for a device and return its generated id."""
     entry = {
@@ -455,13 +475,18 @@ class CasaHeartbeatView(HomeAssistantView):
         # lets the device detect when its stored key is stale after a rotation.
         stored_data = self.hass.data[DOMAIN]["stored_data"]
         device_key = stored_data.get("device_key")
-        return self.json({
+        response = {
             "status": "success",
             "reregister": bool(result.get("reregister")),
             "updates": bool(result.get("updates")),
             "device_key": device_key,
             "device_key_id": _device_key_id(device_key) if device_key else None,
-        })
+        }
+        # Only emitted while an admin-set override is pending; the stored value is
+        # never echoed back, so a freshly re-provisioned device keeps its own expiry.
+        if result.get("expires_at") is not None:
+            response["expires_at"] = result["expires_at"]
+        return self.json(response)
 
 
 class CasaAdminSummaryView(HomeAssistantView):
@@ -533,6 +558,8 @@ class CasaAdminSummaryView(HomeAssistantView):
                     "current_url": dinfo.get("current_url"),
                     "provisioned_at": dinfo.get("provisioned_at"),
                     "expires_at": dinfo.get("expires_at"),
+                    "expires_at_override": dinfo.get("expires_at_override"),
+                    "expires_at_override_set_at": dinfo.get("expires_at_override_set_at"),
                     "pending_updates": len(qu_updates.get(did, [])),
                     "pending_update_list": _pending(did),
                 })
@@ -565,6 +592,8 @@ class CasaAdminSummaryView(HomeAssistantView):
                         "current_url": dinfo.get("current_url"),
                         "provisioned_at": dinfo.get("provisioned_at"),
                         "expires_at": dinfo.get("expires_at"),
+                        "expires_at_override": dinfo.get("expires_at_override"),
+                        "expires_at_override_set_at": dinfo.get("expires_at_override_set_at"),
                         "pending_updates": len(qu_updates.get(did, [])),
                         "pending_update_list": _pending(did),
                     })
@@ -738,34 +767,40 @@ class CasaAdminDeviceView(HomeAssistantView):
         if not device_id:
             return self.json({"error": "Missing device_id"}, status_code=400)
 
-        alias = body.get("alias", "").strip()
-
         stored_data = self.hass.data[DOMAIN]["stored_data"]
 
-        found = False
-        # 1. Check integration-managed users
-        for uid, udata in stored_data.get("users", {}).items():
-            if device_id in udata.get("devices", {}):
-                udata["devices"][device_id]["alias"] = alias
-                found = True
-                break
-
-        # 2. Check native devices
-        if not found:
-            for uid, devices in stored_data.get("native_devices", {}).items():
-                if device_id in devices:
-                    devices[device_id]["alias"] = alias
-                    found = True
-                    break
-
-        if not found:
+        device_info, _, _ = _find_device_record(stored_data, device_id)
+        if device_info is None:
             return self.json({"error": "Device not found"}, status_code=404)
+
+        # Fields are updated only when present in the body, so callers can set
+        # one without clobbering the others.
+        if "alias" in body:
+            device_info["alias"] = str(body.get("alias") or "").strip()
+
+        if "expires_at_override" in body:
+            value = body.get("expires_at_override")
+            if value is not None:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    return self.json({"error": "expires_at_override must be an integer or null"}, status_code=400)
+                if value < 0:
+                    return self.json({"error": "expires_at_override must be >= 0"}, status_code=400)
+            _set_expiry_override(stored_data, device_id, value)
 
         # Save store
         store = self.hass.data[DOMAIN]["store"]
         store.async_delay_save(lambda: stored_data, 2.0)
 
-        return self.json({"status": "ok", "device_id": device_id, "alias": alias})
+        return self.json({
+            "status": "ok",
+            "device_id": device_id,
+            "alias": device_info.get("alias", ""),
+            "expires_at": device_info.get("expires_at"),
+            "expires_at_override": device_info.get("expires_at_override"),
+            "expires_at_override_set_at": device_info.get("expires_at_override_set_at"),
+        })
 
 
 class CasaProvisionProfilesView(HomeAssistantView):
@@ -1557,6 +1592,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         device_info["last_seen_at"] = now_iso
 
+        # Reconcile any admin-set expiration override. The app applies a returned
+        # expires_at only when it differs from its current value, so re-sending a
+        # pending override every heartbeat is a no-op on the device. A device with
+        # no expiry omits expires_at from its heartbeat, so override=0 ("permanent")
+        # is confirmed by absence of the reported value — but only after the
+        # override was sent at least once, to avoid mistaking a never-expiring
+        # device's normal heartbeat for confirmation.
+        pending_expiry = None
+        override = device_info.get("expires_at_override")
+        if override is not None:
+            if override == 0 and expires_at is None and device_info.get("expires_at_override_sent"):
+                device_info["expires_at"] = 0
+                device_info.pop("expires_at_override", None)
+                device_info.pop("expires_at_override_set_at", None)
+                device_info.pop("expires_at_override_sent", None)
+                _LOGGER.info("CASA: Device '%s' confirmed permanent session (override applied).", device_id)
+            elif override > 0 and expires_at == override:
+                device_info.pop("expires_at_override", None)
+                device_info.pop("expires_at_override_set_at", None)
+                device_info.pop("expires_at_override_sent", None)
+                _LOGGER.info("CASA: Device '%s' confirmed expiration override %s.", device_id, override)
+            else:
+                device_info["expires_at_override_sent"] = True
+                pending_expiry = override
+
         store.async_delay_save(lambda: stored_data, 2.0)
 
         # Ensure registered in Home Assistant Device Registry if enabled
@@ -1586,10 +1646,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         qu_data = hass.data[DOMAIN].get("qu_data", {"updates": {}})
         has_updates = bool(qu_data.get("updates", {}).get(device_id))
 
-        return {
+        result = {
             "reregister": bool(device_info.get("needs_reregister", False)),
             "updates": has_updates,
         }
+        if pending_expiry is not None:
+            result["expires_at"] = pending_expiry
+        return result
 
     # Register the HTTP views
     hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
@@ -2920,6 +2983,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         return {"status": "success"}
 
+    async def handle_set_device_expiration(call: ServiceCall):
+        await _check_authorization(call)
+        device_id = str(call.data.get("device_id", "")).strip()
+        if not device_id:
+            raise HomeAssistantError("Missing device_id parameter.")
+
+        permanent = bool(call.data.get("permanent", False))
+        expires_at = call.data.get("expires_at")
+        expires_in_hours = call.data.get("expires_in_hours")
+
+        if permanent:
+            value = 0
+        elif expires_at is not None:
+            try:
+                value = int(expires_at)
+            except (TypeError, ValueError):
+                raise HomeAssistantError("expires_at must be an integer unix timestamp.")
+            if value < 0:
+                raise HomeAssistantError("expires_at must be >= 0.")
+        elif expires_in_hours is not None:
+            try:
+                hours = float(expires_in_hours)
+            except (TypeError, ValueError):
+                raise HomeAssistantError("expires_in_hours must be a number.")
+            if hours <= 0:
+                raise HomeAssistantError("expires_in_hours must be greater than 0.")
+            value = int(time.time() + hours * 3600)
+        else:
+            raise HomeAssistantError("Provide one of: expires_at, expires_in_hours, or permanent.")
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        device_info = _set_expiry_override(stored_data, device_id, value)
+        if device_info is None:
+            raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
+
+        store.async_delay_save(lambda: stored_data, 2.0)
+        _LOGGER.info(
+            "CASA: Expiration override for device '%s' set to %s (delivered on next heartbeat).",
+            device_id, "permanent" if value == 0 else value
+        )
+        return {"status": "success", "device_id": device_id, "expires_at_override": value}
+
     async def handle_update_wireguard(call: ServiceCall):
         import json
 
@@ -3092,6 +3197,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.services.async_register(
         DOMAIN, "reload_device", handle_reload_device,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    hass.services.async_register(
+        DOMAIN, "set_device_expiration", handle_set_device_expiration,
         supports_response=SupportsResponse.OPTIONAL
     )
 
@@ -3419,6 +3529,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "register_device")
     hass.services.async_remove(DOMAIN, "notify_user")
     hass.services.async_remove(DOMAIN, "reload_device")
+    hass.services.async_remove(DOMAIN, "set_device_expiration")
     hass.services.async_remove(DOMAIN, "update_wireguard")
     hass.services.async_remove(DOMAIN, "reconcile")
     hass.services.async_remove(DOMAIN, "regenerate_site")

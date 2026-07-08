@@ -796,6 +796,8 @@ class CasaAdminPanel extends HTMLElement {
     this._deviceProfileError = "";
     this._deviceProfileSuccess = "";
     this._devicePendingError = "";
+    this._deviceExpError = "";
+    this._deviceExpSuccess = "";
 
     const sr = this.shadowRoot;
     const overlay = sr.getElementById("device-overlay");
@@ -896,7 +898,10 @@ class CasaAdminPanel extends HTMLElement {
           <strong>Provisioned At</strong>
           <span>${d.provisioned_at ? this._fmtTime(d.provisioned_at) : "—"}</span>
           <strong>Expires At</strong>
-          <span>${d.expires_at ? this._fmtExpiry(d.expires_at) : "Never"}</span>
+          <span>
+            ${d.expires_at ? this._fmtExpiry(d.expires_at) : "Never"}
+            ${d.expires_at_override != null ? `<span class="badge pending" title="Applied on the device's next heartbeat">pending: ${d.expires_at_override === 0 ? "Never" : this._fmtExpiry(d.expires_at_override)}</span>` : ""}
+          </span>
           <strong>VPN Configuration</strong>
           <span>
             ${d.wireguard_configured === true ? '<span class="badge ok">Installed</span>' :
@@ -994,6 +999,34 @@ class CasaAdminPanel extends HTMLElement {
           ${this._deviceProfileError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 4px;">${esc(this._deviceProfileError)}</div>` : ""}
           ${this._deviceProfileSuccess ? `<div class="editor-msg" style="color:var(--success-color,#43a047); margin-top: 4px;">${esc(this._deviceProfileSuccess)}</div>` : ""}
         </div>
+
+        <div class="device-sec-box">
+          <h5>Session Expiration</h5>
+          <div style="font-size:13px; margin-bottom:8px;">
+            Current: <strong>${d.expires_at ? this._fmtExpiry(d.expires_at) : "Never"}</strong>
+            ${d.expires_at_override != null ? ` — pending change to <strong>${d.expires_at_override === 0 ? "Never" : this._fmtExpiry(d.expires_at_override)}</strong> <a href="#" id="de-exp-cancel" style="color:var(--primary-color,#03a9f4);">cancel</a>` : ""}
+          </div>
+          ${d.expires_at && (d.expires_at * 1000) < Date.now() ? `<div class="editor-msg" style="color:var(--warning-color,#f4b400); margin-bottom:6px;">This device's session has already expired — it has likely wiped itself and may never pick up a new expiration.</div>` : ""}
+          <div class="editor-row">
+            <label>New Expiration</label>
+            <div style="display:flex; gap:8px; align-items: center;">
+              <input type="datetime-local" id="de-exp-datetime" style="flex:1;">
+              <button class="btn-primary" id="de-exp-set">Set</button>
+            </div>
+          </div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;">
+            <button class="btn-plain" id="de-exp-24h" style="padding:6px 10px; font-size:12px;">+24 h</button>
+            <button class="btn-plain" id="de-exp-7d" style="padding:6px 10px; font-size:12px;">+7 d</button>
+            <button class="btn-plain" id="de-exp-30d" style="padding:6px 10px; font-size:12px;">+30 d</button>
+            <button class="btn-plain" id="de-exp-permanent" style="padding:6px 10px; font-size:12px;">Make Permanent</button>
+            <button class="btn-plain" id="de-exp-now" style="padding:6px 10px; font-size:12px; color:var(--error-color,#db4437);">Expire Now</button>
+          </div>
+          <p style="font-size:12px; color:var(--secondary-text-color,#727272); margin:8px 0 0 0;">
+            Changes are delivered on the device's next heartbeat (up to ~5 minutes).
+          </p>
+          ${this._deviceExpError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 4px;">${esc(this._deviceExpError)}</div>` : ""}
+          ${this._deviceExpSuccess ? `<div class="editor-msg" style="color:var(--success-color,#43a047); margin-top: 4px;">${esc(this._deviceExpSuccess)}</div>` : ""}
+        </div>
       </div>
     `;
 
@@ -1002,6 +1035,47 @@ class CasaAdminPanel extends HTMLElement {
     body.querySelector("#de-send-push").addEventListener("click", () => this._sendDeviceTestPush());
     body.querySelector("#de-push-wg").addEventListener("click", () => this._pushDeviceWg());
     body.querySelector("#de-push-pp").addEventListener("click", () => this._pushDeviceProfile());
+
+    // Session expiration controls. Quick-extends are relative to the later of
+    // now / the current (or pending) expiry, so repeated clicks stack.
+    const expBase = () => {
+      const cur = d.expires_at_override != null && d.expires_at_override > 0 ? d.expires_at_override : (d.expires_at || 0);
+      return Math.max(Math.floor(Date.now() / 1000), cur);
+    };
+    body.querySelector("#de-exp-set").addEventListener("click", () => {
+      const input = body.querySelector("#de-exp-datetime");
+      if (!input || !input.value) {
+        this._deviceExpError = "Pick a date and time first.";
+        this._renderDeviceInspectorBody();
+        return;
+      }
+      const ts = Math.floor(new Date(input.value).getTime() / 1000);
+      if (!Number.isFinite(ts) || ts <= Math.floor(Date.now() / 1000)) {
+        this._deviceExpError = "Expiration must be in the future (use Expire Now to end the session).";
+        this._renderDeviceInspectorBody();
+        return;
+      }
+      this._setDeviceExpiration(ts);
+    });
+    body.querySelector("#de-exp-24h").addEventListener("click", () => this._setDeviceExpiration(expBase() + 24 * 3600));
+    body.querySelector("#de-exp-7d").addEventListener("click", () => this._setDeviceExpiration(expBase() + 7 * 24 * 3600));
+    body.querySelector("#de-exp-30d").addEventListener("click", () => this._setDeviceExpiration(expBase() + 30 * 24 * 3600));
+    body.querySelector("#de-exp-permanent").addEventListener("click", () => this._setDeviceExpiration(0));
+    body.querySelector("#de-exp-now").addEventListener("click", () => {
+      this._showConfirm({
+        title: "Expire session now",
+        message: "The device will wipe its session shortly after its next heartbeat and this record will stop updating. For immediate removal with full cleanup, use Deprovision instead.",
+        confirmLabel: "Expire Now",
+        onConfirm: () => this._setDeviceExpiration(Math.floor(Date.now() / 1000)),
+      });
+    });
+    const expCancel = body.querySelector("#de-exp-cancel");
+    if (expCancel) {
+      expCancel.addEventListener("click", (e) => {
+        e.preventDefault();
+        this._setDeviceExpiration(null);
+      });
+    }
 
     body.querySelectorAll(".pu-del").forEach((btn) => {
       btn.addEventListener("click", (e) => {
@@ -1041,6 +1115,29 @@ class CasaAdminPanel extends HTMLElement {
       this._deviceFormError = "Failed: " + ((err && err.message) || err);
     }
     this._renderDeviceInspectorBody();
+  }
+
+  // value: epoch seconds (0 = permanent) to queue an override, null to cancel a pending one.
+  async _setDeviceExpiration(value) {
+    if (!this._inspectingDevice) return;
+    this._deviceExpError = "";
+    this._deviceExpSuccess = "";
+    this._renderDeviceInspectorBody();
+
+    try {
+      await this._hass.callApi("PUT", "casa/admin/device", {
+        device_id: this._inspectingDevice.device_id,
+        expires_at_override: value,
+      });
+      this._deviceExpSuccess =
+        value === null ? "Pending expiration change cancelled."
+        : value === 0 ? "Queued: session becomes permanent on the next heartbeat."
+        : `Queued: expires ${this._fmtExpiry(value)} after the next heartbeat.`;
+      await this._refreshInspectingDevice();
+    } catch (err) {
+      this._deviceExpError = "Failed: " + ((err && err.message) || err);
+      this._renderDeviceInspectorBody();
+    }
   }
 
   async _sendDeviceTestPush() {
