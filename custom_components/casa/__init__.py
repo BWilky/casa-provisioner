@@ -1680,12 +1680,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             frontend.async_remove_panel(hass, "casa")
         except Exception:
             pass
-        # Cache-bust the module URL with the file's mtime so browsers pick up a
-        # new panel after the file changes + HA restarts, without a hard refresh.
-        panel_js_path = os.path.join(os.path.dirname(__file__), "panel", "casa-panel.js")
+        # Cache-bust the module URL with the newest mtime across every panel JS
+        # file (the entry propagates ?v= to its sibling module imports), so any
+        # updated panel file is picked up after an HA restart without a hard refresh.
+        panel_dir_path = os.path.join(os.path.dirname(__file__), "panel")
+        panel_version = 0
         try:
-            panel_version = int(os.path.getmtime(panel_js_path))
+            for dirpath, _dirs, filenames in os.walk(panel_dir_path):
+                for fname in filenames:
+                    if fname.endswith(".js"):
+                        mtime = int(os.path.getmtime(os.path.join(dirpath, fname)))
+                        panel_version = max(panel_version, mtime)
         except OSError:
+            pass
+        if not panel_version:
             panel_version = int(time.time())
         frontend.async_register_built_in_panel(
             hass,
