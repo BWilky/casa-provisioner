@@ -7,7 +7,7 @@
 //   {
 //     id,
 //     header: (params) => ({ title, subtitle, back }),  // back != null → back arrow
-//     chrome: true|false,          // false hides the app header (legacy wrapper)
+//     chrome: true|false,          // false hides the app header (unused today)
 //     polling: "live" | "paused",  // paused in editors
 //     confirmLeave?: async () => boolean,   // dirty-guard; router awaits it
 //     mount(el, params), unmount(), onSummary?(summary, error)
@@ -73,16 +73,17 @@ export async function createApp({ host, loadModule, version }) {
   };
 
   /* ---------- route table ---------- */
-  // matcher: path segments; ":name" captures a param. First match wins.
+  // matcher: path segments; ":name" captures a param. First match wins;
+  // the empty pattern is the catch-all default.
   const ROUTES = [
-    { pattern: ["next"], view: "views/devices.js" },
-    { pattern: ["next", "accounts"], view: "views/accounts.js" },
-    { pattern: ["next", "devices", ":deviceId"], view: "views/device-editor.js" },
-    { pattern: ["next", "profiles", "new"], view: "views/profile-editor.js" },
-    { pattern: ["next", "profiles", ":profileId"], view: "views/profile-editor.js" },
-    { pattern: ["next", "settings"], view: "views/settings.js" },
-    { pattern: ["next", "settings", ":tab"], view: "views/settings.js" },
-    { pattern: [], view: "legacy-view.js" }, // default = legacy panel (until the flip)
+    { pattern: ["devices"], view: "views/devices.js" },
+    { pattern: ["accounts"], view: "views/accounts.js" },
+    { pattern: ["devices", ":deviceId"], view: "views/device-editor.js" },
+    { pattern: ["profiles", "new"], view: "views/profile-editor.js" },
+    { pattern: ["profiles", ":profileId"], view: "views/profile-editor.js" },
+    { pattern: ["settings"], view: "views/settings.js" },
+    { pattern: ["settings", ":tab"], view: "views/settings.js" },
+    { pattern: [], view: "views/devices.js" }, // default = device list
   ];
 
   function matchRoute(path) {
@@ -162,7 +163,7 @@ export async function createApp({ host, loadModule, version }) {
             }
           },
         },
-        { icon: "mdi:cog-outline", label: "Settings", onSelect: () => app.navigate("/next/settings") },
+        { icon: "mdi:cog-outline", label: "Settings", onSelect: () => app.navigate("/settings") },
         "divider",
         {
           icon: "mdi:content-copy", label: "Copy Site ID",

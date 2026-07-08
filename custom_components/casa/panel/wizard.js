@@ -647,7 +647,7 @@ export function openProvisionWizard(app, { presetUsername, presetProfileId } = {
         break;
       case "edit-profile":
         modal.close();
-        app.navigate("/next/profiles/" + encodeURIComponent(el.dataset.id));
+        app.navigate("/profiles/" + encodeURIComponent(el.dataset.id));
         break;
       case "toggle-qr-options":
         state.qrOptionsOpen = !state.qrOptionsOpen;

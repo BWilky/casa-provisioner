@@ -290,7 +290,7 @@ export function createView(app) {
           renderResults();
         }, 150);
       });
-      el.querySelector("#ac-tab-devices").addEventListener("click", () => app.navigate("/next"));
+      el.querySelector("#ac-tab-devices").addEventListener("click", () => app.navigate("/"));
       el.querySelector("#ac-create").addEventListener("click", openCreateModal);
       refs.results.addEventListener("click", onResultsClick);
 

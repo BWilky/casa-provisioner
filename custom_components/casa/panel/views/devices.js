@@ -331,10 +331,12 @@ export function createView(app) {
 
   /* ---------- actions ---------- */
 
-  const gotoEdit = (id) => app.navigate("/next/devices/" + encodeURIComponent(id));
+  const gotoEdit = (id) => app.navigate("/devices/" + encodeURIComponent(id));
 
-  // TODO(wizard): launch the provision wizard module here once it lands.
-  const openProvisionWizard = () => ui.toast("Provision wizard coming soon");
+  const openProvisionWizard = async (opts = {}) => {
+    const mod = await app.loadModule("wizard.js");
+    mod.openProvisionWizard(app, opts);
+  };
 
   function toggleSort(key) {
     if (sortKey === key) sortDir = sortDir === "asc" ? "desc" : "asc";
@@ -368,6 +370,23 @@ export function createView(app) {
           onSelect: () => openTestPushModal(d),
         },
         { icon: "mdi:refresh", label: "Reload app", onSelect: () => confirmReload(d) },
+        {
+          icon: "mdi:shield-key",
+          label: "Push WireGuard profile",
+          onSelect: async () => {
+            const mod = await app.loadModule("views/device-editor.js");
+            mod.openPushModal(app, d, "wireguard");
+          },
+        },
+        {
+          icon: "mdi:clipboard-arrow-down-outline",
+          label: "Push provision profile",
+          onSelect: async () => {
+            const mod = await app.loadModule("views/device-editor.js");
+            mod.openPushModal(app, d, "profile");
+          },
+        },
+        { icon: "mdi:qrcode", label: "Re-provision user", onSelect: () => openProvisionWizard({ presetUsername: d.username }) },
         "divider",
         { icon: "mdi:delete-outline", label: "Delete record", danger: true, onSelect: () => confirmDeviceAction(d, "delete") },
         { icon: "mdi:cellphone-remove", label: "Deprovision", danger: true, onSelect: () => confirmDeviceAction(d, "deprovision") },
@@ -739,7 +758,7 @@ export function createView(app) {
         }, 150);
       });
 
-      el.querySelector("#dv-tab-accounts").addEventListener("click", () => app.navigate("/next/accounts"));
+      el.querySelector("#dv-tab-accounts").addEventListener("click", () => app.navigate("/accounts"));
       refs.segmented.addEventListener("click", (e) => {
         const btn = e.target.closest("[data-mode]");
         if (!btn || btn.dataset.mode === viewMode) return;

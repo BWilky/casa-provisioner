@@ -1,7 +1,7 @@
 // Casa admin panel — settings view. Two-pane layout reusing the editor nav
 // classes: Site (relay identity + encryption key rotation + regenerate-site
 // danger zone) and WireGuard Profiles (stored VPN configs with an add/edit
-// modal). Mounted at /next/settings and /next/settings/{tab}.
+// modal). Mounted at /settings and /settings/{tab}.
 
 export function createView(app) {
   const { api, ui } = app;
@@ -17,7 +17,7 @@ export function createView(app) {
   function setTab(next) {
     if (next !== "site" && next !== "wireguard") next = "site";
     tab = next;
-    app.navigate("/next/settings/" + tab, { replace: true });
+    app.navigate("/settings/" + tab, { replace: true });
     renderNav();
     renderForm();
   }
@@ -318,7 +318,7 @@ export function createView(app) {
 
   return {
     id: "settings",
-    header: () => ({ title: "Settings", back: "/next" }),
+    header: () => ({ title: "Settings", back: "/" }),
     polling: "paused",
 
     mount(el, params) {

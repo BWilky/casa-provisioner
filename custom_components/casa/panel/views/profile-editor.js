@@ -1,5 +1,5 @@
 // Casa admin panel — provisioning-profile editor view. Three-pane editor
-// (editor-shell.js) mounted at /next/profiles/new and /next/profiles/{profileId}:
+// (editor-shell.js) mounted at /profiles/new and /profiles/{profileId}:
 // left navigator sections, center form bound to `state.form` (the profile's
 // `fields` object, same keys as CasaProvisionProfilesView._DEFAULT_FIELDS in
 // __init__.py), right live v2 payload preview (payload-preview.js). Saves the
@@ -458,7 +458,7 @@ export function createView(app) {
         // POST returns the created profile; adopt its id and fix the URL. The
         // router remounts this view for the new path (state is clean now).
         profileId = res.id;
-        app.navigate("/next/profiles/" + encodeURIComponent(res.id), { replace: true });
+        app.navigate("/profiles/" + encodeURIComponent(res.id), { replace: true });
         return;
       }
       app.setHeader({ title: titleText() });
@@ -520,7 +520,7 @@ export function createView(app) {
     id: "profile-editor",
     header: (params) => ({
       title: loaded ? titleText() : params && params.profileId ? "Editing profile…" : "Editing New profile",
-      back: "/next",
+      back: "/",
     }),
     polling: "paused",
 
@@ -551,7 +551,7 @@ export function createView(app) {
           const profile = ((ppRes && ppRes.profiles) || []).find((p) => p && p.id === profileId);
           if (!profile) {
             ui.showInfo({ title: "Profile not found", message: "That provisioning profile no longer exists." });
-            app.navigate("/next", { replace: true });
+            app.navigate("/", { replace: true });
             return;
           }
           state = { name: profile.name || "", form: { ...DEFAULTS, ...(profile.fields || {}) } };

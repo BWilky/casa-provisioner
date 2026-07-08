@@ -247,7 +247,7 @@ export function createView(app) {
     if (missingHandled) return;
     missingHandled = true;
     ui.showInfo({ title: "Device not found", message: "Device record no longer exists" });
-    app.navigate("/next", { replace: true });
+    app.navigate("/", { replace: true });
   }
 
   async function init() {
@@ -757,7 +757,7 @@ export function createView(app) {
     syncManage();
     manage.addEventListener("click", (e) => {
       e.preventDefault();
-      if (select.value) app.navigate("/next/profiles/" + encodeURIComponent(select.value));
+      if (select.value) app.navigate("/profiles/" + encodeURIComponent(select.value));
     });
   }
 
@@ -862,7 +862,7 @@ export function createView(app) {
           ? await api.deleteDevice(device.device_id)
           : await api.deprovisionDevice(device.device_id);
       await app.refresh();
-      app.navigate("/next");
+      app.navigate("/");
       if (kind === "deprovision") {
         const response = api.constructor.response(res); // CasaApi.response
         if (response.push_sent === false) {
@@ -887,7 +887,7 @@ export function createView(app) {
     header: (params) => {
       const d = findDevice(params && params.deviceId);
       const label = d ? displayName(d) : String((params && params.deviceId) || "").slice(0, 8);
-      return { title: `Editing ${label}`, back: "/next" };
+      return { title: `Editing ${label}`, back: "/" };
     },
     polling: "live",
 
