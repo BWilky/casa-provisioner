@@ -4,6 +4,7 @@ import os
 import string
 import secrets
 import base64
+import hashlib
 import time
 import json
 import uuid
@@ -42,6 +43,11 @@ def generate_random_password(length=12):
     chars = string.ascii_letters + string.digits
     return ''.join(secrets.choice(chars) for _ in range(length))
 
+def _generate_update_id() -> str:
+    """Random 32-char [A-Za-z0-9] id for a queued update entry."""
+    chars = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(chars) for _ in range(32))
+
 def _encrypt_payload(payload_str: str, key_bytes: bytes) -> str:
     """Helper to perform RSA OAEP encryption in the executor thread."""
     public_key = serialization.load_pem_public_key(key_bytes)
@@ -56,20 +62,32 @@ def _encrypt_payload(payload_str: str, key_bytes: bytes) -> str:
     return base64.b64encode(ciphertext).decode('utf-8')
 
 
-def _encrypt_wireguard_payload(plaintext: str, refresh_token: str) -> str:
-    """End-to-end encrypt a WireGuard push payload using the device's session secret.
+def _device_key_id(device_key: str) -> str:
+    """Short, non-secret fingerprint of the site device_key.
 
-    The key is derived from the device's HA refresh token via HKDF-SHA256, so the
-    relay (which never sees the token) cannot read or tamper with the config. The
-    iOS app derives the same key from its own copy of the refresh token.
-    Output is base64(nonce || ciphertext || GCM tag).
+    Sent in heartbeats and on every encrypted push so the app can tell whether the
+    key it holds is current. On mismatch the app falls back to pulling the plaintext
+    update from /api/casa/profile_updates instead of trying to decrypt.
+    """
+    return hashlib.sha256(device_key.encode("utf-8")).hexdigest()[:8]
+
+
+def _encrypt_push_payload(plaintext: str, device_key: str, device_id: str) -> str:
+    """End-to-end encrypt an update push payload for a specific device.
+
+    The AES-256 key is HKDF-derived from the site-wide device_key (the shared secret,
+    delivered to devices only over the authenticated heartbeat) salted with the
+    device's own device_id. The relay never receives device_key, so it cannot read or
+    tamper with the payload; per-device salting means a payload encrypted for one
+    device can't be decrypted by another. The iOS app derives the same key from its
+    copy of device_key + its device_id. Output is base64(nonce || ciphertext || tag).
     """
     key = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=None,
-        info=b"casa-wireguard-v1",
-    ).derive(refresh_token.encode("utf-8"))
+        salt=device_id.encode("utf-8"),
+        info=b"casa-update-v1",
+    ).derive(device_key.encode("utf-8"))
     nonce = secrets.token_bytes(12)
     ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
     return base64.b64encode(nonce + ciphertext).decode("utf-8")
@@ -177,6 +195,37 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
 
     _LOGGER.error("CASA: Could not register site after multiple attempts.")
     return False
+
+
+def _find_device_record(stored_data: dict, device_id: str):
+    """Locate a device across integration-managed and native users.
+
+    Returns (device_info, owning_user_id, username) or (None, None, None).
+    """
+    for uid, udata in stored_data.get("users", {}).items():
+        if udata.get("deleted", False):
+            continue
+        devices = udata.get("devices", {})
+        if device_id in devices:
+            return devices[device_id], uid, udata.get("username", "Unknown")
+    for uid, devices in stored_data.get("native_devices", {}).items():
+        if device_id in devices:
+            return devices[device_id], uid, None
+    return None, None, None
+
+
+def _enqueue_update(qu_data: dict, device_id: str, update_type: str, action: str, payload: dict, created_by: str) -> str:
+    """Append a queued update entry for a device and return its generated id."""
+    entry = {
+        "id": _generate_update_id(),
+        "type": update_type,
+        "action": action,
+        "payload": payload,
+        "created_at": dt_util.now().isoformat(),
+        "created_by": created_by,
+    }
+    qu_data.setdefault("updates", {}).setdefault(device_id, []).append(entry)
+    return entry["id"]
 
 
 class CasaRegisterDeviceView(HomeAssistantView):
@@ -380,7 +429,7 @@ class CasaHeartbeatView(HomeAssistantView):
             wireguard_connected = bool(wireguard_connected)
 
         try:
-            reregister = await self.heartbeat_func(
+            result = await self.heartbeat_func(
                 user.id,
                 device_id,
                 last_12_token=last_12_token,
@@ -401,7 +450,18 @@ class CasaHeartbeatView(HomeAssistantView):
 
         # reregister=true tells the device its relay registration was lost (detected
         # by /reconcile) and it should re-register and report a fresh proxy token.
-        return self.json({"status": "success", "reregister": bool(reregister)})
+        # updates=true tells the device to pull queued updates from /api/casa/profile_updates.
+        # device_key is the shared secret used to decrypt encrypted pushes; device_key_id
+        # lets the device detect when its stored key is stale after a rotation.
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_key = stored_data.get("device_key")
+        return self.json({
+            "status": "success",
+            "reregister": bool(result.get("reregister")),
+            "updates": bool(result.get("updates")),
+            "device_key": device_key,
+            "device_key_id": _device_key_id(device_key) if device_key else None,
+        })
 
 
 class CasaAdminSummaryView(HomeAssistantView):
@@ -422,7 +482,20 @@ class CasaAdminSummaryView(HomeAssistantView):
             return self.json_message("Admin access required", status_code=403)
 
         stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data", {})
+        qu_updates = self.hass.data.get(DOMAIN, {}).get("qu_data", {}).get("updates", {})
         now = dt_util.now()
+
+        def _pending(did):
+            entries = qu_updates.get(did, [])
+            return [
+                {
+                    "id": e.get("id"),
+                    "type": e.get("type"),
+                    "action": e.get("action"),
+                    "created_at": e.get("created_at"),
+                }
+                for e in entries
+            ]
 
         def _stale(last_seen) -> bool:
             if not last_seen:
@@ -460,6 +533,8 @@ class CasaAdminSummaryView(HomeAssistantView):
                     "current_url": dinfo.get("current_url"),
                     "provisioned_at": dinfo.get("provisioned_at"),
                     "expires_at": dinfo.get("expires_at"),
+                    "pending_updates": len(qu_updates.get(did, [])),
+                    "pending_update_list": _pending(did),
                 })
 
         # Native devices (HA users not managed by the integration).
@@ -490,6 +565,8 @@ class CasaAdminSummaryView(HomeAssistantView):
                         "current_url": dinfo.get("current_url"),
                         "provisioned_at": dinfo.get("provisioned_at"),
                         "expires_at": dinfo.get("expires_at"),
+                        "pending_updates": len(qu_updates.get(did, [])),
+                        "pending_update_list": _pending(did),
                     })
 
         accounts = []
@@ -504,13 +581,16 @@ class CasaAdminSummaryView(HomeAssistantView):
                 "device_count": len(udata.get("devices", {})),
             })
 
+        device_key = stored_data.get("device_key")
         return self.json({
             "site_id": stored_data.get("site_id"),
+            "device_key_id": _device_key_id(device_key) if device_key else None,
             "stats": {
                 "devices": len(devices),
                 "managed_users": len(accounts),
                 "orphaned": sum(1 for d in devices if d["orphaned"]),
                 "stale": sum(1 for d in devices if d["stale"]),
+                "pending_updates": sum(d.get("pending_updates", 0) for d in devices),
             },
             "devices": devices,
             "accounts": accounts,
@@ -851,6 +931,343 @@ class CasaProvisionProfilesView(HomeAssistantView):
         return self.json({"status": "ok"})
 
 
+class CasaProfileUpdatesView(HomeAssistantView):
+    """Device-facing endpoint to pull and acknowledge queued updates.
+
+    A device learns it has work via the heartbeat ("updates": true), then GETs its
+    queued entries here and POSTs back each consumed id to dequeue it. Entries are
+    returned in plaintext over the authenticated HA TLS connection — only the
+    optional push-notification copy is encrypted.
+    """
+
+    url = "/api/casa/profile_updates"
+    name = "api:casa:profile_updates"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    def _authorize(self, request, device_id):
+        """Return (device_info, error_response). Verifies the caller owns the device
+        by matching the bearer JWT's stable refresh_token_id to the device record."""
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_info, _uid, _username = _find_device_record(stored_data, device_id)
+        if not device_info:
+            return None, self.json({"error": "Device not found"}, status_code=404)
+
+        stored_refresh_id = device_info.get("refresh_token_id")
+        auth_header = request.headers.get("Authorization")
+        bearer_refresh_id = None
+        if auth_header and auth_header.startswith("Bearer "):
+            bearer_refresh_id = _get_refresh_token_id_from_jwt(auth_header[7:].strip())
+
+        if not stored_refresh_id or not bearer_refresh_id or bearer_refresh_id != stored_refresh_id:
+            _LOGGER.warning(
+                "CASA: Rejected profile_updates access for device '%s' (token mismatch).",
+                device_id,
+            )
+            return None, self.json({"error": "Forbidden"}, status_code=403)
+
+        return device_info, None
+
+    async def get(self, request):
+        user = request.get("hass_user")
+        if not user:
+            return self.json({"error": "Unauthorized"}, status_code=401)
+
+        device_id = request.query.get("device_id")
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        _device_info, err = self._authorize(request, device_id)
+        if err:
+            return err
+
+        qu_data = self.hass.data[DOMAIN]["qu_data"]
+        updates = qu_data.get("updates", {}).get(device_id, [])
+        return self.json({"updates": updates})
+
+    async def post(self, request):
+        """Acknowledge consumed updates by id, removing them from the queue."""
+        user = request.get("hass_user")
+        if not user:
+            return self.json({"error": "Unauthorized"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = body.get("device_id")
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        ack_ids = body.get("ids")
+        if ack_ids is None and body.get("id"):
+            ack_ids = [body.get("id")]
+        if not ack_ids or not isinstance(ack_ids, list):
+            return self.json({"error": "Missing id or ids"}, status_code=400)
+
+        _device_info, err = self._authorize(request, device_id)
+        if err:
+            return err
+
+        qu_data = self.hass.data[DOMAIN]["qu_data"]
+        ack_set = set(ack_ids)
+        entries = qu_data.get("updates", {}).get(device_id, [])
+        remaining = [e for e in entries if e.get("id") not in ack_set]
+
+        if remaining:
+            qu_data["updates"][device_id] = remaining
+        else:
+            qu_data.get("updates", {}).pop(device_id, None)
+
+        qu_store = self.hass.data[DOMAIN]["qu_store"]
+        qu_store.async_delay_save(lambda: qu_data, 2.0)
+
+        return self.json({"status": "ok", "remaining": len(remaining)})
+
+
+class CasaAdminQueueUpdateView(HomeAssistantView):
+    """Admin-only endpoint to queue a profile/WireGuard update for a device.
+
+    The update is always written to the durable queue (consumed by the device on its
+    next heartbeat via /api/casa/profile_updates). Two independent flags optionally
+    accelerate delivery: send_update_push delivers the full payload over an encrypted
+    silent push; notify_push sends a visible notification. Both carry the update id so
+    the device can dequeue whichever way it consumes the update.
+    """
+
+    url = "/api/casa/admin/queue_update"
+    name = "api:casa:admin:queue_update"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def _resolve_targets(self, device_id, username):
+        """Return a list of (device_id, device_info) for the requested target(s)."""
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        if device_id:
+            device_info, _uid, _name = _find_device_record(stored_data, device_id)
+            if not device_info:
+                return None
+            return [(device_id, device_info)]
+
+        users = await self.hass.auth.async_get_users()
+        target_user = next((u for u in users if u.name and u.name.casefold() == username.casefold()), None)
+        if not target_user:
+            for u in users:
+                for cred in u.credentials:
+                    if cred.auth_provider_type == "homeassistant" and cred.data.get("username", "").casefold() == username.casefold():
+                        target_user = u
+                        break
+                if target_user:
+                    break
+        if not target_user:
+            return None
+
+        uid = target_user.id
+        if uid in stored_data["users"] and not stored_data["users"][uid].get("deleted", False):
+            devices = stored_data["users"][uid].get("devices", {})
+        else:
+            devices = stored_data.get("native_devices", {}).get(uid, {})
+        return list(devices.items())
+
+    async def _send_to_relay(self, session, payload) -> bool:
+        for url in RELAY_URLS:
+            try:
+                async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        return True
+                    text = await resp.text()
+                    _LOGGER.warning("CASA: Relay %s returned %s for queue_update push: %s", url, resp.status, text)
+                    if resp.status < 500:
+                        return False
+            except Exception as err:
+                _LOGGER.warning("CASA: Failed to reach relay %s for queue_update push: %s", url, err)
+        return False
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = str(body.get("device_id", "")).strip()
+        username = str(body.get("username", "")).strip()
+        update_type = str(body.get("update_type", "")).strip().lower()
+        action = str(body.get("action", "update")).strip().lower()
+        notify_push = bool(body.get("notify_push", False))
+        send_update_push = bool(body.get("send_update_push", False))
+        title = str(body.get("title", "")).strip()
+        message = str(body.get("message", "")).strip()
+
+        if update_type not in ("wireguard", "profile"):
+            return self.json({"error": "update_type must be 'wireguard' or 'profile'"}, status_code=400)
+        if action not in ("update", "revoke"):
+            return self.json({"error": "action must be 'update' or 'revoke'"}, status_code=400)
+        if not device_id and not username:
+            return self.json({"error": "Must provide device_id or username"}, status_code=400)
+
+        # Build the type-specific payload.
+        if update_type == "wireguard":
+            if action == "update":
+                config = str(body.get("wireguard_config", "")).strip()
+                if not config:
+                    return self.json({"error": "wireguard_config is required for action 'update'"}, status_code=400)
+                payload = {"config": config, "excluded_wifi": str(body.get("wireguard_excluded_wifi", "")).strip()}
+            else:
+                payload = {}
+        else:  # profile
+            if action != "update":
+                return self.json({"error": "profile updates only support action 'update'"}, status_code=400)
+            profile_id = str(body.get("profile_id", "")).strip()
+            if not profile_id:
+                return self.json({"error": "profile_id is required for profile updates"}, status_code=400)
+            pp_data = self.hass.data[DOMAIN].get("pp_data", {"profiles": []})
+            matched = next((p for p in pp_data.get("profiles", []) if p.get("id") == profile_id), None)
+            if not matched:
+                return self.json({"error": "Provision profile not found"}, status_code=404)
+            payload = {"profile_id": profile_id, "name": matched.get("name"), "fields": matched.get("fields", {})}
+
+        targets = await self._resolve_targets(device_id, username)
+        if targets is None:
+            return self.json({"error": "Target device or user not found"}, status_code=404)
+        if not targets:
+            return self.json({"queued": 0, "pushed": 0, "notified": 0, "skipped": 0})
+
+        qu_data = self.hass.data[DOMAIN]["qu_data"]
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_key = stored_data.get("device_key")
+        created_by = user.name or user.id
+        session = async_get_clientsession(self.hass)
+
+        queued = pushed = notified = skipped = 0
+
+        for did, dinfo in targets:
+            update_id = _enqueue_update(qu_data, did, update_type, action, payload, created_by)
+            queued += 1
+
+            push_token = dinfo.get("push_token")
+
+            if send_update_push:
+                if not push_token or not device_key:
+                    skipped += 1
+                else:
+                    inner = {"id": update_id, "type": update_type, "action": action, "payload": payload, "ts": int(time.time())}
+                    try:
+                        enc = _encrypt_push_payload(json.dumps(inner), device_key, did)
+                    except Exception as e:
+                        _LOGGER.error("CASA ERROR: Failed to encrypt queued update for device '%s': %s", did, e)
+                        enc = None
+                    if enc is not None:
+                        ok = await self._send_to_relay(session, {
+                            "target": push_token,
+                            "site_id": stored_data.get("site_id"),
+                            "site_key": stored_data.get("site_key"),
+                            "command": "casa_update",
+                            "encrypted": True,
+                            "update_payload": enc,
+                            "update_id": update_id,
+                            "device_key_id": _device_key_id(device_key),
+                            "title": "",
+                            "message": "",
+                        })
+                        if ok:
+                            pushed += 1
+
+            if notify_push:
+                if not push_token:
+                    skipped += 1
+                elif not title or not message:
+                    _LOGGER.warning("CASA: notify_push requested without title/message; skipping notification for '%s'.", did)
+                else:
+                    ok = await self._send_to_relay(session, {
+                        "target": push_token,
+                        "site_id": stored_data.get("site_id"),
+                        "site_key": stored_data.get("site_key"),
+                        "title": title,
+                        "message": message,
+                        "data": {"update_id": update_id, "type": update_type, "action": action},
+                    })
+                    if ok:
+                        notified += 1
+
+        qu_store = self.hass.data[DOMAIN]["qu_store"]
+        qu_store.async_delay_save(lambda: qu_data, 2.0)
+
+        _LOGGER.info(
+            "CASA: Queued %s '%s' update(s) (push=%s notify=%s) by %s.",
+            queued, update_type, pushed, notified, created_by,
+        )
+        return self.json({"queued": queued, "pushed": pushed, "notified": notified, "skipped": skipped})
+
+    async def delete(self, request):
+        """Cancel a single queued update by device_id + id.
+
+        Only removes it from the server queue; a copy already delivered by push cannot
+        be recalled (the device would simply ack an id that's no longer queued).
+        """
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        device_id = request.query.get("device_id", "").strip()
+        update_id = request.query.get("id", "").strip()
+        if not device_id or not update_id:
+            return self.json({"error": "Missing device_id or id query parameter"}, status_code=400)
+
+        qu_data = self.hass.data[DOMAIN]["qu_data"]
+        entries = qu_data.get("updates", {}).get(device_id, [])
+        remaining = [e for e in entries if e.get("id") != update_id]
+        if len(remaining) == len(entries):
+            return self.json({"error": "Queued update not found"}, status_code=404)
+
+        if remaining:
+            qu_data["updates"][device_id] = remaining
+        else:
+            qu_data.get("updates", {}).pop(device_id, None)
+
+        qu_store = self.hass.data[DOMAIN]["qu_store"]
+        qu_store.async_delay_save(lambda: qu_data, 2.0)
+        _LOGGER.info("CASA: Admin %s cancelled queued update %s for device '%s'.", user.name or user.id, update_id, device_id)
+        return self.json({"status": "ok", "remaining": len(remaining)})
+
+
+class CasaAdminRegenerateKeyView(HomeAssistantView):
+    """Admin-only, non-destructive rotation of the site device_key.
+
+    Unlike regenerate_site (which nukes the relay site and invalidates every
+    provisioned profile), this only rotates the push-encryption secret. Devices pick
+    up the new key on their next heartbeat; any push encrypted with the new key that
+    reaches a not-yet-updated device simply fails to decrypt and the device falls back
+    to pulling the plaintext update from /api/casa/profile_updates.
+    """
+
+    url = "/api/casa/admin/regenerate_device_key"
+    name = "api:casa:admin:regenerate_device_key"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        stored_data["device_key"] = secrets.token_hex(32)
+        store = self.hass.data[DOMAIN]["store"]
+        await store.async_save(stored_data)
+
+        key_id = _device_key_id(stored_data["device_key"])
+        _LOGGER.info("CASA: Rotated site device_key (new id=%s) by %s.", key_id, user.name or user.id)
+        return self.json({"status": "ok", "device_key_id": key_id})
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
@@ -880,6 +1297,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not stored_data.get("site_key"):
         await _register_site(hass, stored_data, store)
 
+    # Site-wide device_key: a 256-bit secret (64 hex chars) shared with provisioned
+    # devices over the authenticated heartbeat and used to encrypt push payloads. It
+    # is NOT the relay's site_key (that credential is never sent to devices).
+    if not stored_data.get("device_key"):
+        stored_data["device_key"] = secrets.token_hex(32)
+        await store.async_save(stored_data)
+
     hass.data[DOMAIN]["stored_data"] = stored_data
 
     # Initialize WireGuard profiles store (separate .storage file)
@@ -897,6 +1321,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         pp_data = {"profiles": []}
     hass.data[DOMAIN]["pp_store"] = pp_store
     hass.data[DOMAIN]["pp_data"] = pp_data
+
+    # Initialize queued-updates store (separate .storage file).
+    # Shape: {"updates": {device_id: [entry, ...]}}
+    qu_store = Store(hass, 1, "casa_queued_updates")
+    qu_data = await qu_store.async_load()
+    if qu_data is None:
+        qu_data = {"updates": {}}
+    hass.data[DOMAIN]["qu_store"] = qu_store
+    hass.data[DOMAIN]["qu_data"] = qu_data
 
     create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
     
@@ -1150,7 +1583,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         _LOGGER.debug("CASA: Processed heartbeat for device '%s' for user '%s'.", device_id, username)
 
-        return bool(device_info.get("needs_reregister", False))
+        qu_data = hass.data[DOMAIN].get("qu_data", {"updates": {}})
+        has_updates = bool(qu_data.get("updates", {}).get(device_id))
+
+        return {
+            "reregister": bool(device_info.get("needs_reregister", False)),
+            "updates": has_updates,
+        }
 
     # Register the HTTP views
     hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
@@ -1159,6 +1598,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(CasaWireGuardProfilesView(hass))
     hass.http.register_view(CasaProvisionProfilesView(hass))
     hass.http.register_view(CasaAdminDeviceView(hass))
+    hass.http.register_view(CasaProfileUpdatesView(hass))
+    hass.http.register_view(CasaAdminQueueUpdateView(hass))
+    hass.http.register_view(CasaAdminRegenerateKeyView(hass))
 
     # Serve the admin panel assets once per process; the route survives reloads.
     global _PANEL_STATIC_REGISTERED
@@ -2562,24 +3004,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 inner = {"action": "revoke", "ts": int(time.time())}
             inner_str = json.dumps(inner)
 
+            device_key = stored_data.get("device_key")
             if encrypt_config:
-                refresh_token_id = dinfo.get("refresh_token_id")
-                token_value = None
-                if refresh_token_id:
-                    user_obj = next((u for u in users if u.id == uid), None)
-                    if user_obj:
-                        rt = user_obj.refresh_tokens.get(refresh_token_id)
-                        if rt:
-                            token_value = rt.token
-                if not token_value:
-                    _LOGGER.warning(
-                        "CASA: No active refresh token for device '%s'; cannot encrypt wireguard payload. Skipping.",
-                        did,
-                    )
-                    skipped_count += 1
+                if not device_key:
+                    _LOGGER.error("CASA ERROR: No site device_key available; cannot encrypt wireguard payload.")
+                    failed_count += 1
                     continue
                 try:
-                    wg_payload = _encrypt_wireguard_payload(inner_str, token_value)
+                    wg_payload = _encrypt_push_payload(inner_str, device_key, did)
                 except Exception as e:
                     _LOGGER.error("CASA ERROR: Failed to encrypt wireguard payload for device '%s': %s", did, e)
                     failed_count += 1
@@ -2594,6 +3026,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "command": command,
                 "encrypted": bool(encrypt_config),
                 "wireguard_payload": wg_payload,
+                "device_key_id": _device_key_id(device_key) if (encrypt_config and device_key) else None,
                 "title": "" if silent else title,
                 "message": "" if silent else message,
             }

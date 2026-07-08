@@ -70,6 +70,21 @@ class CasaAdminPanel extends HTMLElement {
     this._renderSettingsBody();
   }
 
+  async _rotateDeviceKey() {
+    if (!this._hass) return;
+    this._keyRotBusy = true;
+    this._renderSettingsBody();
+    try {
+      const res = await this._hass.callApi("POST", "casa/admin/regenerate_device_key", {});
+      await this._load();
+      this._keyRotMsg = `Encryption key rotated (new id ${res.device_key_id}). Devices update on their next heartbeat.`;
+    } catch (err) {
+      this._keyRotMsg = "Failed: " + ((err && err.message) || err);
+    }
+    this._keyRotBusy = false;
+    this._renderSettingsBody();
+  }
+
   _setStatus(text) {
     const el = this.shadowRoot && this.shadowRoot.getElementById("status");
     if (el) el.textContent = text || "";
@@ -192,6 +207,7 @@ class CasaAdminPanel extends HTMLElement {
         .badge.ok { background: var(--success-color, #43a047); color: #fff; }
         .badge.stale { background: var(--warning-color, #ffa600); color: #222; }
         .badge.orphan { background: var(--error-color, #db4437); color: #fff; }
+        .badge.pending { background: var(--info-color, #2196f3); color: #fff; }
         .empty { padding: 16px; color: var(--secondary-text-color, #727272); }
         .errbar { background: var(--error-color, #db4437); color: #fff; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; }
         code { font-family: monospace; }
@@ -471,6 +487,19 @@ class CasaAdminPanel extends HTMLElement {
           </div>
         </div>
       </div>
+      <div class="editor-overlay hidden" id="confirm-overlay" style="z-index: 10002;">
+        <div class="editor-modal" style="width: 420px;">
+          <div class="editor-header">
+            <h3 id="confirm-title">Confirm</h3>
+            <button class="close" id="confirm-close" title="Close"><ha-icon icon="mdi:close"></ha-icon></button>
+          </div>
+          <div class="editor-body" id="confirm-body"></div>
+          <div class="editor-footer">
+            <button class="btn-plain" id="confirm-cancel">Cancel</button>
+            <button class="btn-danger" id="confirm-ok">Delete</button>
+          </div>
+        </div>
+      </div>
     `;
 
     const sr = this.shadowRoot;
@@ -524,6 +553,14 @@ class CasaAdminPanel extends HTMLElement {
     const pane = this.shadowRoot && this.shadowRoot.getElementById("settings-pane");
     if (!pane) return;
     const siteId = (this._data && this._data.site_id) || "—";
+    const keyId = (this._data && this._data.device_key_id) || "—";
+
+    const keyRotInner = this._keyRotBusy
+      ? `<p>Rotating…</p>`
+      : `<p>Rotate the shared key used to encrypt WireGuard and update pushes. Non-destructive:
+         devices pick up the new key on their next heartbeat and fall back to the secure update
+         queue in the meantime. No re-provisioning required.</p>
+         <button class="btn-outline" id="key-rotate">Rotate Encryption Key</button>`;
 
     let dangerInner;
     if (this._regenBusy) {
@@ -550,6 +587,15 @@ class CasaAdminPanel extends HTMLElement {
         <label>Site ID</label>
         <div class="val">${this._esc(siteId)}</div>
       </div>
+      <div class="field">
+        <label>Encryption Key ID</label>
+        <div class="val">${this._esc(keyId)}</div>
+      </div>
+      <div class="field">
+        <h4>Encryption Key</h4>
+        ${keyRotInner}
+        ${this._keyRotMsg ? `<div class="regen-msg">${this._esc(this._keyRotMsg)}</div>` : ""}
+      </div>
       <div class="danger">
         <h4>Regenerate Site</h4>
         ${dangerInner}
@@ -561,6 +607,7 @@ class CasaAdminPanel extends HTMLElement {
       const el = pane.querySelector("#" + id);
       if (el) el.addEventListener("click", fn);
     };
+    pin("key-rotate", () => this._rotateDeviceKey());
     pin("regen-start", () => { this._regenConfirm = true; this._regenMsg = ""; this._renderSettingsBody(); });
     pin("regen-cancel", () => { this._regenConfirm = false; this._renderSettingsBody(); });
     pin("regen-confirm", () => this._regenerate());
@@ -746,6 +793,9 @@ class CasaAdminPanel extends HTMLElement {
     this._devicePushSuccess = "";
     this._deviceWgError = "";
     this._deviceWgSuccess = "";
+    this._deviceProfileError = "";
+    this._deviceProfileSuccess = "";
+    this._devicePendingError = "";
 
     const sr = this.shadowRoot;
     const overlay = sr.getElementById("device-overlay");
@@ -769,6 +819,15 @@ class CasaAdminPanel extends HTMLElement {
     if (!this._wgProfiles && !this._wgLoading) {
       this._loadWgProfiles().then(() => this._renderDeviceInspectorBody());
     }
+
+    // Fetch provision profiles for the profile-push dropdown
+    if (!this._ppProfiles && !this._ppInspectorLoading) {
+      this._ppInspectorLoading = true;
+      this._hass.callApi("GET", "casa/admin/provision_profiles")
+        .then((res) => { this._ppProfiles = (res && res.profiles) || []; })
+        .catch(() => { this._ppProfiles = []; })
+        .finally(() => { this._ppInspectorLoading = false; this._renderDeviceInspectorBody(); });
+    }
   }
 
   _closeDeviceInspector() {
@@ -782,6 +841,7 @@ class CasaAdminPanel extends HTMLElement {
     const esc = (val) => this._esc(val || "");
 
     const wgList = this._wgProfiles || [];
+    const ppList = this._ppProfiles || [];
 
     body.innerHTML = `
       <style>
@@ -854,6 +914,24 @@ class CasaAdminPanel extends HTMLElement {
         </div>
       </div>
 
+      ${(d.pending_updates ?? 0) > 0 ? `
+      <div class="editor-section">
+        <h4>Pending Updates <span class="badge pending">${d.pending_updates}</span></h4><hr>
+        <p style="font-size:12px; color:var(--secondary-text-color,#727272); margin:0 0 8px 0;">
+          Queued for this device. Consumed on the device's next heartbeat (or via push), then cleared.
+        </p>
+        <div style="display:flex; flex-direction:column; gap:6px;">
+          ${(d.pending_update_list || []).map((u) => `
+            <div style="display:flex; align-items:center; gap:8px; background:var(--secondary-background-color,#f5f5f5); border-radius:6px; padding:8px 10px; font-size:13px;">
+              <span class="badge" style="background:var(--primary-color,#03a9f4); color:#fff; margin:0;">${esc(u.type)}</span>
+              <span>${esc(u.action)}</span>
+              <span style="margin-left:auto; color:var(--secondary-text-color,#727272); font-size:12px;">${this._fmtTime(u.created_at)}</span>
+              <button class="pu-del" data-id="${esc(u.id)}" title="Delete queued update" style="background:none; border:none; cursor:pointer; color:var(--error-color,#db4437); padding:2px 4px; line-height:1; display:flex; align-items:center;"><ha-icon icon="mdi:delete-outline"></ha-icon></button>
+            </div>`).join("")}
+        </div>
+        ${this._devicePendingError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 6px;">${esc(this._devicePendingError)}</div>` : ""}
+      </div>` : ""}
+
       <div class="editor-section">
         <h4>Device Settings</h4><hr>
         <div class="editor-row">
@@ -894,9 +972,27 @@ class CasaAdminPanel extends HTMLElement {
               ${wgList.map(p => `<option value="${esc(p.id)}">${esc(p.alias)}</option>`).join("")}
             </select>
           </div>
-          <button class="btn-primary" id="de-push-wg">Push VPN Profile</button>
+          <label class="editor-toggle" style="display:flex; align-items:center; gap:6px; font-size:13px; margin-top:6px;"><input type="checkbox" id="de-wg-send-push"> Send Update via Push</label>
+          <label class="editor-toggle" style="display:flex; align-items:center; gap:6px; font-size:13px; margin-top:4px;"><input type="checkbox" id="de-wg-notify-push"> Notify via Push</label>
+          <button class="btn-primary" id="de-push-wg" style="margin-top:8px;">Queue VPN Update</button>
           ${this._deviceWgError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 4px;">${esc(this._deviceWgError)}</div>` : ""}
           ${this._deviceWgSuccess ? `<div class="editor-msg" style="color:var(--success-color,#43a047); margin-top: 4px;">${esc(this._deviceWgSuccess)}</div>` : ""}
+        </div>
+
+        <div class="device-sec-box">
+          <h5>Push Provisioning Profile</h5>
+          <div class="editor-row">
+            <label>Provision Profile</label>
+            <select id="de-pp-profile" style="width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--divider-color, #ddd); font-size: 13px; font-family: inherit; background: var(--card-background-color, #fff); color: var(--primary-text-color, #212121);">
+              <option value="">-- Select a profile --</option>
+              ${ppList.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("")}
+            </select>
+          </div>
+          <label class="editor-toggle" style="display:flex; align-items:center; gap:6px; font-size:13px; margin-top:6px;"><input type="checkbox" id="de-pp-send-push"> Send Update via Push</label>
+          <label class="editor-toggle" style="display:flex; align-items:center; gap:6px; font-size:13px; margin-top:4px;"><input type="checkbox" id="de-pp-notify-push"> Notify via Push</label>
+          <button class="btn-primary" id="de-push-pp" style="margin-top:8px;">Queue Profile Update</button>
+          ${this._deviceProfileError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top: 4px;">${esc(this._deviceProfileError)}</div>` : ""}
+          ${this._deviceProfileSuccess ? `<div class="editor-msg" style="color:var(--success-color,#43a047); margin-top: 4px;">${esc(this._deviceProfileSuccess)}</div>` : ""}
         </div>
       </div>
     `;
@@ -905,6 +1001,22 @@ class CasaAdminPanel extends HTMLElement {
     body.querySelector("#de-save-alias").addEventListener("click", () => this._saveDeviceAlias());
     body.querySelector("#de-send-push").addEventListener("click", () => this._sendDeviceTestPush());
     body.querySelector("#de-push-wg").addEventListener("click", () => this._pushDeviceWg());
+    body.querySelector("#de-push-pp").addEventListener("click", () => this._pushDeviceProfile());
+
+    body.querySelectorAll(".pu-del").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.id;
+        const entry = (d.pending_update_list || []).find((u) => u.id === id);
+        const label = entry ? `${entry.type} ${entry.action}` : "this update";
+        this._showConfirm({
+          title: "Delete pending update",
+          message: `Remove the queued "${label}" for this device? This only clears it from the server queue — if it was already delivered by push, the device may still apply it.`,
+          confirmLabel: "Delete",
+          onConfirm: () => this._deletePendingUpdate(id),
+        });
+      });
+    });
   }
 
   async _saveDeviceAlias() {
@@ -963,39 +1075,160 @@ class CasaAdminPanel extends HTMLElement {
     this._renderDeviceInspectorBody();
   }
 
+  // Reusable confirmation modal. Pass { title, message, confirmLabel, onConfirm }.
+  _showConfirm({ title, message, confirmLabel, onConfirm }) {
+    const sr = this.shadowRoot;
+    const overlay = sr.getElementById("confirm-overlay");
+    if (!overlay) return;
+
+    sr.getElementById("confirm-title").textContent = title || "Confirm";
+    sr.getElementById("confirm-body").innerHTML =
+      `<p style="margin:0; font-size:14px; line-height:1.5;">${this._esc(message || "Are you sure?")}</p>`;
+
+    overlay.classList.remove("hidden");
+
+    // Clone-replace to avoid stacking listeners across invocations.
+    const bindOnce = (id, fn) => {
+      const el = sr.getElementById(id);
+      if (!el) return;
+      const clone = el.cloneNode(true);
+      el.parentNode.replaceChild(clone, el);
+      clone.addEventListener("click", fn);
+      return clone;
+    };
+    const okBtn = bindOnce("confirm-ok", async () => {
+      this._closeConfirm();
+      if (onConfirm) await onConfirm();
+    });
+    if (okBtn) okBtn.textContent = confirmLabel || "Confirm";
+    bindOnce("confirm-cancel", () => this._closeConfirm());
+    bindOnce("confirm-close", () => this._closeConfirm());
+    overlay.onclick = (e) => { if (e.target === overlay) this._closeConfirm(); };
+  }
+
+  _closeConfirm() {
+    const overlay = this.shadowRoot.getElementById("confirm-overlay");
+    if (overlay) overlay.classList.add("hidden");
+  }
+
+  async _deletePendingUpdate(updateId) {
+    if (!this._inspectingDevice) return;
+    this._devicePendingError = "";
+    try {
+      const did = this._inspectingDevice.device_id;
+      await this._hass.callApi(
+        "DELETE",
+        `casa/admin/queue_update?device_id=${encodeURIComponent(did)}&id=${encodeURIComponent(updateId)}`
+      );
+    } catch (err) {
+      this._devicePendingError = "Failed to delete: " + ((err && err.message) || err);
+    }
+    await this._refreshInspectingDevice();
+  }
+
+  // Reload the summary and re-point the open inspector at fresh device data so the
+  // Pending Updates section reflects a just-queued update immediately.
+  async _refreshInspectingDevice() {
+    if (!this._inspectingDevice) return;
+    const id = this._inspectingDevice.device_id;
+    await this._load();
+    const fresh = ((this._data && this._data.devices) || []).find((d) => d.device_id === id);
+    if (fresh) this._inspectingDevice = fresh;
+    this._renderDeviceInspectorBody();
+  }
+
   async _pushDeviceWg() {
     const sr = this.shadowRoot;
     const select = sr.getElementById("de-wg-profile");
     if (!select) return;
 
+    // Read inputs before re-rendering (which would reset them).
     const profileId = select.value;
-    
+    const sendPush = !!(sr.getElementById("de-wg-send-push") || {}).checked;
+    const notifyPush = !!(sr.getElementById("de-wg-notify-push") || {}).checked;
+
     this._deviceWgError = "";
     this._deviceWgSuccess = "";
     this._renderDeviceInspectorBody();
 
     try {
+      const req = {
+        device_id: this._inspectingDevice.device_id,
+        update_type: "wireguard",
+        send_update_push: sendPush,
+        notify_push: notifyPush,
+      };
+      let label;
       if (profileId) {
         const profile = (this._wgProfiles || []).find((p) => p.id === profileId);
-        if (!profile) {
-          throw new Error("Selected WireGuard profile not found.");
+        if (!profile) throw new Error("Selected WireGuard profile not found.");
+        req.action = "update";
+        req.wireguard_config = profile.config;
+        req.wireguard_excluded_wifi = profile.excluded_wifi || "";
+        if (notifyPush) {
+          req.title = "VPN profile updated";
+          req.message = `A new WireGuard profile (${profile.alias}) is available.`;
         }
-        await this._hass.callService("casa", "update_wireguard", {
-          device_id: this._inspectingDevice.device_id,
-          action: "update",
-          wireguard_config: profile.config,
-          wireguard_excluded_wifi: profile.excluded_wifi || ""
-        });
-        this._deviceWgSuccess = `WireGuard profile '${profile.alias}' push command sent.`;
+        label = `WireGuard profile '${profile.alias}'`;
       } else {
-        await this._hass.callService("casa", "update_wireguard", {
-          device_id: this._inspectingDevice.device_id,
-          action: "revoke"
-        });
-        this._deviceWgSuccess = "WireGuard revoke command sent.";
+        req.action = "revoke";
+        if (notifyPush) {
+          req.title = "VPN access revoked";
+          req.message = "Your WireGuard VPN profile has been removed.";
+        }
+        label = "WireGuard revoke";
       }
+      const res = await this._hass.callApi("POST", "casa/admin/queue_update", req);
+      this._deviceWgSuccess = `${label} queued (queued ${res.queued}, pushed ${res.pushed}, notified ${res.notified}, skipped ${res.skipped}).`;
+      await this._refreshInspectingDevice();
+      return;
     } catch (err) {
-      this._deviceWgError = "Failed to push: " + ((err && err.message) || err);
+      this._deviceWgError = "Failed to queue: " + ((err && err.message) || err);
+    }
+    this._renderDeviceInspectorBody();
+  }
+
+  async _pushDeviceProfile() {
+    const sr = this.shadowRoot;
+    const select = sr.getElementById("de-pp-profile");
+    if (!select) return;
+
+    const profileId = select.value;
+    const sendPush = !!(sr.getElementById("de-pp-send-push") || {}).checked;
+    const notifyPush = !!(sr.getElementById("de-pp-notify-push") || {}).checked;
+
+    this._deviceProfileError = "";
+    this._deviceProfileSuccess = "";
+
+    if (!profileId) {
+      this._deviceProfileError = "Select a provisioning profile first.";
+      this._renderDeviceInspectorBody();
+      return;
+    }
+
+    this._renderDeviceInspectorBody();
+
+    try {
+      const profile = (this._ppProfiles || []).find((p) => p.id === profileId);
+      if (!profile) throw new Error("Selected provisioning profile not found.");
+      const req = {
+        device_id: this._inspectingDevice.device_id,
+        update_type: "profile",
+        action: "update",
+        profile_id: profileId,
+        send_update_push: sendPush,
+        notify_push: notifyPush,
+      };
+      if (notifyPush) {
+        req.title = "Profile updated";
+        req.message = `A new configuration profile (${profile.name}) is available.`;
+      }
+      const res = await this._hass.callApi("POST", "casa/admin/queue_update", req);
+      this._deviceProfileSuccess = `Profile '${profile.name}' queued (queued ${res.queued}, pushed ${res.pushed}, notified ${res.notified}, skipped ${res.skipped}).`;
+      await this._refreshInspectingDevice();
+      return;
+    } catch (err) {
+      this._deviceProfileError = "Failed to queue: " + ((err && err.message) || err);
     }
     this._renderDeviceInspectorBody();
   }
@@ -1588,6 +1821,7 @@ class CasaAdminPanel extends HTMLElement {
       <div class="stat"><div class="value">${s.managed_users ?? 0}</div><div class="label">Managed Users</div></div>
       <div class="stat ${(s.orphaned ?? 0) > 0 ? "err" : ""}"><div class="value">${s.orphaned ?? 0}</div><div class="label">Orphaned</div></div>
       <div class="stat ${(s.stale ?? 0) > 0 ? "warn" : ""}"><div class="value">${s.stale ?? 0}</div><div class="label">Stale</div></div>
+      <div class="stat"><div class="value">${s.pending_updates ?? 0}</div><div class="label">Updates Pending</div></div>
       <div class="stat site"><div class="value">${this._esc(data.site_id) || "—"}</div><div class="label">Site ID</div></div>
     `;
 
@@ -1601,7 +1835,7 @@ class CasaAdminPanel extends HTMLElement {
               <td>${d.alias ? `<strong>${this._esc(d.alias)}</strong> <small style="color:var(--secondary-text-color)">(${this._esc((d.device_id || "").slice(0, 8))}…)</small>` : `<code>${this._esc((d.device_id || "").slice(0, 8))}…</code>`}</td>
               <td>${this._esc(d.ip) || "—"}</td>
               <td>${this._fmtTime(d.last_seen)}</td>
-              <td>${d.orphaned ? '<span class="badge orphan">orphan</span>' : ""}${d.stale ? '<span class="badge stale">stale</span>' : ""}${!d.orphaned && !d.stale && d.push_registered ? '<span class="badge ok">ok</span>' : ""}</td>
+              <td>${d.orphaned ? '<span class="badge orphan">orphan</span>' : ""}${d.stale ? '<span class="badge stale">stale</span>' : ""}${(d.pending_updates ?? 0) > 0 ? `<span class="badge pending">${d.pending_updates} pending</span>` : ""}${!d.orphaned && !d.stale && d.push_registered ? '<span class="badge ok">ok</span>' : ""}</td>
             </tr>`).join("")}
           </tbody>
         </table>`
@@ -1801,8 +2035,14 @@ class CasaAdminPanel extends HTMLElement {
         profile: this._provisionSelectedProfileId || undefined
       };
       
-      const res = await this._hass.callService("casa", "provision", payload);
-      this._provisionResult = res || null;
+      const res = await this._hass.callWS({
+        type: "call_service",
+        domain: "casa",
+        service: "provision",
+        service_data: payload,
+        return_response: true
+      });
+      this._provisionResult = (res && res.response) || res || null;
     } catch (err) {
       this._provisionError = (err && err.message) || String(err);
     } finally {
