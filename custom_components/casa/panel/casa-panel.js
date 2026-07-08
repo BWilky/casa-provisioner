@@ -13,11 +13,12 @@ const loadModule = (path) => import(`./${path}?v=${VERSION}`);
 class CasaAdminPanel extends HTMLElement {
   constructor() {
     super();
+    // Spec: a custom element constructor must not add attributes — HA's
+    // document.createElement() throws NotSupportedError otherwise. Styling
+    // happens in connectedCallback instead.
     this._props = {};
     this._app = null;
     this._booting = false;
-    this.style.display = "block";
-    this.style.height = "100%";
   }
 
   // HA assigns these on custom panels; buffer until the app module loads.
@@ -59,6 +60,8 @@ class CasaAdminPanel extends HTMLElement {
   }
 
   connectedCallback() {
+    this.style.display = "block";
+    this.style.height = "100%";
     this._app?.onConnected();
   }
   disconnectedCallback() {
