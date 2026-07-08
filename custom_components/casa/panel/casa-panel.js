@@ -14,7 +14,7 @@ class CasaAdminPanel extends HTMLElement {
   constructor() {
     super();
     this._props = {};
-    this._inner = null;
+    this._app = null;
     this._booting = false;
     this.style.display = "block";
     this.style.height = "100%";
@@ -23,39 +23,46 @@ class CasaAdminPanel extends HTMLElement {
   // HA assigns these on custom panels; buffer until the app module loads.
   set hass(v) {
     this._props.hass = v;
-    if (this._inner) this._inner.hass = v;
+    if (this._app) this._app.setHass(v);
     else this._boot();
   }
   set narrow(v) {
     this._props.narrow = v;
-    if (this._inner) this._inner.narrow = v;
+    this._app?.setNarrow(v);
   }
   set route(v) {
     this._props.route = v;
-    if (this._inner) this._inner.route = v;
+    this._app?.setRoute(v);
   }
   set panel(v) {
     this._props.panel = v;
-    if (this._inner) this._inner.panel = v;
+    this._app?.setPanel?.(v);
   }
 
   async _boot() {
     if (this._booting) return;
     this._booting = true;
     try {
-      await loadModule("legacy.js");
-      const el = document.createElement("casa-admin-legacy");
-      el.narrow = this._props.narrow;
-      el.route = this._props.route;
-      el.panel = this._props.panel;
-      el.hass = this._props.hass;
-      this._inner = el;
-      this.appendChild(el);
+      const { createApp } = await loadModule("app.js");
+      this._app = await createApp({ host: this, loadModule, version: VERSION });
+      this._app.setNarrow(this._props.narrow);
+      if (this._props.route) this._app.setRoute(this._props.route);
+      this._app.setHass(this._props.hass);
     } catch (err) {
       this._booting = false;
-      this.innerHTML = `<div style="padding:24px; font-family:sans-serif; color:#db4437;">
-        Casa panel failed to load: ${String(err && err.message ? err.message : err)}</div>`;
+      const div = document.createElement("div");
+      div.style.cssText = "padding:24px; font-family:sans-serif; color:#db4437;";
+      div.textContent = `Casa panel failed to load: ${String(err && err.message ? err.message : err)}`;
+      (this.shadowRoot || this).appendChild(div);
+      console.error("casa: panel boot failed", err);
     }
+  }
+
+  connectedCallback() {
+    this._app?.onConnected();
+  }
+  disconnectedCallback() {
+    this._app?.onDisconnected();
   }
 }
 
