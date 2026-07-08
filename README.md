@@ -22,12 +22,15 @@ Home Assistant custom integration for provisioning and managing [Casa](https://b
 
 ## Admin Panel
 
-Enable **Show Panel** in the integration options to get a **Casa** sidebar entry (admins only). From the panel you can:
+Enable **Show Panel** in the integration options to get a **Casa** sidebar entry (admins only). The panel is a full app in the style of the ESPHome Device Builder:
 
-- **Dashboard** — device and account tables with orphan/stale badges, pending-update counts, reconcile and refresh actions. Each device row has quick actions: **Delete Record** (revoke tokens + remove record, no wipe — for stale/orphaned entries) and **Deprovision** (remote wipe).
-- **Quick Provision** — provision from a saved profile (or ad-hoc host/user/PIN) with three output methods: **QR Code**, **Deep Link** (`hascasa://` + universal link), or **Manual Entry** (plaintext values to read into the app's manual provisioning sheet, with copy buttons and the password-validity window).
-- **Device Inspector** — full device details; edit alias; test push; queue WireGuard/provisioning-profile updates; **Session Expiration** management (set/extend a date, quick +24h/+7d/+30d, Make Permanent, Expire Now — applied on the device's next heartbeat); **Deprovision** (remote wipe + full cleanup).
-- **Settings** — site key rotation, WireGuard profile CRUD, provisioning profile CRUD, guest account management.
+- **Device list** (default page) — searchable, sortable table or card grid with status dots (heartbeat recency), app-version chips, filter and column pickers, select-multiple bulk actions (reload / delete / deprovision), pagination, and a per-device menu (edit, test push, reload, push WireGuard/provision profile, re-provision, delete record, deprovision). An **Accounts** tab manages guest users with one-time-credential dialogs.
+- **Provision wizard** ("+ Provision device") — stepped flow: pick a method (Guided QR — recommended — or Deep link only / Manual entry / BLE beacon), pick a provisioning profile from a searchable card grid (or go ad-hoc), enter connection details, and get the result: QR image, `hascasa://` deep link + universal link with copy buttons, plaintext manual-entry values, or per-beacon broadcast status.
+- **Device editor** — three-pane page per device: section navigator (Overview, Session & Expiration, Push, VPN/WireGuard, Pending Updates, Danger Zone), forms in the middle, and a live read-only `device.json` pane on the right. Expiration changes (set/extend/permanent/expire-now) apply on the device's next heartbeat and show as *pending* until confirmed.
+- **Profile editor** — same three-pane layout for provisioning profiles, with a **live `payload.json` preview** of the v2 provisioning payload that updates as you type (provision-time values shown as placeholders), and dirty-state Save.
+- **Settings** (header menu) — Site ID / encryption-key rotation, site regeneration (danger), and WireGuard profile management with in-use checks.
+
+The panel is served as versioned ES modules from `/casa_static/`; updates are picked up automatically after a Home Assistant restart (no hard refresh needed).
 
 ---
 
