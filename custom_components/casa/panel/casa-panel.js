@@ -2022,6 +2022,7 @@ class CasaAdminPanel extends HTMLElement {
     this._provisionHostUrl = this._data?.site_id ? window.location.origin : "";
     this._provisionUsername = "";
     this._provisionPin = "";
+    this._provisionMethod = "qr";
     this._provisionResult = null;
     this._provisionError = "";
     this._provisionLoading = false;
@@ -2067,41 +2068,25 @@ class CasaAdminPanel extends HTMLElement {
           <label>PIN (Optional 6-digit PIN)</label>
           <input type="text" id="qp-pin" value="${esc(this._provisionPin)}" placeholder="e.g. 123456" maxlength="6">
         </div>
-        
+
+        <div class="editor-row">
+          <label>Output Method</label>
+          <div id="qp-method-picker" style="display:flex; gap:6px;">
+            ${[["qr", "QR Code"], ["deep_link", "Deep Link"], ["manual", "Manual Entry"]].map(([val, label]) => `
+              <button class="${this._provisionMethod === val ? "btn-primary" : "btn-plain"} qp-method" data-method="${val}" style="flex:1; padding:8px 10px; font-size:13px; ${this._provisionMethod === val ? "" : "border:1px solid var(--divider-color,#ddd); border-radius:6px;"}">${label}</button>
+            `).join("")}
+          </div>
+        </div>
+
         ${this._provisionError ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-bottom: 12px;">${esc(this._provisionError)}</div>` : ""}
-        
+
         <button class="btn-primary" id="qp-generate" style="width: 100%; margin-top: 12px; height: 40px; font-weight: 600;">
-          ${this._provisionLoading ? "Generating..." : "Generate Link & QR Code"}
+          ${this._provisionLoading ? "Generating..." : (this._provisionMethod === "qr" ? "Generate Link & QR Code" : this._provisionMethod === "deep_link" ? "Generate Setup Links" : "Generate Manual Entry Values")}
         </button>
       </div>
 
       <div id="qp-result-container">
-        ${this._provisionResult ? `
-          <div class="device-sec-box" style="text-align: center; margin-top: 16px;">
-            <h5 style="margin-bottom: 12px; font-size: 14px;">Scan with Casa App or click link</h5>
-            <div style="margin: 16px 0;">
-              <img src="${esc(this._provisionResult.url_path)}" style="width: 220px; height: 220px; border: 1px solid var(--divider-color, #ddd); border-radius: 8px; padding: 12px; background: white;" />
-            </div>
-            <div class="editor-row" style="text-align: left;">
-              <label>Setup Deep Link</label>
-              <div style="display:flex; gap:8px; align-items: center;">
-                <input type="text" id="qp-link-val" value="${esc(this._provisionResult.deep_link)}" readonly style="flex:1; font-family: monospace; font-size: 11px;">
-                <button class="btn-primary" id="qp-copy-link" style="padding: 8px 16px;">Copy</button>
-              </div>
-              <div id="qp-copy-msg" style="color:var(--success-color,#43a047); font-size: 12px; margin-top: 4px; display:none;">Link copied to clipboard!</div>
-            </div>
-            ${this._provisionResult.universal_link ? `
-            <div class="editor-row" style="text-align: left;">
-              <label>Universal Link (opens from Safari / iMessage)</label>
-              <div style="display:flex; gap:8px; align-items: center;">
-                <input type="text" id="qp-ulink-val" value="${esc(this._provisionResult.universal_link)}" readonly style="flex:1; font-family: monospace; font-size: 11px;">
-                <button class="btn-primary" id="qp-copy-ulink" style="padding: 8px 16px;">Copy</button>
-              </div>
-              <div id="qp-ucopy-msg" style="color:var(--success-color,#43a047); font-size: 12px; margin-top: 4px; display:none;">Link copied to clipboard!</div>
-            </div>
-            ` : ""}
-          </div>
-        ` : ""}
+        ${this._renderProvisionResult(esc)}
       </div>
     `;
 
@@ -2147,6 +2132,26 @@ class CasaAdminPanel extends HTMLElement {
 
     generateBtn.addEventListener("click", () => this._generateProvisionLink());
 
+    body.querySelectorAll(".qp-method").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (this._provisionMethod === btn.dataset.method) return;
+        this._provisionMethod = btn.dataset.method;
+        this._provisionResult = null;
+        this._provisionError = "";
+        this._renderQuickProvisionBody();
+      });
+    });
+
+    body.querySelectorAll(".qp-copy-val").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        navigator.clipboard.writeText(btn.dataset.copy || "").then(() => {
+          const original = btn.textContent;
+          btn.textContent = "Copied!";
+          setTimeout(() => { btn.textContent = original; }, 1500);
+        });
+      });
+    });
+
     const bindCopy = (btnId, inputId, msgId) => {
       const btn = body.querySelector(`#${btnId}`);
       if (!btn) return;
@@ -2167,6 +2172,100 @@ class CasaAdminPanel extends HTMLElement {
     bindCopy("qp-copy-ulink", "qp-ulink-val", "qp-ucopy-msg");
   }
 
+  _renderProvisionResult(esc) {
+    const r = this._provisionResult;
+    if (!r) return "";
+
+    if (r.method === "manual") {
+      const f = r.fields || {};
+      const u = r.unsupported || {};
+      const val = (v) => (v === undefined || v === null || String(v) === "")
+        ? '<em style="color:var(--secondary-text-color,#727272);">leave blank</em>'
+        : `<code style="word-break:break-all;">${esc(String(v))}</code>`;
+      const row = (label, v, copyValue) => `
+        <strong>${label}</strong>
+        <span style="display:flex; align-items:center; gap:8px;">
+          ${val(v)}
+          ${copyValue ? `<button class="btn-plain qp-copy-val" data-copy="${esc(String(copyValue))}" style="padding:2px 8px; font-size:11px; border:1px solid var(--divider-color,#ddd); border-radius:4px;">Copy</button>` : ""}
+        </span>`;
+      const section = (label) => `
+        <strong style="grid-column:1 / -1; margin-top:8px; color:var(--primary-text-color,#212121); font-weight:600; border-bottom:1px solid var(--divider-color,#ddd); padding-bottom:2px;">${label}</strong>`;
+
+      const sessionText = Number(f.session_expiration) === 0
+        ? 'Never — toggle "Session Never Expires" ON'
+        : this._fmtExpiry(f.session_expiration);
+
+      const lost = [];
+      if (u.pin) lost.push("provisioning PIN");
+      if (u.push_notifications && u.push_notifications !== "false") lost.push("push notifications");
+      if (u.wireguard) lost.push("WireGuard VPN");
+
+      return `
+        <div class="device-sec-box" style="margin-top: 16px;">
+          <h5>Manual Entry Values</h5>
+          <p style="font-size:12px; color:var(--secondary-text-color,#727272); margin:0 0 10px 0;">
+            Enter these in the Casa app's manual provisioning sheet, field for field.
+          </p>
+          ${r.expires_at ? `<div class="editor-msg" style="color:var(--warning-color,#f4b400); margin-bottom:10px;">Password valid until <strong>${this._fmtExpiry(r.expires_at)}</strong> — it is scrambled after that window.</div>` : ""}
+          <div style="display:grid; grid-template-columns:auto 1fr; gap:6px 16px; font-size:13px;">
+            ${section("Server Configuration")}
+            ${row("Server URL", f.server_url, f.server_url)}
+            ${row("Username", f.username, f.username)}
+            ${row("Password", f.password, f.password)}
+            ${section("Access Control & Network")}
+            ${row("Allowed Paths (comma-separated)", f.allowed_paths)}
+            ${row("Allowed Wi-Fi SSIDs (comma-separated)", f.allowed_wifi)}
+            ${section("Client Customization")}
+            ${row("Default Dashboard Path", f.default_dashboard)}
+            ${row("Immersive Level", f.immersive_level)}
+            ${row("Immersive Color Mode", f.theme_color_mode)}
+            ${row("Custom Hex Color", f.custom_color)}
+            ${section("Session & Caching")}
+            ${row("Session Expiration", sessionText)}
+            ${row("Cache Control Hours", f.cache_control_hours)}
+            ${section("Onboarding Extras")}
+            ${row("Welcome Screen URL", f.welcome_url)}
+            ${row("Auto-Join Wi-Fi SSID", f.connect_wifi_ssid)}
+            ${row("Auto-Join Wi-Fi Password", f.connect_wifi_password)}
+          </div>
+          ${lost.length ? `<div class="editor-msg" style="color:var(--error-color,#db4437); margin-top:12px;">This configuration includes settings manual entry cannot carry over: <strong>${lost.join(", ")}</strong>.</div>` : ""}
+          <p style="font-size:12px; color:var(--secondary-text-color,#727272); margin:10px 0 0 0;">
+            Manual entry cannot configure a PIN, push notifications (site binding), or WireGuard VPN.
+            A manually provisioned device receives no pushes, remote updates, or remote deprovision;
+            session expiration changes still apply on its heartbeat.
+          </p>
+        </div>`;
+    }
+
+    // qr / deep_link results share the link rows; qr adds the scannable image.
+    return `
+      <div class="device-sec-box" style="text-align: center; margin-top: 16px;">
+        <h5 style="margin-bottom: 12px; font-size: 14px;">${r.method === "qr" ? "Scan with Casa App or click link" : "Send a setup link to the device"}</h5>
+        ${r.method === "qr" ? `
+        <div style="margin: 16px 0;">
+          <img src="${esc(r.url_path)}" style="width: 220px; height: 220px; border: 1px solid var(--divider-color, #ddd); border-radius: 8px; padding: 12px; background: white;" />
+        </div>` : ""}
+        <div class="editor-row" style="text-align: left;">
+          <label>Setup Deep Link</label>
+          <div style="display:flex; gap:8px; align-items: center;">
+            <input type="text" id="qp-link-val" value="${esc(r.deep_link)}" readonly style="flex:1; font-family: monospace; font-size: 11px;">
+            <button class="btn-primary" id="qp-copy-link" style="padding: 8px 16px;">Copy</button>
+          </div>
+          <div id="qp-copy-msg" style="color:var(--success-color,#43a047); font-size: 12px; margin-top: 4px; display:none;">Link copied to clipboard!</div>
+        </div>
+        ${r.universal_link ? `
+        <div class="editor-row" style="text-align: left;">
+          <label>Universal Link (opens from Safari / iMessage)</label>
+          <div style="display:flex; gap:8px; align-items: center;">
+            <input type="text" id="qp-ulink-val" value="${esc(r.universal_link)}" readonly style="flex:1; font-family: monospace; font-size: 11px;">
+            <button class="btn-primary" id="qp-copy-ulink" style="padding: 8px 16px;">Copy</button>
+          </div>
+          <div id="qp-ucopy-msg" style="color:var(--success-color,#43a047); font-size: 12px; margin-top: 4px; display:none;">Link copied to clipboard!</div>
+        </div>
+        ` : ""}
+      </div>`;
+  }
+
   async _generateProvisionLink() {
     const hostVal = this._provisionHostUrl.trim();
     const userVal = this._provisionUsername.trim();
@@ -2184,12 +2283,16 @@ class CasaAdminPanel extends HTMLElement {
 
     try {
       const payload = {
-        method: "qr",
+        method: this._provisionMethod,
         host_url: hostVal,
         username: userVal,
         pin: this._provisionPin.trim() || undefined,
         profile: this._provisionSelectedProfileId || undefined
       };
+      if (this._provisionMethod === "manual") {
+        // Typing values in takes longer than the 5-minute default window.
+        payload.timeout_minutes = 30;
+      }
       
       const res = await this._hass.callWS({
         type: "call_service",

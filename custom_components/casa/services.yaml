@@ -12,7 +12,7 @@ provision:
     # 1. Essential Connection Details
     method:
       name: "Provisioning Method"
-      description: "Choose whether to generate a QR code image ('qr') or broadcast via BLE beacons ('ble')."
+      description: "Output format: QR code image ('qr'), BLE beacon broadcast ('ble'), setup link only ('deep_link'), or plaintext values for the app's manual entry sheet ('manual'). Manual returns the resolved credentials unencrypted in the service response — admin eyes only."
       required: true
       selector:
         select:
@@ -23,6 +23,8 @@ provision:
               value: "ble"
             - label: "Deep Link"
               value: "deep_link"
+            - label: "Manual Entry Values"
+              value: "manual"
     host_url:
       name: "Host URL"
       description: "e.g., http://192.168.1.21:8123. The exact address the device will use to connect."

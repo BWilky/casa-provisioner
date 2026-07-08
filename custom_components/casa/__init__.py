@@ -1790,7 +1790,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ==========================================
     async def _provision_internal(service_data: dict, users: list = None) -> dict:
         method = str(service_data.get("method", "qr")).strip().lower()
-        if method not in ("qr", "ble", "deep_link"):
+        if method not in ("qr", "ble", "deep_link", "manual"):
             return {"error": f"Invalid method: {method}"}
 
         _LOGGER.debug("CASA: Internal provision function triggered (method: %s).", method)
@@ -2037,7 +2037,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         payload_decrypted = service_data.get("payload_decrypted", False)
 
-        if payload_version == 1:
+        if method == "manual":
+            # Manual entry: no payload is built. The resolved plaintext values are
+            # returned below for an admin to read into the app's manual sheet.
+            final_payload = None
+            deep_link = None
+            universal_link = None
+        elif payload_version == 1:
             # Legacy v1: 21-field, '|'-joined, RSA-OAEP (plaintext capped at 190 bytes).
             raw_payload_array = [
                 str(final_server_url),
@@ -2224,7 +2230,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if target_username in hass.data[DOMAIN]["timers"]:
             hass.data[DOMAIN]["timers"][target_username].cancel()
 
-        if (method in ("qr", "deep_link") and timeout_mins > 0) or password_scramble:
+        if (method in ("qr", "deep_link", "manual") and timeout_mins > 0) or password_scramble:
             countdown_task = hass.async_create_task(
                 _cleanup_sequence(login_username, provider, timeout_secs, scramble_timeout_secs, password_scramble, delete_qr, final_filename)
             )
@@ -2252,7 +2258,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         hass.data[DOMAIN]["listeners"][target_username] = listener_task
 
-        if method == "qr":
+        if method == "manual":
+            # Plaintext values for the iOS app's manual provisioning sheet,
+            # field-for-field. The password/window expiry still applies.
+            return {
+                "method": "manual",
+                "expires_at": expiration_unix,
+                "fields": {
+                    "server_url": final_server_url,
+                    "username": login_username,
+                    "password": login_password,
+                    "allowed_paths": allowed_paths_str,
+                    "allowed_wifi": allowed_wifi,
+                    "default_dashboard": default_dashboard,
+                    "immersive_level": immersive_level,
+                    "theme_color_mode": theme_color_mode,
+                    "custom_color": custom_color,
+                    "session_expiration": session_expiration_unix,
+                    "cache_control_hours": cache_control_hours_str,
+                    "welcome_url": welcome_url,
+                    "connect_wifi_ssid": connect_wifi_ssid,
+                    "connect_wifi_password": connect_wifi_password,
+                },
+                # Resolved but impossible to enter in the app's manual sheet.
+                "unsupported": {
+                    "pin": bool(target_pin),
+                    "site_id": bool(site_id),
+                    "push_notifications": normalized_push,
+                    "wireguard": bool(wireguard_config_raw) or normalized_wireguard == "true",
+                },
+            }
+        elif method == "qr":
             return {
                 "method": "qr",
                 "filename": final_filename,
