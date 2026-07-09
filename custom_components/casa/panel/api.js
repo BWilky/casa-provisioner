@@ -11,6 +11,7 @@ export class CasaApi {
     this._timer = null;
     this._paused = false;
     this._intervalMs = 30000;
+    this._reqSeq = 0;
   }
 
   setHass(hass) {
@@ -37,14 +38,58 @@ export class CasaApi {
 
   async refreshSummary() {
     if (!this._hass) return null;
+    // Only the newest in-flight request may assign the summary: a slow poll
+    // response that started before a mutation must not overwrite the fresher
+    // post-mutation refresh (which would resurrect deleted rows).
+    const seq = ++this._reqSeq;
+    let summary = null;
+    let error = null;
     try {
-      this.summary = await this._hass.callApi("GET", "casa/admin/summary");
-      this.lastError = null;
+      summary = await this._hass.callApi("GET", "casa/admin/summary");
     } catch (err) {
-      this.lastError = (err && err.message) || String(err);
+      error = (err && err.message) || String(err);
+    }
+    if (seq !== this._reqSeq) return this.summary;
+    if (error === null) {
+      this.summary = summary;
+      this.lastError = null;
+    } else {
+      this.lastError = error;
     }
     this._notify();
     return this.summary;
+  }
+
+  // Optimistically remove a device from the cached summary so the UI updates
+  // instantly after a delete/deprovision; the follow-up refresh reconciles.
+  _dropDeviceLocal(deviceId) {
+    const s = this.summary;
+    if (!s || !Array.isArray(s.devices)) return;
+    const dropped = s.devices.find((d) => d.device_id === deviceId);
+    if (!dropped) return;
+    s.devices = s.devices.filter((d) => d.device_id !== deviceId);
+    if (s.stats) {
+      const dec = (key, by = 1) => {
+        if (typeof s.stats[key] === "number") s.stats[key] = Math.max(0, s.stats[key] - by);
+      };
+      dec("devices");
+      if (dropped.orphaned) dec("orphaned");
+      if (dropped.stale) dec("stale");
+      if (dropped.pending_updates) dec("pending_updates", Number(dropped.pending_updates) || 0);
+    }
+    this._notify();
+  }
+
+  _dropAccountLocal(username) {
+    const s = this.summary;
+    if (!s) return;
+    if (Array.isArray(s.accounts)) s.accounts = s.accounts.filter((a) => a.username !== username);
+    if (Array.isArray(s.devices)) {
+      for (const d of s.devices.filter((d) => d.username === username)) {
+        this._dropDeviceLocal(d.device_id);
+      }
+    }
+    this._notify();
   }
 
   startPolling(ms = 30000) {
@@ -83,11 +128,15 @@ export class CasaApi {
   provision(data) {
     return this._callWs("provision", data);
   }
-  deleteDevice(deviceId) {
-    return this._callWs("delete_device", { device_id: deviceId });
+  async deleteDevice(deviceId) {
+    const res = await this._callWs("delete_device", { device_id: deviceId });
+    this._dropDeviceLocal(deviceId);
+    return res;
   }
-  deprovisionDevice(deviceId) {
-    return this._callWs("deprovision_device", { device_id: deviceId });
+  async deprovisionDevice(deviceId) {
+    const res = await this._callWs("deprovision_device", { device_id: deviceId });
+    this._dropDeviceLocal(deviceId);
+    return res;
   }
   reloadDevice(deviceId) {
     return this._hass.callService("casa", "reload_device", { device_id: deviceId });
@@ -104,8 +153,11 @@ export class CasaApi {
     if (password) payload.password = password;
     return this._callWs("create_user", payload);
   }
-  removeUser(username) {
-    return this._callWs("remove_user", { username });
+  async removeUser(username) {
+    const res = await this._callWs("remove_user", { username });
+    // Server also deregisters the user's devices — mirror that locally.
+    this._dropAccountLocal(username);
+    return res;
   }
   scrambleGuestPassword(username, deauthenticate = true) {
     return this._callWs("scramble_guest_password", { username, deauthenticate });
