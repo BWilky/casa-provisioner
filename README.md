@@ -295,7 +295,7 @@ These are called by the Casa iOS app directly (authenticated via HA long-lived o
 |--------|----------|-------------|
 | `POST` | `/api/casa/register_device` | Register/update a device for push notifications |
 | `GET` | `/api/casa/register_device?device_id=X` | Check if a device is registered |
-| `DELETE` | `/api/casa/register_device?device_id=X` | Unregister a device |
+| `DELETE` | `/api/casa/register_device?device_id=X` | Unregister push for a device (record retained — use `casa.delete_device` / `casa.deprovision_device` to remove a device) |
 | `POST` | `/api/casa/heartbeat` | Device heartbeat. Response carries `reregister`, `updates`, `device_key`/`device_key_id`, and — while an admin override is pending — `expires_at` (the app applies it; `0` = permanent) |
 | `GET`/`POST` | `/api/casa/profile_updates` | Pull / acknowledge queued profile & WireGuard updates |
 

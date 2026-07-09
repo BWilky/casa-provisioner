@@ -336,8 +336,10 @@ class CasaRegisterDeviceView(HomeAssistantView):
             store.async_delay_save(lambda: stored_data, 2.0)
             
             device_info = devices[device_id]
+            # "registered" means push-registered: after a push-only unregister the
+            # record persists without a push_token and must not read as registered.
             return self.json({
-                "registered": True,
+                "registered": bool(device_info.get("push_token")),
                 "push_token": device_info.get("push_token"),
                 "registered_at": device_info.get("registered_at"),
                 "last_seen_at": device_info.get("last_seen_at")
@@ -370,18 +372,18 @@ class CasaRegisterDeviceView(HomeAssistantView):
                 return self.json({"error": "User not found or deleted"}, status_code=404)
         
         if device_id in devices:
-            devices.pop(device_id)
+            # Push-only unregister: the device record (and its HA registry entry)
+            # stays visible and manageable — only the push registration is cleared.
+            # Full removal is an admin action (casa.delete_device / deprovision).
+            device_info = devices[device_id]
+            proxy_token = device_info.pop("push_token", None)
+            device_info.pop("needs_reregister", None)
+            await _unregister_relay_token(self.hass, proxy_token, device_id)
+
             store = self.hass.data[DOMAIN]["store"]
             store.async_delay_save(lambda: stored_data, 2.0)
-            
-            # Remove from Home Assistant Device Registry
-            from homeassistant.helpers import device_registry as dr
-            dev_reg = dr.async_get(self.hass)
-            device_entry = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
-            if device_entry:
-                dev_reg.async_remove_device(device_entry.id)
-                
-            _LOGGER.info("CASA: Unregistered device '%s' for user '%s'.", device_id, username)
+
+            _LOGGER.info("CASA: Cleared push registration for device '%s' (user '%s'); record retained.", device_id, username)
             return self.json({"status": "success"})
             
         return self.json({"error": "Device not found"}, status_code=404)
@@ -3507,6 +3509,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     return True
 
+async def _unregister_relay_token(hass: HomeAssistant, proxy_token: str, device_id: str) -> None:
+    """Best-effort unregister of a proxy token from the push relay."""
+    if not proxy_token:
+        return
+    try:
+        session = async_get_clientsession(hass)
+        async with session.post(
+            RELAY_UNREGISTER_URL,
+            json={"proxy_token": proxy_token},
+            timeout=ClientTimeout(total=10),
+        ) as resp:
+            if resp.status == 200:
+                _LOGGER.info("CASA: Unregistered proxy token for device '%s' from relay.", device_id)
+            elif resp.status == 404:
+                _LOGGER.info("CASA: Relay had no registration for device '%s' (already gone).", device_id)
+            else:
+                text = await resp.text()
+                _LOGGER.warning("CASA: Relay /unregister returned %s for device '%s': %s", resp.status, device_id, text)
+    except Exception as err:
+        _LOGGER.warning("CASA: Failed to unregister proxy token for device '%s' from relay: %s", device_id, err)
+
+
 def _remove_registry_device(hass: HomeAssistant, device_id: str) -> None:
     """Best-effort removal of a Casa device from the HA device registry.
 
@@ -3564,23 +3588,7 @@ async def _purge_device(hass: HomeAssistant, device_id: str) -> dict:
         return {"found": False, "username": username, "push_token": None, "access_revoked": False}
 
     # Unregister the proxy token from the relay (possession of the token is the auth).
-    if proxy_token:
-        try:
-            session = async_get_clientsession(hass)
-            async with session.post(
-                RELAY_UNREGISTER_URL,
-                json={"proxy_token": proxy_token},
-                timeout=ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    _LOGGER.info("CASA: Unregistered proxy token for deleted device '%s' from relay.", device_id)
-                elif resp.status == 404:
-                    _LOGGER.info("CASA: Relay had no registration for deleted device '%s' (already gone).", device_id)
-                else:
-                    text = await resp.text()
-                    _LOGGER.warning("CASA: Relay /unregister returned %s for device '%s': %s", resp.status, device_id, text)
-        except Exception as err:
-            _LOGGER.warning("CASA: Failed to unregister proxy token for device '%s' from relay: %s", device_id, err)
+    await _unregister_relay_token(hass, proxy_token, device_id)
 
     # Revoke this device's HA session so it loses access (and can't silently
     # re-register via heartbeat). Scoped to the device's own token only.
