@@ -333,10 +333,12 @@ export function createView(app) {
 
   const gotoEdit = (id) => app.navigate("/devices/" + encodeURIComponent(id));
 
-  const openProvisionWizard = async (opts = {}) => {
-    const mod = await app.loadModule("wizard.js");
-    mod.openProvisionWizard(app, opts);
-  };
+  // Provisioning is a full-page flow (views/provision.js); a preset username
+  // (re-provision) rides the route as a path segment.
+  const gotoProvision = (opts = {}) =>
+    app.navigate(
+      opts.presetUsername ? "/provision/user/" + encodeURIComponent(opts.presetUsername) : "/provision"
+    );
 
   function toggleSort(key) {
     if (sortKey === key) sortDir = sortDir === "asc" ? "desc" : "asc";
@@ -386,7 +388,7 @@ export function createView(app) {
             mod.openPushModal(app, d, "profile");
           },
         },
-        { icon: "mdi:qrcode", label: "Re-provision user", onSelect: () => openProvisionWizard({ presetUsername: d.username }) },
+        { icon: "mdi:qrcode", label: "Re-provision user", onSelect: () => gotoProvision({ presetUsername: d.username }) },
         "divider",
         { icon: "mdi:delete-outline", label: "Delete record", danger: true, onSelect: () => confirmDeviceAction(d, "delete") },
         { icon: "mdi:cellphone-remove", label: "Deprovision", danger: true, onSelect: () => confirmDeviceAction(d, "deprovision") },
@@ -680,7 +682,7 @@ export function createView(app) {
         renderResults();
         break;
       case "provision":
-        openProvisionWizard();
+        gotoProvision();
         break;
       case "clear-filters":
         clearFilters();
@@ -712,6 +714,9 @@ export function createView(app) {
           <div class="tabs">
             <button class="tab tab--active">Devices</button>
             <button class="tab" id="dv-tab-accounts">Accounts</button>
+            <button class="tab" id="dv-tab-sessions">Sessions</button>
+            <button class="tab" id="dv-tab-profiles">Provision Profiles</button>
+            <button class="tab" id="dv-tab-wireguard">WireGuard Profiles</button>
           </div>
           <div class="list-toolbar">
             <div class="search-field">
@@ -759,6 +764,9 @@ export function createView(app) {
       });
 
       el.querySelector("#dv-tab-accounts").addEventListener("click", () => app.navigate("/accounts"));
+      el.querySelector("#dv-tab-sessions").addEventListener("click", () => app.navigate("/sessions"));
+      el.querySelector("#dv-tab-profiles").addEventListener("click", () => app.navigate("/profiles"));
+      el.querySelector("#dv-tab-wireguard").addEventListener("click", () => app.navigate("/wireguard"));
       refs.segmented.addEventListener("click", (e) => {
         const btn = e.target.closest("[data-mode]");
         if (!btn || btn.dataset.mode === viewMode) return;
@@ -769,7 +777,7 @@ export function createView(app) {
       });
       el.querySelector("#dv-filters").addEventListener("click", (e) => openFiltersPopover(e.currentTarget));
       refs.columnsBtn.addEventListener("click", (e) => openColumnsPopover(e.currentTarget));
-      el.querySelector("#dv-provision").addEventListener("click", openProvisionWizard);
+      el.querySelector("#dv-provision").addEventListener("click", () => gotoProvision());
 
       // One delegated listener covers meta, results, and footer (all re-rendered).
       refs.body.addEventListener("click", onBodyClick);

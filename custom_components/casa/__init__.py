@@ -26,7 +26,7 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_VERIFY_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.components import frontend
@@ -195,6 +195,44 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
 
     _LOGGER.error("CASA: Could not register site after multiple attempts.")
     return False
+
+
+async def _ensure_site_registration(hass: HomeAssistant, stored_data: dict, store) -> None:
+    """Verify the stored site credentials against the relay; self-heal if stale.
+
+    A stored site_key can outlive the relay's record of the site (relay DB reset,
+    site removed out-of-band). /verify_site is silent-mode-exempt: 403 means the
+    relay does not accept our site_id + site_key. Dropping the stale key and
+    re-registering the same site_id heals the unknown-site case with a 201; if the
+    site exists under a different key, _register_site's 409 handling rotates to a
+    fresh site_id.
+    """
+    if not stored_data.get("site_key"):
+        await _register_site(hass, stored_data, store)
+        return
+
+    session = async_get_clientsession(hass)
+    try:
+        async with session.post(
+            RELAY_VERIFY_SITE_URL,
+            json={"site_id": stored_data.get("site_id"), "site_key": stored_data.get("site_key")},
+            timeout=ClientTimeout(total=10),
+        ) as resp:
+            if resp.status == 200:
+                return
+            if resp.status == 403:
+                _LOGGER.warning(
+                    "CASA: Relay does not recognize our site credentials (403); re-registering site."
+                )
+                stored_data.pop("site_key", None)
+                await store.async_save(stored_data)
+                await _register_site(hass, stored_data, store)
+                return
+            text = await resp.text()
+            _LOGGER.warning("CASA: /verify_site returned %s: %s — keeping existing credentials.", resp.status, text)
+    except Exception as err:
+        # Transient network failure: keep credentials, do not churn the site.
+        _LOGGER.warning("CASA: Could not reach relay /verify_site (%s); keeping existing credentials.", err)
 
 
 def _find_device_record(stored_data: dict, device_id: str):
@@ -438,6 +476,9 @@ class CasaHeartbeatView(HomeAssistantView):
         app_version = data.get("app_version")
         wireguard_configured = data.get("wireguard_configured")
         wireguard_connected = data.get("wireguard_connected")
+        alias = data.get("alias")
+        if not isinstance(alias, str):
+            alias = None
 
         if expires_at is not None:
             try:
@@ -462,7 +503,8 @@ class CasaHeartbeatView(HomeAssistantView):
                 current_url=current_url,
                 app_version=app_version,
                 wireguard_configured=wireguard_configured,
-                wireguard_connected=wireguard_connected
+                wireguard_connected=wireguard_connected,
+                alias=alias
             )
         except HomeAssistantError as err:
             return self.json({"error": str(err)}, status_code=400)
@@ -483,12 +525,69 @@ class CasaHeartbeatView(HomeAssistantView):
             "updates": bool(result.get("updates")),
             "device_key": device_key,
             "device_key_id": _device_key_id(device_key) if device_key else None,
+            # require_alias is the site-wide flag only; the per-profile flag is
+            # carried by the provisioning payload / profile updates and ORed
+            # with this on the device. has_alias reflects the stored alias.
+            "require_alias": bool(result.get("require_alias")),
+            "has_alias": bool(result.get("has_alias")),
+            "heartbeat_interval_seconds": result.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
+            "profile_report_interval_seconds": result.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
         }
         # Only emitted while an admin-set override is pending; the stored value is
         # never echoed back, so a freshly re-provisioned device keeps its own expiry.
         if result.get("expires_at") is not None:
             response["expires_at"] = result["expires_at"]
         return self.json(response)
+
+
+class CasaDeviceProfileReportView(HomeAssistantView):
+    """Device-authenticated endpoint for a device to self-report its current
+    provisioning/profile state, so the admin panel can show what a specific
+    device is actually running (there is no other durable source of this —
+    provisioning never learns a device's id, see _provision_internal)."""
+
+    url = "/api/casa/profile_report"
+    name = "api:casa:profile_report"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user:
+            return self.json({"error": "Unauthorized"}, status_code=401)
+
+        try:
+            data = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = str(data.get("device_id", "")).strip()
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        fields = data.get("fields")
+        if not isinstance(fields, dict):
+            return self.json({"error": "Missing or invalid 'fields' object"}, status_code=400)
+
+        # Devices only ever report live settings; filtering here makes device
+        # records self-cleaning by construction and keeps a buggy client from
+        # injecting arbitrary keys into admin-panel-rendered state.
+        fields = {k: v for k, v in fields.items() if k in LIVE_PROVISIONING_FIELDS}
+
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_info, _uid, _username = _find_device_record(stored_data, device_id)
+        if device_info is None:
+            return self.json({"error": "Device not found"}, status_code=404)
+
+        device_info["provisioning_fields"] = fields
+        device_info["provisioning_reported_at"] = dt_util.now().isoformat()
+        device_info["provisioning_pending_push"] = False
+
+        store = self.hass.data[DOMAIN]["store"]
+        store.async_delay_save(lambda: stored_data, 2.0)
+
+        return self.json({"status": "success"})
 
 
 class CasaAdminSummaryView(HomeAssistantView):
@@ -564,6 +663,12 @@ class CasaAdminSummaryView(HomeAssistantView):
                     "expires_at_override_set_at": dinfo.get("expires_at_override_set_at"),
                     "pending_updates": len(qu_updates.get(did, [])),
                     "pending_update_list": _pending(did),
+                    "provisioning_fields": dinfo.get("provisioning_fields", {}),
+                    "provisioning_reported_at": dinfo.get("provisioning_reported_at"),
+                    "custom_provisioning": bool(dinfo.get("custom_provisioning", False)),
+                    "provisioning_pending_push": bool(dinfo.get("provisioning_pending_push", False)),
+                    "provisioning_profile_id": dinfo.get("provisioning_profile_id"),
+                    "provisioning_profile_name": dinfo.get("provisioning_profile_name"),
                 })
 
         # Native devices (HA users not managed by the integration).
@@ -598,6 +703,12 @@ class CasaAdminSummaryView(HomeAssistantView):
                         "expires_at_override_set_at": dinfo.get("expires_at_override_set_at"),
                         "pending_updates": len(qu_updates.get(did, [])),
                         "pending_update_list": _pending(did),
+                        "provisioning_fields": dinfo.get("provisioning_fields", {}),
+                        "provisioning_reported_at": dinfo.get("provisioning_reported_at"),
+                        "custom_provisioning": bool(dinfo.get("custom_provisioning", False)),
+                        "provisioning_pending_push": bool(dinfo.get("provisioning_pending_push", False)),
+                        "provisioning_profile_id": dinfo.get("provisioning_profile_id"),
+                        "provisioning_profile_name": dinfo.get("provisioning_profile_name"),
                     })
 
         accounts = []
@@ -616,6 +727,9 @@ class CasaAdminSummaryView(HomeAssistantView):
         return self.json({
             "site_id": stored_data.get("site_id"),
             "device_key_id": _device_key_id(device_key) if device_key else None,
+            "require_device_alias": bool(stored_data.get("require_device_alias", False)),
+            "heartbeat_interval_seconds": stored_data.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
+            "profile_report_interval_seconds": stored_data.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
             "stats": {
                 "devices": len(devices),
                 "managed_users": len(accounts),
@@ -778,7 +892,7 @@ class CasaAdminDeviceView(HomeAssistantView):
         # Fields are updated only when present in the body, so callers can set
         # one without clobbering the others.
         if "alias" in body:
-            device_info["alias"] = str(body.get("alias") or "").strip()
+            device_info["alias"] = str(body.get("alias") or "").strip()[:DEVICE_ALIAS_MAX_LEN]
 
         if "expires_at_override" in body:
             value = body.get("expires_at_override")
@@ -791,6 +905,38 @@ class CasaAdminDeviceView(HomeAssistantView):
                     return self.json({"error": "expires_at_override must be >= 0"}, status_code=400)
             _set_expiry_override(stored_data, device_id, value)
 
+        # "Force Device Changes": an admin-authored off-profile edit for this
+        # device only. Pushed through the same encrypted profile-update
+        # pipeline shared profile pushes use (update_type "profile", profile_id
+        # None) — the app already knows how to apply this exact envelope, so
+        # no app-side changes are needed for the edit to take effect.
+        pushed = False
+        if "provisioning_fields" in body:
+            fields = body.get("provisioning_fields")
+            if not isinstance(fields, dict):
+                return self.json({"error": "provisioning_fields must be an object"}, status_code=400)
+
+            # Only live device settings may be stored or pushed post-provision;
+            # process-scope keys (password, pin, timeout_minutes, ...) are
+            # dropped even if an older panel or manual API client sends them.
+            fields = {k: v for k, v in fields.items() if k in LIVE_PROVISIONING_FIELDS}
+
+            device_info["provisioning_fields"] = fields
+            device_info["custom_provisioning"] = True
+            device_info["provisioning_pending_push"] = True
+
+            qu_data = self.hass.data[DOMAIN]["qu_data"]
+            session = async_get_clientsession(self.hass)
+            created_by = user.name or user.id
+            payload = {"profile_id": None, "name": "Custom device settings", "fields": fields}
+            _update_id, pushed, _skipped = await _enqueue_and_push_update(
+                stored_data, qu_data, session, device_id, device_info,
+                "profile", "update", payload, created_by, send_push=True,
+            )
+            qu_store = self.hass.data[DOMAIN]["qu_store"]
+            qu_store.async_delay_save(lambda: qu_data, 2.0)
+            await _nudge_device_checkin(session, stored_data, device_info)
+
         # Save store
         store = self.hass.data[DOMAIN]["store"]
         store.async_delay_save(lambda: stored_data, 2.0)
@@ -802,6 +948,240 @@ class CasaAdminDeviceView(HomeAssistantView):
             "expires_at": device_info.get("expires_at"),
             "expires_at_override": device_info.get("expires_at_override"),
             "expires_at_override_set_at": device_info.get("expires_at_override_set_at"),
+            "provisioning_fields": device_info.get("provisioning_fields", {}),
+            "custom_provisioning": bool(device_info.get("custom_provisioning", False)),
+            "provisioning_pending_push": bool(device_info.get("provisioning_pending_push", False)),
+            "pushed": pushed,
+        })
+
+
+class CasaAdminSettingsView(HomeAssistantView):
+    """Admin-only GET/PUT for site-wide settings stored on the main casa store."""
+
+    url = "/api/casa/admin/settings"
+    name = "api:casa:admin:settings"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        return self.json({
+            "require_device_alias": bool(stored_data.get("require_device_alias", False)),
+            "heartbeat_interval_seconds": stored_data.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
+            "profile_report_interval_seconds": stored_data.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
+        })
+
+    async def put(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+
+        if "require_device_alias" in body:
+            stored_data["require_device_alias"] = bool(body.get("require_device_alias"))
+
+        if "heartbeat_interval_seconds" in body:
+            try:
+                interval = int(body.get("heartbeat_interval_seconds"))
+            except (TypeError, ValueError):
+                return self.json({"error": "heartbeat_interval_seconds must be an integer"}, status_code=400)
+            if not (MIN_HEARTBEAT_INTERVAL_SECONDS <= interval <= MAX_HEARTBEAT_INTERVAL_SECONDS):
+                return self.json(
+                    {"error": f"heartbeat_interval_seconds must be between {MIN_HEARTBEAT_INTERVAL_SECONDS} and {MAX_HEARTBEAT_INTERVAL_SECONDS}"},
+                    status_code=400,
+                )
+            stored_data["heartbeat_interval_seconds"] = interval
+
+        if "profile_report_interval_seconds" in body:
+            try:
+                report_interval = int(body.get("profile_report_interval_seconds"))
+            except (TypeError, ValueError):
+                return self.json({"error": "profile_report_interval_seconds must be an integer"}, status_code=400)
+            if not (MIN_PROFILE_REPORT_INTERVAL_SECONDS <= report_interval <= MAX_PROFILE_REPORT_INTERVAL_SECONDS):
+                return self.json(
+                    {"error": f"profile_report_interval_seconds must be between {MIN_PROFILE_REPORT_INTERVAL_SECONDS} and {MAX_PROFILE_REPORT_INTERVAL_SECONDS}"},
+                    status_code=400,
+                )
+            stored_data["profile_report_interval_seconds"] = report_interval
+
+        store = self.hass.data[DOMAIN]["store"]
+        store.async_delay_save(lambda: stored_data, 2.0)
+
+        return self.json({
+            "status": "ok",
+            "require_device_alias": bool(stored_data.get("require_device_alias", False)),
+            "heartbeat_interval_seconds": stored_data.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
+            "profile_report_interval_seconds": stored_data.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
+        })
+
+
+class CasaAdminSessionsView(HomeAssistantView):
+    """Admin-only listing/revocation of HA refresh tokens (login sessions)."""
+
+    url = "/api/casa/admin/sessions"
+    name = "api:casa:admin:sessions"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        current_token_id = request.get("hass_refresh_token_id")
+        stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data", {})
+
+        # Correlate refresh tokens to casa device records so the panel can
+        # show which session belongs to which device.
+        token_devices = {}
+        casa_users = {}
+        for uid, udata in stored_data.get("users", {}).items():
+            if udata.get("deleted", False):
+                continue
+            casa_users[uid] = udata
+            for did, dinfo in udata.get("devices", {}).items():
+                rtid = dinfo.get("refresh_token_id")
+                if rtid:
+                    token_devices[rtid] = {"device_id": did, "alias": dinfo.get("alias", "")}
+        for uid, devs in stored_data.get("native_devices", {}).items():
+            for did, dinfo in devs.items():
+                rtid = dinfo.get("refresh_token_id")
+                if rtid:
+                    token_devices[rtid] = {"device_id": did, "alias": dinfo.get("alias", "")}
+
+        users_out = []
+        for ha_user in await self.hass.auth.async_get_users():
+            if ha_user.system_generated:
+                continue
+
+            sessions = []
+            for token in ha_user.refresh_tokens.values():
+                if getattr(token, "token_type", "normal") == "system":
+                    continue
+                created_at = getattr(token, "created_at", None)
+                last_used_at = getattr(token, "last_used_at", None)
+                device = token_devices.get(token.id, {})
+                sessions.append({
+                    "token_id": token.id,
+                    "token_suffix": token.id[-12:],
+                    "client_name": getattr(token, "client_name", None),
+                    "client_id": getattr(token, "client_id", None),
+                    "token_type": getattr(token, "token_type", None),
+                    "created_at": created_at.isoformat() if created_at else None,
+                    "last_used_at": last_used_at.isoformat() if last_used_at else None,
+                    "last_used_ip": getattr(token, "last_used_ip", None),
+                    "expire_at": getattr(token, "expire_at", None),
+                    "is_current": token.id == current_token_id,
+                    "device_id": device.get("device_id"),
+                    "device_alias": device.get("alias"),
+                })
+            sessions.sort(key=lambda s: s.get("last_used_at") or "", reverse=True)
+
+            casa_record = casa_users.get(ha_user.id)
+            users_out.append({
+                "user_id": ha_user.id,
+                "name": ha_user.name or ha_user.id,
+                "username": casa_record.get("username") if casa_record else None,
+                "casa_managed": casa_record is not None,
+                "is_owner": bool(getattr(ha_user, "is_owner", False)),
+                "is_active": bool(getattr(ha_user, "is_active", True)),
+                "session_count": len(sessions),
+                "sessions": sessions,
+            })
+
+        users_out.sort(key=lambda u: (not u["casa_managed"], (u["name"] or "").casefold()))
+
+        return self.json({
+            "current_token_id": current_token_id,
+            "users": users_out,
+        })
+
+    async def delete(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        user_id = request.query.get("user_id", "").strip()
+        token_id = request.query.get("token_id", "").strip()
+        if not user_id or not token_id:
+            return self.json({"error": "user_id and token_id are required"}, status_code=400)
+
+        target = await self.hass.auth.async_get_user(user_id)
+        if not target:
+            return self.json({"error": "User not found"}, status_code=404)
+
+        token = target.refresh_tokens.get(token_id)
+        if not token:
+            return self.json({"error": "Session not found"}, status_code=404)
+
+        self.hass.auth.async_remove_refresh_token(token)
+        _LOGGER.info(
+            "CASA: Session '%s' revoked for %s by %s.",
+            token_id[-12:], target.name, user.name,
+        )
+
+        return self.json({
+            "status": "ok",
+            "revoked": token_id,
+            "was_current": token_id == request.get("hass_refresh_token_id"),
+        })
+
+
+class CasaAdminCheckUsernameView(HomeAssistantView):
+    """Admin-only availability check for a prospective guest username/name.
+
+    Checks both HA display names (what create_user rejects on) and
+    homeassistant-provider credential usernames (what add_auth would
+    crash on) so the panel can warn before attempting account creation.
+    """
+
+    url = "/api/casa/admin/check_username"
+    name = "api:casa:admin:check_username"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        username = request.query.get("username", "").strip().casefold()
+        display_name = request.query.get("name", "").strip().casefold()
+        if not username and not display_name:
+            return self.json({"error": "username or name is required"}, status_code=400)
+
+        users = await self.hass.auth.async_get_users()
+
+        def _cred_usernames(u):
+            for cred in u.credentials:
+                if cred.auth_provider_type == "homeassistant":
+                    yield str(cred.data.get("username", "")).casefold()
+
+        username_conflict = bool(username) and any(
+            (u.name and u.name.casefold() == username) or username in _cred_usernames(u)
+            for u in users
+        )
+        name_conflict = bool(display_name) and any(
+            u.name and u.name.casefold() == display_name for u in users
+        )
+
+        return self.json({
+            "available": not (username_conflict or name_conflict),
+            "username_conflict": username_conflict,
+            "name_conflict": name_conflict,
         })
 
 
@@ -811,33 +1191,14 @@ class CasaProvisionProfilesView(HomeAssistantView):
     url = "/api/casa/admin/provision_profiles"
     name = "api:casa:admin:provision_profiles"
 
-    _DEFAULT_FIELDS = {
-        "host_url": "",
-        "username": "",
-        "password": "",
-        "pin": "",
-        "default_dashboard": "",
-        "welcome_url": "",
-        "immersive_level": "1",
-        "theme_color_mode": "inherit",
-        "custom_color": "#000000",
-        "deauthenticate_existing": False,
-        "allow_all_pages": False,
-        "allowed_pages": "",
-        "allowed_wifi": "",
-        "push_notifications": "false",
-        "allow_wireguard": False,
-        "wireguard_config": "",
-        "wireguard_excluded_wifi": "",
-        "wireguard_profile_id": "",
-        "timeout_minutes": 5,
-        "password_scramble": True,
-        "password_scramble_in": 0,
-        "expiration_hours": 336,
-        "connect_wifi_ssid": "",
-        "connect_wifi_password": "",
-        "cache_control_hours": "",
-    }
+    # Profiles persist only template-appropriate fields (live device settings
+    # + expiration_hours). One-time process inputs (username/password/pin,
+    # deauthenticate_existing, timeout_minutes, password_scramble*,
+    # connect_wifi_*) belong in casa.provision service_data, not in a saved
+    # profile. Legacy profiles created before this split may still carry
+    # process keys — put() merges rather than rewrites, so they persist and
+    # keep applying at provision time via get_field's profile fallback.
+    _DEFAULT_FIELDS = PROFILE_PROVISIONING_FIELDS
 
     def __init__(self, hass: HomeAssistant):
         self.hass = hass
@@ -1064,6 +1425,90 @@ class CasaProfileUpdatesView(HomeAssistantView):
         return self.json({"status": "ok", "remaining": len(remaining)})
 
 
+async def _send_push_to_relay(session, payload) -> bool:
+    for url in RELAY_URLS:
+        try:
+            async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return True
+                text = await resp.text()
+                _LOGGER.warning("CASA: Relay %s returned %s for push: %s", url, resp.status, text)
+                if resp.status < 500:
+                    return False
+        except Exception as err:
+            _LOGGER.warning("CASA: Failed to reach relay %s for push: %s", url, err)
+    return False
+
+
+async def _nudge_device_checkin(session, stored_data, device_info, command="request_heartbeat"):
+    """Best-effort, content-free silent push asking a device to check in
+    (heartbeat) right away instead of waiting for its next scheduled tick.
+    The actual state change already lives durably (qu_data queue /
+    stored_data) — this only accelerates the device noticing it. Nesting
+    the command under "data" is required: the relay's request schema only
+    declares a `data` field for caller-supplied extras, so anything sent as
+    a top-level key is silently dropped before it ever reaches APNs (see
+    the now-fixed casa_update/deprovision/wireguard_update payloads below).
+    No-ops if the device has no push_token; never raises."""
+    push_token = device_info.get("push_token")
+    if not push_token:
+        return False
+    payload = {
+        "title": "",
+        "message": "",
+        "target": push_token,
+        "site_id": stored_data.get("site_id"),
+        "site_key": stored_data.get("site_key"),
+        "data": {"command": command},
+    }
+    return await _send_push_to_relay(session, payload)
+
+
+async def _enqueue_and_push_update(stored_data, qu_data, session, device_id, device_info, update_type, action, payload, created_by, send_push=True):
+    """Enqueue a durable update for a device and optionally deliver it via an
+    encrypted silent push. Shared by CasaAdminQueueUpdateView (bulk/profile
+    pushes) and CasaAdminDeviceView's "Force Device Changes" (single-device
+    off-profile pushes) — both are just `profile`-shaped payloads pushed the
+    same way.
+
+    Returns (update_id, pushed, skipped). `skipped` means the push was
+    requested but couldn't be attempted (no push_token / device_key yet).
+    """
+    update_id = _enqueue_update(qu_data, device_id, update_type, action, payload, created_by)
+    pushed = False
+    skipped = False
+    if send_push:
+        device_key = stored_data.get("device_key")
+        push_token = device_info.get("push_token")
+        if not push_token or not device_key:
+            skipped = True
+        else:
+            inner = {"id": update_id, "type": update_type, "action": action, "payload": payload, "ts": int(time.time())}
+            try:
+                enc = _encrypt_push_payload(json.dumps(inner), device_key, device_id)
+            except Exception as e:
+                _LOGGER.error("CASA ERROR: Failed to encrypt queued update for device '%s': %s", device_id, e)
+                enc = None
+            if enc is not None:
+                ok = await _send_push_to_relay(session, {
+                    "target": push_token,
+                    "site_id": stored_data.get("site_id"),
+                    "site_key": stored_data.get("site_key"),
+                    "title": "",
+                    "message": "",
+                    "data": {
+                        "command": "casa_update",
+                        "encrypted": True,
+                        "update_payload": enc,
+                        "update_id": update_id,
+                        "device_key_id": _device_key_id(device_key),
+                    },
+                })
+                if ok:
+                    pushed = True
+    return update_id, pushed, skipped
+
+
 class CasaAdminQueueUpdateView(HomeAssistantView):
     """Admin-only endpoint to queue a profile/WireGuard update for a device.
 
@@ -1110,18 +1555,7 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
         return list(devices.items())
 
     async def _send_to_relay(self, session, payload) -> bool:
-        for url in RELAY_URLS:
-            try:
-                async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        return True
-                    text = await resp.text()
-                    _LOGGER.warning("CASA: Relay %s returned %s for queue_update push: %s", url, resp.status, text)
-                    if resp.status < 500:
-                        return False
-            except Exception as err:
-                _LOGGER.warning("CASA: Failed to reach relay %s for queue_update push: %s", url, err)
-        return False
+        return await _send_push_to_relay(session, payload)
 
     async def post(self, request):
         user = request.get("hass_user")
@@ -1178,43 +1612,30 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
 
         qu_data = self.hass.data[DOMAIN]["qu_data"]
         stored_data = self.hass.data[DOMAIN]["stored_data"]
-        device_key = stored_data.get("device_key")
         created_by = user.name or user.id
         session = async_get_clientsession(self.hass)
 
         queued = pushed = notified = skipped = 0
 
         for did, dinfo in targets:
-            update_id = _enqueue_update(qu_data, did, update_type, action, payload, created_by)
+            update_id, ok, skip = await _enqueue_and_push_update(
+                stored_data, qu_data, session, did, dinfo,
+                update_type, action, payload, created_by, send_push=send_update_push,
+            )
             queued += 1
+            if send_update_push:
+                if skip:
+                    skipped += 1
+                elif ok:
+                    pushed += 1
+                await _nudge_device_checkin(session, stored_data, dinfo)
+
+            # A real shared profile push re-hugs any device previously
+            # force-edited off-profile back onto shared management.
+            if update_type == "profile":
+                dinfo["custom_provisioning"] = False
 
             push_token = dinfo.get("push_token")
-
-            if send_update_push:
-                if not push_token or not device_key:
-                    skipped += 1
-                else:
-                    inner = {"id": update_id, "type": update_type, "action": action, "payload": payload, "ts": int(time.time())}
-                    try:
-                        enc = _encrypt_push_payload(json.dumps(inner), device_key, did)
-                    except Exception as e:
-                        _LOGGER.error("CASA ERROR: Failed to encrypt queued update for device '%s': %s", did, e)
-                        enc = None
-                    if enc is not None:
-                        ok = await self._send_to_relay(session, {
-                            "target": push_token,
-                            "site_id": stored_data.get("site_id"),
-                            "site_key": stored_data.get("site_key"),
-                            "command": "casa_update",
-                            "encrypted": True,
-                            "update_payload": enc,
-                            "update_id": update_id,
-                            "device_key_id": _device_key_id(device_key),
-                            "title": "",
-                            "message": "",
-                        })
-                        if ok:
-                            pushed += 1
 
             if notify_push:
                 if not push_token:
@@ -1278,9 +1699,11 @@ class CasaAdminRegenerateKeyView(HomeAssistantView):
     """Admin-only, non-destructive rotation of the site device_key.
 
     Unlike regenerate_site (which nukes the relay site and invalidates every
-    provisioned profile), this only rotates the push-encryption secret. Devices pick
-    up the new key on their next heartbeat; any push encrypted with the new key that
-    reaches a not-yet-updated device simply fails to decrypt and the device falls back
+    provisioned profile), this only rotates the push-encryption secret.
+    Every registered device is nudged to heartbeat immediately (see
+    _nudge_device_checkin below) so they pick up the new key as soon as
+    possible; any push encrypted with the new key that still reaches a
+    not-yet-updated device simply fails to decrypt and the device falls back
     to pulling the plaintext update from /api/casa/profile_updates.
     """
 
@@ -1302,6 +1725,15 @@ class CasaAdminRegenerateKeyView(HomeAssistantView):
 
         key_id = _device_key_id(stored_data["device_key"])
         _LOGGER.info("CASA: Rotated site device_key (new id=%s) by %s.", key_id, user.name or user.id)
+
+        # Nudge every registered device to heartbeat now — the rotation
+        # affects all of them, not just one, and an earlier check-in means
+        # less time spent falling back to plaintext pulls with the old key.
+        session = async_get_clientsession(self.hass)
+        for udata in stored_data.get("users", {}).values():
+            for dinfo in udata.get("devices", {}).values():
+                await _nudge_device_checkin(session, stored_data, dinfo)
+
         return self.json({"status": "ok", "device_key_id": key_id})
 
 
@@ -1329,10 +1761,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if stored_data is None:
         stored_data = {"users": {}}
 
-    # Register the site with the relay once. The relay issues the site_key (never
-    # generated locally); we skip registration whenever we already hold one.
-    if not stored_data.get("site_key"):
-        await _register_site(hass, stored_data, store)
+    # Register the site with the relay once, verifying stored credentials against
+    # the relay so a stale site_key (relay lost the site) self-heals at startup.
+    await _ensure_site_registration(hass, stored_data, store)
 
     # Site-wide device_key: a 256-bit secret (64 hex chars) shared with provisioned
     # devices over the authenticated heartbeat and used to encrypt push payloads. It
@@ -1487,16 +1918,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         existing_reregister = devices.get(device_id, {}).get("needs_reregister", False)
         final_reregister = False if push_token is not None else existing_reregister
 
+        # Merge onto the existing record — this function is called on every
+        # re-registration (periodic push-registration check, relaunch,
+        # etc.), not just the first one. A wholesale replacement here would
+        # silently wipe alias, expires_at, provisioning_fields,
+        # custom_provisioning, and everything else not listed below.
+        existing_info = devices.get(device_id, {})
         devices[device_id] = {
+            **existing_info,
             "push_token": final_token,
-            "registered_at": devices.get(device_id, {}).get("registered_at", now_iso),
+            "registered_at": existing_info.get("registered_at", now_iso),
             "last_seen_at": now_iso,
             "last_12_token": final_last_12,
             "refresh_token_id": final_refresh_id,
             "ip_address": final_ip,
             "needs_reregister": final_reregister
         }
-        
+
+        # "Originally provisioned from" bridge — consume the pending record
+        # _provision_internal stashed by user_id (device_id wasn't known
+        # then). Ignore stale entries (abandoned code, unrelated later
+        # registration) past the same 30-min TTL _login_listener caps at.
+        pending_by_user = hass.data[DOMAIN].get("pending_profile_by_user", {})
+        pending = pending_by_user.pop(user_id, None)
+        if pending and (time.time() - pending.get("set_at", 0)) <= 1800:
+            devices[device_id]["provisioning_profile_id"] = pending.get("profile_id")
+            devices[device_id]["provisioning_profile_name"] = pending.get("profile_name")
+            # Alias typed at provision time; never overwrite one already set
+            # (same precedence as the heartbeat's device-submitted alias).
+            pending_alias = str(pending.get("device_alias") or "").strip()
+            if pending_alias and not str(devices[device_id].get("alias") or "").strip():
+                devices[device_id]["alias"] = pending_alias[:DEVICE_ALIAS_MAX_LEN]
+
         store.async_delay_save(lambda: stored_data, 2.0)
         
         # Register in Home Assistant Device Registry if enabled
@@ -1535,7 +1988,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         current_url: str = None,
         app_version: str = None,
         wireguard_configured: bool = None,
-        wireguard_connected: bool = None
+        wireguard_connected: bool = None,
+        alias: str = None
     ) -> None:
         """Process heartbeat from a device."""
         if DOMAIN not in hass.data:
@@ -1592,6 +2046,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if wireguard_connected is not None:
             device_info["wireguard_connected"] = wireguard_connected
 
+        # A user-submitted alias is accepted only while the stored alias is
+        # empty — an admin-set alias always wins and is never overwritten.
+        if alias is not None:
+            cleaned = alias.strip()[:DEVICE_ALIAS_MAX_LEN]
+            if cleaned and not (device_info.get("alias") or "").strip():
+                device_info["alias"] = cleaned
+                _LOGGER.info("CASA: Device '%s' set its alias via heartbeat.", device_id)
+
         device_info["last_seen_at"] = now_iso
 
         # Reconcile any admin-set expiration override. The app applies a returned
@@ -1603,6 +2065,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # device's normal heartbeat for confirmation.
         pending_expiry = None
         override = device_info.get("expires_at_override")
+        if override is not None and provisioned_at is not None:
+            # A re-provision supersedes any override set before it. The override
+            # targeted the previous session (and likely already expired it); the
+            # device can never confirm a past-dated override because it wipes
+            # itself immediately on applying one, so without this guard the
+            # pending override re-expires every fresh session in a loop.
+            set_at = dt_util.parse_datetime(device_info.get("expires_at_override_set_at") or "")
+            reported = dt_util.parse_datetime(str(provisioned_at))
+            try:
+                superseded = set_at is not None and reported is not None and reported > set_at
+            except TypeError:  # naive/aware mismatch — don't guess, keep the override
+                superseded = False
+            if superseded:
+                device_info.pop("expires_at_override", None)
+                device_info.pop("expires_at_override_set_at", None)
+                device_info.pop("expires_at_override_sent", None)
+                override = None
+                _LOGGER.info(
+                    "CASA: Device '%s' was re-provisioned after its expiration override was set — dropping stale override.",
+                    device_id,
+                )
         if override is not None:
             if override == 0 and expires_at is None and device_info.get("expires_at_override_sent"):
                 device_info["expires_at"] = 0
@@ -1651,6 +2134,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         result = {
             "reregister": bool(device_info.get("needs_reregister", False)),
             "updates": has_updates,
+            "require_alias": bool(stored_data.get("require_device_alias", False)),
+            "has_alias": bool((device_info.get("alias") or "").strip()),
+            "heartbeat_interval_seconds": stored_data.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
+            "profile_report_interval_seconds": stored_data.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
         }
         if pending_expiry is not None:
             result["expires_at"] = pending_expiry
@@ -1659,10 +2146,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register the HTTP views
     hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
     hass.http.register_view(CasaHeartbeatView(hass, async_heartbeat))
+    hass.http.register_view(CasaDeviceProfileReportView(hass))
     hass.http.register_view(CasaAdminSummaryView(hass))
     hass.http.register_view(CasaWireGuardProfilesView(hass))
     hass.http.register_view(CasaProvisionProfilesView(hass))
     hass.http.register_view(CasaAdminDeviceView(hass))
+    hass.http.register_view(CasaAdminSettingsView(hass))
+    hass.http.register_view(CasaAdminSessionsView(hass))
+    hass.http.register_view(CasaAdminCheckUsernameView(hass))
     hass.http.register_view(CasaProfileUpdatesView(hass))
     hass.http.register_view(CasaAdminQueueUpdateView(hass))
     hass.http.register_view(CasaAdminRegenerateKeyView(hass))
@@ -1828,9 +2319,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # 1. Resolve Profile data if present
         profile_key = str(service_data.get("profile", "")).strip()
         profile_fields = {}
+        matched_profile = None
         if profile_key:
             pp_data = hass.data.get(DOMAIN, {}).get("pp_data", {"profiles": []})
-            matched_profile = None
             for p in pp_data.get("profiles", []):
                 if p.get("id") == profile_key or p.get("name") == profile_key:
                     matched_profile = p
@@ -1876,15 +2367,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("CASA ERROR: Missing mandatory host_url or username.")
             return {"error": "Missing mandatory fields"}
 
-        if method == "ble":
-            esphome_services_input = service_data.get("esphome_service", [])
-            if isinstance(esphome_services_input, list):
-                esphome_targets = [str(s).strip() for s in esphome_services_input if str(s).strip()]
-            else:
-                esphome_targets = [str(esphome_services_input).strip()] if str(esphome_services_input).strip() else []
-            if not esphome_targets:
-                _LOGGER.error("CASA ERROR: Missing mandatory ESPHome services for BLE method.")
-                return {"error": "Missing ESPHome Services"}
+        # BLE targets are accepted with any method — a QR/deep-link provision
+        # may broadcast a beacon alongside. Only method="ble" requires them.
+        esphome_services_input = service_data.get("esphome_service", [])
+        if isinstance(esphome_services_input, list):
+            esphome_targets = [str(s).strip() for s in esphome_services_input if str(s).strip()]
+        else:
+            esphome_targets = [str(esphome_services_input).strip()] if str(esphome_services_input).strip() else []
+        if method == "ble" and not esphome_targets:
+            _LOGGER.error("CASA ERROR: Missing mandatory ESPHome services for BLE method.")
+            return {"error": "Missing ESPHome Services"}
 
         target_pin = str(get_field("pin", "")).strip()[:6]
         connect_wifi_ssid = str(get_field("connect_wifi_ssid", "")).strip()
@@ -1902,6 +2394,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 allowed_paths_str = ",".join(clean_paths)
             else:
                 allowed_paths_str = str(allowed_pages_input).strip()
+
+        require_alias = bool(get_field("require_alias", False))
 
         allowed_wifi_input = get_field("allowed_wifi", [])
         if isinstance(allowed_wifi_input, list):
@@ -1968,13 +2462,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         if users is None:
             users = await hass.auth.async_get_users()
-        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
-        if not target_user: 
+        # Display-name match first (historic behavior), then fall back to the
+        # homeassistant-provider credential username — accounts created with
+        # name != username (e.g. guided flow names the user after the device)
+        # are only reachable by their login username.
+        def _matches_target(u):
+            if u.name and u.name.casefold() == target_username.casefold():
+                return True
+            return any(
+                cred.auth_provider_type == "homeassistant"
+                and str(cred.data.get("username", "")).casefold() == target_username.casefold()
+                for cred in u.credentials
+            )
+        target_user = next((u for u in users if _matches_target(u)), None)
+        if not target_user:
             return {"error": "User not found"}
 
         if getattr(target_user, "is_admin", False):
             _LOGGER.error("CASA ERROR: Attempted to provision an admin user '%s'. Blocked.", target_username)
             return {"error": "Cannot provision an admin user"}
+
+        # Bridge for the device-editor's "Originally provisioned from" display.
+        # The device_id doesn't exist yet at provision time (see
+        # async_register_device below) — stash which profile (if any) was
+        # used, keyed by the one thing both moments share: the HA user_id.
+        # In-memory only (like timers/listeners below); self-heals on the
+        # next provision if lost to a reload.
+        hass.data[DOMAIN].setdefault("pending_profile_by_user", {})[target_user.id] = {
+            "profile_id": profile_key or None,
+            "profile_name": matched_profile.get("name") if matched_profile else None,
+            "device_alias": str(service_data.get("device_alias", "")).strip()[:DEVICE_ALIAS_MAX_LEN] or None,
+            "set_at": time.time(),
+        }
 
         login_username = None
         for cred in target_user.credentials:
@@ -2119,6 +2638,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "cache_control_hours": cache_control_hours_str,
                 "allowed_pages": allowed_paths_str,
                 "allowed_wifi": allowed_wifi,
+                "require_alias": require_alias,
                 "push_notifications": normalized_push,
                 "wireguard": {
                     "allowed": normalized_wireguard == "true",
@@ -2174,7 +2694,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await hass.async_add_executor_job(create_qr_images, deep_link)
             _LOGGER.info("CASA: QR Code saved as %s.", final_filename)
 
-        elif method == "ble":
+        if esphome_targets:
             for target in esphome_targets:
                 try:
                     domain, service = target.split(".")
@@ -2303,10 +2823,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "site_id": bool(site_id),
                     "push_notifications": normalized_push,
                     "wireguard": bool(wireguard_config_raw) or normalized_wireguard == "true",
+                    "require_alias": require_alias,
                 },
             }
         elif method == "qr":
-            return {
+            result = {
                 "method": "qr",
                 "filename": final_filename,
                 "url_path": f"/local/{final_filename}",
@@ -2314,13 +2835,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "deep_link": deep_link,
                 "universal_link": universal_link
             }
+            if esphome_targets:
+                result["successful_targets"] = successful_targets
+                result["pin_required"] = bool(target_pin)
+            return result
         elif method == "deep_link":
-            return {
+            result = {
                 "method": "deep_link",
                 "deep_link": deep_link,
                 "universal_link": universal_link,
                 "expires_at": expiration_unix
             }
+            if esphome_targets:
+                result["successful_targets"] = successful_targets
+                result["pin_required"] = bool(target_pin)
+            return result
         else:
             return {
                 "method": "ble",
@@ -3008,7 +3537,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "target": push_token,
             "site_id": stored_data.get("site_id"),
             "site_key": stored_data.get("site_key"),
-            "command": "clear_cache_and_reload"
+            "data": {"command": "clear_cache_and_reload"}
         }
 
         _LOGGER.info(
@@ -3033,6 +3562,64 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         if not success:
             raise HomeAssistantError("Failed to deliver reload command to any Casa push relay.")
+
+        return {"status": "success"}
+
+    async def handle_request_device_report(call: ServiceCall):
+        """Silently ask a device to report its provisioning state right now,
+        instead of waiting for its next periodic self-report. Purely a nudge —
+        no cache-clear/reload side effects, unlike reload_device."""
+        device_id = str(call.data.get("device_id", "")).strip()
+        if not device_id:
+            raise HomeAssistantError("Missing device_id parameter.")
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        device_info, _uid, username = _find_device_record(stored_data, device_id)
+        if device_info is None:
+            raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
+
+        if not device_info.get("push_token"):
+            raise HomeAssistantError(f"No push notification token registered for device '{device_id}'.")
+
+        _LOGGER.info(
+            "CASA: Service called to request an on-demand profile report from device '%s' of user '%s'.",
+            device_id, username or "Unknown",
+        )
+
+        session = async_get_clientsession(hass)
+        success = await _nudge_device_checkin(session, stored_data, device_info, command="request_profile_report")
+        if not success:
+            raise HomeAssistantError("Failed to deliver profile report request to any Casa push relay.")
+
+        return {"status": "success"}
+
+    async def handle_request_heartbeat(call: ServiceCall):
+        """Silently ask a device to heartbeat right now, instead of waiting
+        for its next scheduled tick. Purely a nudge — the device's own
+        sendHeartbeat already pulls any durably-queued profile_updates when
+        the response says they're pending, so this is sufficient to make any
+        queued admin change land immediately."""
+        device_id = str(call.data.get("device_id", "")).strip()
+        if not device_id:
+            raise HomeAssistantError("Missing device_id parameter.")
+
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        device_info, _uid, username = _find_device_record(stored_data, device_id)
+        if device_info is None:
+            raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
+
+        if not device_info.get("push_token"):
+            raise HomeAssistantError(f"No push notification token registered for device '{device_id}'.")
+
+        _LOGGER.info(
+            "CASA: Service called to request an on-demand heartbeat from device '%s' of user '%s'.",
+            device_id, username or "Unknown",
+        )
+
+        session = async_get_clientsession(hass)
+        success = await _nudge_device_checkin(session, stored_data, device_info, command="request_heartbeat")
+        if not success:
+            raise HomeAssistantError("Failed to deliver heartbeat request to any Casa push relay.")
 
         return {"status": "success"}
 
@@ -3073,9 +3660,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         store.async_delay_save(lambda: stored_data, 2.0)
         _LOGGER.info(
-            "CASA: Expiration override for device '%s' set to %s (delivered on next heartbeat).",
+            "CASA: Expiration override for device '%s' set to %s.",
             device_id, "permanent" if value == 0 else value
         )
+        session = async_get_clientsession(hass)
+        await _nudge_device_checkin(session, stored_data, device_info)
         return {"status": "success", "device_id": device_id, "expires_at_override": value}
 
     async def handle_deprovision_device(call: ServiceCall):
@@ -3104,22 +3693,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "target": push_token,
                 "site_id": stored_data.get("site_id"),
                 "site_key": stored_data.get("site_key"),
-                "command": "deprovision"
+                "data": {"command": "deprovision"},
             }
             _LOGGER.info(
                 "CASA: Sending silent deprovision push to device '%s' of user '%s'. Target: %s",
                 device_id, username or "Unknown", push_token[:10] + "..."
             )
-            for url in RELAY_URLS:
-                try:
-                    async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
-                        if response.status == 200:
-                            push_sent = True
-                            break
-                        text = await response.text()
-                        _LOGGER.warning("CASA: Relay %s returned status %s: %s", url, response.status, text)
-                except Exception as err:
-                    _LOGGER.warning("CASA: Failed to connect to relay %s: %s", url, err)
+            push_sent = await _send_push_to_relay(session, payload)
             if not push_sent:
                 _LOGGER.warning(
                     "CASA: Deprovision push for device '%s' was not delivered; device will be wiped lazily on next contact.",
@@ -3277,27 +3857,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "target": push_token,
                 "site_id": stored_data.get("site_id"),
                 "site_key": stored_data.get("site_key"),
-                "command": command,
-                "encrypted": bool(encrypt_config),
-                "wireguard_payload": wg_payload,
-                "device_key_id": _device_key_id(device_key) if (encrypt_config and device_key) else None,
                 "title": "" if silent else title,
                 "message": "" if silent else message,
+                "data": {
+                    "command": command,
+                    "encrypted": bool(encrypt_config),
+                    "wireguard_payload": wg_payload,
+                    "device_key_id": _device_key_id(device_key) if (encrypt_config and device_key) else None,
+                },
             }
 
-            success = False
-            for url in RELAY_URLS:
-                try:
-                    async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
-                        if response.status == 200:
-                            success = True
-                            break
-                        text = await response.text()
-                        _LOGGER.warning("CASA: Relay %s returned status %s for wireguard %s on device '%s': %s", url, response.status, action, did, text)
-                        if response.status < 500:
-                            break
-                except Exception as err:
-                    _LOGGER.warning("CASA: Failed to connect to relay %s for wireguard %s on device '%s': %s", url, action, did, err)
+            success = await _send_push_to_relay(session, payload)
 
             if success:
                 sent_count += 1
@@ -3340,6 +3910,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.services.async_register(
         DOMAIN, "reload_device", handle_reload_device,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    hass.services.async_register(
+        DOMAIN, "request_device_report", handle_request_device_report,
+        supports_response=SupportsResponse.OPTIONAL
+    )
+
+    hass.services.async_register(
+        DOMAIN, "request_heartbeat", handle_request_heartbeat,
         supports_response=SupportsResponse.OPTIONAL
     )
 
@@ -3728,6 +4308,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "register_device")
     hass.services.async_remove(DOMAIN, "notify_user")
     hass.services.async_remove(DOMAIN, "reload_device")
+    hass.services.async_remove(DOMAIN, "request_device_report")
+    hass.services.async_remove(DOMAIN, "request_heartbeat")
     hass.services.async_remove(DOMAIN, "set_device_expiration")
     hass.services.async_remove(DOMAIN, "deprovision_device")
     hass.services.async_remove(DOMAIN, "delete_device")

@@ -78,11 +78,18 @@ export async function createApp({ host, loadModule, version }) {
   const ROUTES = [
     { pattern: ["devices"], view: "views/devices.js" },
     { pattern: ["accounts"], view: "views/accounts.js" },
+    { pattern: ["sessions"], view: "views/sessions.js" },
+    { pattern: ["profiles"], view: "views/profiles.js" },
+    { pattern: ["wireguard"], view: "views/wireguard-profiles.js" },
     { pattern: ["devices", ":deviceId"], view: "views/device-editor.js" },
     { pattern: ["profiles", "new"], view: "views/profile-editor.js" },
     { pattern: ["profiles", ":profileId"], view: "views/profile-editor.js" },
     { pattern: ["settings"], view: "views/settings.js" },
     { pattern: ["settings", ":tab"], view: "views/settings.js" },
+    { pattern: ["provision"], view: "views/provision.js" },
+    { pattern: ["provision", "guided"], view: "views/provision-guided.js" },
+    { pattern: ["provision", "user", ":username"], view: "views/provision.js" },
+    { pattern: ["provision", "profile", ":profileId"], view: "views/provision.js" },
     { pattern: [], view: "views/devices.js" }, // default = device list
   ];
 

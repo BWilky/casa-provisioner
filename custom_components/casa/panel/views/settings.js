@@ -69,6 +69,52 @@ export function createView(app) {
           <button class="btn btn--outlined" id="st-rotate-key">Rotate Encryption Key</button>
         </div>
       </div>
+      <div class="card section-card">
+        <div class="card__body">
+          <h5>Require device alias</h5>
+          <p class="muted" style="font-size:13px; margin:0 0 12px;">
+            When enabled, every provisioned device without an alias blocks the user with a
+            name prompt until one is provided (delivered on the next heartbeat). Admin-set
+            aliases satisfy it. Can also be enforced per provisioning profile.
+          </p>
+          <label class="toggle">
+            <input type="checkbox" id="st-require-alias" ${summary.require_device_alias ? "checked" : ""}>
+            <span>Require an alias on every device</span>
+          </label>
+        </div>
+      </div>
+      <div class="card section-card">
+        <div class="card__body">
+          <h5>Heartbeat interval</h5>
+          <p class="muted" style="font-size:13px; margin:0 0 12px;">
+            How often (in seconds) provisioned devices check in with this site.
+            Applied on each device's next heartbeat — no re-provisioning
+            required. Default 300s (5 min).
+          </p>
+          <div class="field-row">
+            <input type="number" class="input" id="st-heartbeat-interval" min="60" max="3600" step="1"
+              value="${esc(summary.heartbeat_interval_seconds || 300)}" style="max-width:140px; flex:none;">
+            <span class="muted">seconds (60–3600)</span>
+          </div>
+        </div>
+      </div>
+      <div class="card section-card">
+        <div class="card__body">
+          <h5>Profile report interval</h5>
+          <p class="muted" style="font-size:13px; margin:0 0 12px;">
+            How often (in seconds) devices self-report their provisioning
+            details to this site, for the per-device Provisioning view.
+            Applied on the device's next heartbeat. Default 3600s (1 hour).
+            Use "Refresh Now" on a device's Provisioning tab for an immediate,
+            out-of-cycle report.
+          </p>
+          <div class="field-row">
+            <input type="number" class="input" id="st-profile-report-interval" min="300" max="86400" step="1"
+              value="${esc(summary.profile_report_interval_seconds || 3600)}" style="max-width:140px; flex:none;">
+            <span class="muted">seconds (300–86400)</span>
+          </div>
+        </div>
+      </div>
       <div class="danger-zone">
         <h5>Regenerate Site ID</h5>
         <p class="muted" style="font-size:13px; margin:0 0 12px;">
@@ -84,6 +130,66 @@ export function createView(app) {
     }
     refs.form.querySelector("#st-rotate-key").addEventListener("click", rotateKey);
     refs.form.querySelector("#st-regen-site").addEventListener("click", confirmRegenerateSite);
+    refs.form.querySelector("#st-require-alias").addEventListener("change", toggleRequireAlias);
+    refs.form.querySelector("#st-heartbeat-interval").addEventListener("change", updateHeartbeatInterval);
+    refs.form.querySelector("#st-profile-report-interval").addEventListener("change", updateProfileReportInterval);
+  }
+
+  async function toggleRequireAlias(e) {
+    const input = e.currentTarget;
+    const value = input.checked;
+    input.disabled = true;
+    try {
+      await api.updateSettings({ require_device_alias: value });
+      ui.toast(value ? "Device alias is now required." : "Device alias requirement disabled.");
+      app.refresh(); // summary re-render restores the toggle state
+    } catch (err) {
+      ui.toast("Failed to update setting: " + ((err && err.message) || err), { error: true });
+      input.checked = !value;
+      input.disabled = false;
+    }
+  }
+
+  async function updateHeartbeatInterval(e) {
+    const input = e.currentTarget;
+    const previous = (app.summary() || {}).heartbeat_interval_seconds || 300;
+    const value = parseInt(input.value, 10);
+    if (!Number.isFinite(value) || value < 60 || value > 3600) {
+      ui.toast("Heartbeat interval must be between 60 and 3600 seconds.", { error: true });
+      input.value = previous;
+      return;
+    }
+    input.disabled = true;
+    try {
+      await api.updateSettings({ heartbeat_interval_seconds: value });
+      ui.toast(`Heartbeat interval updated to ${value}s.`);
+      app.refresh(); // summary re-render restores the field
+    } catch (err) {
+      ui.toast("Failed to update setting: " + ((err && err.message) || err), { error: true });
+      input.value = previous;
+      input.disabled = false;
+    }
+  }
+
+  async function updateProfileReportInterval(e) {
+    const input = e.currentTarget;
+    const previous = (app.summary() || {}).profile_report_interval_seconds || 3600;
+    const value = parseInt(input.value, 10);
+    if (!Number.isFinite(value) || value < 300 || value > 86400) {
+      ui.toast("Profile report interval must be between 300 and 86400 seconds.", { error: true });
+      input.value = previous;
+      return;
+    }
+    input.disabled = true;
+    try {
+      await api.updateSettings({ profile_report_interval_seconds: value });
+      ui.toast(`Profile report interval updated to ${value}s.`);
+      app.refresh(); // summary re-render restores the field
+    } catch (err) {
+      ui.toast("Failed to update setting: " + ((err && err.message) || err), { error: true });
+      input.value = previous;
+      input.disabled = false;
+    }
   }
 
   async function rotateKey(e) {

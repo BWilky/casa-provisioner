@@ -262,6 +262,9 @@ export function createView(app) {
           <div class="tabs">
             <button class="tab" id="ac-tab-devices">Devices</button>
             <button class="tab tab--active">Accounts</button>
+            <button class="tab" id="ac-tab-sessions">Sessions</button>
+            <button class="tab" id="ac-tab-profiles">Provision Profiles</button>
+            <button class="tab" id="ac-tab-wireguard">WireGuard Profiles</button>
           </div>
           <div class="list-toolbar">
             <div class="search-field">
@@ -291,6 +294,9 @@ export function createView(app) {
         }, 150);
       });
       el.querySelector("#ac-tab-devices").addEventListener("click", () => app.navigate("/"));
+      el.querySelector("#ac-tab-sessions").addEventListener("click", () => app.navigate("/sessions"));
+      el.querySelector("#ac-tab-profiles").addEventListener("click", () => app.navigate("/profiles"));
+      el.querySelector("#ac-tab-wireguard").addEventListener("click", () => app.navigate("/wireguard"));
       el.querySelector("#ac-create").addEventListener("click", openCreateModal);
       refs.results.addEventListener("click", onResultsClick);
 

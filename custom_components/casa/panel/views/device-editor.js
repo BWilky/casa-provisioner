@@ -13,7 +13,8 @@ const RECORD_KEYS = [
   "refresh_token_id", "app_version", "wireguard_configured",
   "wireguard_connected", "current_url", "provisioned_at", "expires_at",
   "expires_at_override", "expires_at_override_set_at", "pending_updates",
-  "pending_update_list",
+  "pending_update_list", "provisioning_fields", "provisioning_reported_at",
+  "custom_provisioning", "provisioning_pending_push",
 ];
 
 function orderedRecord(d) {
@@ -161,16 +162,21 @@ export function createView(app) {
   let device = null;
   let host = null; // .page--flush container
   let shellMod = null; // editor-shell module
+  let fieldsMod = null; // profile-fields.js — shared field schema/renderer, loaded lazily
+  let fieldsModLoading = false;
   let shell = null; // editor shell handle
   let active = "overview";
   let wgProfiles = null; // null = not loaded yet (loaded lazily, once)
   let wgLoading = false;
   let ppProfiles = null;
   let ppLoading = false;
+  let provisioningEditing = false; // "Force Device Changes" active?
+  let provisioningDraft = null; // editable copy of provisioning fields while editing
+  let provisioningSubSection = "connection"; // sub-nav within the Provisioning section
   let msgs = freshMsgs();
 
   function freshMsgs() {
-    return { alias: {}, session: {}, push: {}, vpn: {}, updates: {}, pending: {}, danger: {} };
+    return { alias: {}, session: {}, push: {}, vpn: {}, updates: {}, pending: {}, danger: {}, provisioning: {} };
   }
 
   /* ----- pure helpers ----- */
@@ -241,6 +247,19 @@ export function createView(app) {
       });
   }
 
+  function ensureFieldsMod() {
+    if (fieldsMod || fieldsModLoading) return;
+    fieldsModLoading = true;
+    app
+      .loadModule("views/profile-fields.js")
+      .then((mod) => { fieldsMod = mod; })
+      .catch(() => { /* renderProvisioning shows a fallback while fieldsMod is null */ })
+      .finally(() => {
+        fieldsModLoading = false;
+        if (mounted && active === "provisioning") renderSection();
+      });
+  }
+
   /* ----- shell / lifecycle plumbing ----- */
 
   function handleMissing() {
@@ -288,6 +307,7 @@ export function createView(app) {
       navHint: "Changes apply directly to this device record.",
       sections: [
         { id: "overview", label: "Overview", icon: "mdi:cellphone" },
+        { id: "provisioning", label: "Provisioning", icon: "mdi:clipboard-text-outline" },
         { id: "session", label: "Session & Expiration", icon: "mdi:timer-sand" },
         { id: "push", label: "Push & Notifications", icon: "mdi:bell-outline" },
         { id: "vpn", label: "VPN / WireGuard", icon: "mdi:shield-lock-outline" },
@@ -317,6 +337,7 @@ export function createView(app) {
 
   function updateNavBadges() {
     if (!shell) return;
+    shell.setBadge("provisioning", device.custom_provisioning ? "custom" : null, "badge--pending");
     shell.setBadge("session", device.expires_at_override != null ? "pending" : null, "badge--pending");
     shell.setBadge(
       "updates",
@@ -342,6 +363,7 @@ export function createView(app) {
     if (!shell || !mounted) return;
     const RENDERERS = {
       overview: renderOverview,
+      provisioning: renderProvisioning,
       session: renderSession,
       push: renderPush,
       vpn: renderVpn,
@@ -444,6 +466,181 @@ export function createView(app) {
       msgs.alias = { error: "Failed: " + ((err && err.message) || err) };
     }
     if (mounted && active === "overview") renderSection();
+  }
+
+  // Read-only by default, sourced from the device's self-reported state (the
+  // only durable source of "what this device actually has" — see
+  // CasaDeviceProfileReportView). "Force Device Changes" swaps into an
+  // editable copy of the same fields/markup the shared provisioning-profile
+  // editor uses (profile-fields.js) — saving pushes an off-profile override
+  // straight to this one device.
+  function renderProvisioning() {
+    const d = device;
+    ensureFieldsMod();
+    if (!fieldsMod) {
+      shell.formEl.innerHTML = `
+        <h2>Provisioning</h2>
+        <p class="editor__form-desc">What this specific device is currently configured with.</p>
+        <div class="empty-state" style="padding:24px 0;"><span class="muted">Loading…</span></div>`;
+      return;
+    }
+    ensureWgProfiles(); // the Push & VPN group's wireguard_profile_id select wants this
+
+    // LIVE scope only: process-only settings (password, PIN, provisioning
+    // timeout, scramble, Wi-Fi join, ...) are one-time wizard inputs, not
+    // ongoing device state — they're neither shown here nor pushable.
+    const liveKeys = fieldsMod.LIVE_KEYS;
+    const baseline = {};
+    for (const key of liveKeys) {
+      baseline[key] =
+        d.provisioning_fields && d.provisioning_fields[key] !== undefined
+          ? d.provisioning_fields[key]
+          : fieldsMod.DEFAULTS[key];
+    }
+    const values = provisioningEditing ? provisioningDraft : baseline;
+    const hasReport = !!d.provisioning_reported_at;
+
+    const badge = d.custom_provisioning
+      ? '<span class="chip chip--warn">Custom settings (off-profile)</span>'
+      : '<span class="chip chip--ok">Following shared profile</span>';
+    const freshness = d.provisioning_pending_push
+      ? '<span class="badge badge--pending" title="Applied on the device\'s next heartbeat or refresh">Pending device confirmation</span>'
+      : hasReport
+        ? `<span class="muted" style="font-size:12px;">Live as of ${esc(ui.fmtTime(d.provisioning_reported_at))}</span>`
+        : '<span class="muted" style="font-size:12px;">Never reported yet — awaiting first check-in</span>';
+
+    // Captured at provision time (see async_register_device's
+    // pending_profile_by_user bridge) — best-effort; devices that predate
+    // this feature, or whose registration missed the 30-min pending window,
+    // simply won't have this and the line is omitted.
+    const provisionedFromHtml = d.provisioning_profile_name
+      ? `<div class="muted" style="font-size:12px; margin-top:6px;">Originally provisioned from: ${
+          d.provisioning_profile_id
+            ? `<a href="#" data-prov-profile-link="${esc(d.provisioning_profile_id)}" style="color:var(--casa-primary);">${esc(d.provisioning_profile_name)}</a>`
+            : esc(d.provisioning_profile_name)
+        }</div>`
+      : "";
+
+    const provSections = fieldsMod.sectionsFor(liveKeys);
+    // A previously-persisted sub-section (e.g. "wifi") may no longer exist
+    // under the live-only scope — snap to the first available one.
+    if (!provSections.some((s) => s.id === provisioningSubSection)) {
+      provisioningSubSection = provSections[0]?.id || "connection";
+    }
+    const subNav = provSections
+      .map(
+        (s) =>
+          `<button class="btn ${s.id === provisioningSubSection ? "btn--primary" : "btn--outlined"}" data-prov-tab="${esc(s.id)}" style="font-size:12px; padding:4px 10px; height:28px;">${esc(s.label)}</button>`
+      )
+      .join("");
+
+    const actionsHtml = provisioningEditing
+      ? `<button class="btn btn--text" id="dev-prov-cancel">Cancel</button>
+         <button class="btn btn--primary" id="dev-prov-save">Save &amp; Push to Device</button>`
+      : `<button class="btn btn--outlined" id="dev-prov-refresh">Refresh Now</button>
+         <button class="btn btn--danger-outlined" id="dev-prov-force">Force Device Changes</button>`;
+
+    // While waiting for the device's first self-report, showing the
+    // DEFAULTS-filled field form would look like real data — show a plain
+    // explanation instead. Force Device Changes still works in this state
+    // (it doesn't depend on a report having arrived), so editing mode
+    // always shows the real form regardless of report status.
+    const bodyHtml = !provisioningEditing && !hasReport
+      ? `<div class="empty-state" style="padding:24px 0;">
+           <ha-icon icon="mdi:clock-outline"></ha-icon>
+           <div>This device hasn't reported its provisioning details yet.</div>
+           <p class="field__help" style="max-width:420px; margin:8px auto 0;">
+             It will check in automatically on its next cycle, or use
+             "Refresh Now" below to request an immediate report.
+           </p>
+         </div>`
+      : `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">${subNav}</div>
+         <div id="dev-prov-fields">${fieldsMod.renderSectionHtml(provisioningSubSection, values, { readOnly: !provisioningEditing, wgProfiles: wgProfiles || [], esc, fields: liveKeys })}</div>`;
+
+    shell.formEl.innerHTML = `
+      <h2>Provisioning</h2>
+      <p class="editor__form-desc">What this specific device is currently configured with — read-only unless "Force Device Changes" is active.</p>
+      <div class="card section-card"><div class="card__body">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          ${badge}
+          ${freshness}
+        </div>
+        ${provisionedFromHtml}
+        ${provisioningEditing ? '<p class="field__help" style="margin:8px 0 0;">Editing takes this device off its shared profile — changes are pushed directly to it.</p>' : ""}
+      </div></div>
+      ${bodyHtml}
+      ${msgHtml(msgs.provisioning)}
+      <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">${actionsHtml}</div>`;
+
+    for (const btn of shell.formEl.querySelectorAll("[data-prov-tab]")) {
+      btn.addEventListener("click", () => {
+        provisioningSubSection = btn.dataset.provTab;
+        renderSection();
+      });
+    }
+
+    const profLink = shell.formEl.querySelector("[data-prov-profile-link]");
+    if (profLink) {
+      profLink.addEventListener("click", (e) => {
+        e.preventDefault();
+        app.navigate("/profiles/" + encodeURIComponent(profLink.dataset.provProfileLink));
+      });
+    }
+
+    if (provisioningEditing) {
+      fieldsMod.bindFieldEvents(shell.formEl.querySelector("#dev-prov-fields"), {
+        values: provisioningDraft,
+        readOnly: false,
+        onSectionRerender: () => renderSection(),
+      });
+      shell.formEl.querySelector("#dev-prov-save").addEventListener("click", saveProvisioning);
+      shell.formEl.querySelector("#dev-prov-cancel").addEventListener("click", () => {
+        provisioningEditing = false;
+        provisioningDraft = null;
+        msgs.provisioning = {};
+        renderSection();
+      });
+    } else {
+      shell.formEl.querySelector("#dev-prov-refresh").addEventListener("click", requestProvisioningRefresh);
+      shell.formEl.querySelector("#dev-prov-force").addEventListener("click", () => {
+        provisioningDraft = { ...baseline };
+        provisioningEditing = true;
+        msgs.provisioning = {};
+        renderSection();
+      });
+    }
+  }
+
+  async function saveProvisioning() {
+    msgs.provisioning = {};
+    try {
+      const fields = fieldsMod.collectFields(provisioningDraft, fieldsMod.LIVE_KEYS);
+      await api.updateDeviceProvisioning(device.device_id, fields);
+      ui.toast("Device settings force-pushed — this device is now off its shared profile.");
+      provisioningEditing = false;
+      provisioningDraft = null;
+      await app.refresh();
+    } catch (err) {
+      msgs.provisioning = { error: "Failed to save: " + ((err && err.message) || err) };
+    }
+    if (mounted && active === "provisioning") renderSection();
+  }
+
+  function requestProvisioningRefresh() {
+    ui.showConfirm({
+      title: "Refresh provisioning now",
+      message: `Ask "${displayName(device)}" to report its current provisioning state right now, instead of waiting for its next scheduled check-in?`,
+      confirmLabel: "Refresh Now",
+      confirmDanger: false,
+      onConfirm: async () => {
+        try {
+          await api.requestDeviceReport(device.device_id);
+          ui.toast("Refresh request sent.");
+        } catch (err) {
+          ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+        }
+      },
+    });
   }
 
   function renderSession() {
@@ -899,6 +1096,9 @@ export function createView(app) {
       device = null;
       shell = null;
       active = "overview";
+      provisioningEditing = false;
+      provisioningDraft = null;
+      provisioningSubSection = "connection";
       msgs = freshMsgs();
       host = document.createElement("div");
       host.className = "page--flush";

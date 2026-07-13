@@ -1,50 +1,22 @@
 // Casa admin panel — provisioning-profile editor view. Three-pane editor
 // (editor-shell.js) mounted at /profiles/new and /profiles/{profileId}:
 // left navigator sections, center form bound to `state.form` (the profile's
-// `fields` object, same keys as CasaProvisionProfilesView._DEFAULT_FIELDS in
-// __init__.py), right live v2 payload preview (payload-preview.js). Saves the
-// legacy flat body shape — { id?, name, ...fields } — because the server view
-// reads every field key from the top level of the JSON body.
-
-// Mirrors CasaProvisionProfilesView._DEFAULT_FIELDS exactly (keys and types).
-const DEFAULTS = {
-  host_url: "",
-  username: "",
-  password: "",
-  pin: "",
-  default_dashboard: "",
-  welcome_url: "",
-  immersive_level: "1",
-  theme_color_mode: "inherit",
-  custom_color: "#000000",
-  deauthenticate_existing: false,
-  allow_all_pages: false,
-  allowed_pages: "",
-  allowed_wifi: "",
-  push_notifications: "false",
-  allow_wireguard: false,
-  wireguard_config: "",
-  wireguard_excluded_wifi: "",
-  wireguard_profile_id: "",
-  timeout_minutes: 5,
-  password_scramble: true,
-  password_scramble_in: 0,
-  expiration_hours: 336,
-  connect_wifi_ssid: "",
-  connect_wifi_password: "",
-  cache_control_hours: "",
-};
-
-const SECTIONS = [
-  { id: "connection", label: "Connection", icon: "mdi:server-network" },
-  { id: "appui", label: "App UI", icon: "mdi:palette-outline" },
-  { id: "access", label: "Access Control", icon: "mdi:shield-lock-outline" },
-  { id: "pushvpn", label: "Push & VPN", icon: "mdi:bell-badge-outline" },
-  { id: "timing", label: "Timing & Security", icon: "mdi:timer-lock-outline" },
-  { id: "wifi", label: "Wi-Fi & Extras", icon: "mdi:wifi-cog" },
-];
-
-const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+// `fields` object, PROFILE-scope keys per profile-fields.js FIELD_SCOPES /
+// const.py PROFILE_PROVISIONING_FIELDS), right live v2 payload preview
+// (payload-preview.js). Saves the legacy flat body shape — { id?, name,
+// ...fields } — because the server view reads every field key from the top
+// level of the JSON body.
+//
+// Profiles hold reusable template settings only. One-time provisioning
+// process inputs (username/password/pin, deauth, timeout, scramble, Wi-Fi
+// join) are entered in the provisioning wizard / casa.provision service call
+// instead. Legacy profiles may still carry those keys server-side; this
+// editor neither shows nor resubmits them.
+//
+// The field schema/markup/coercion is shared with a single device's
+// "Provisioning" section (device-editor.js) and the wizard via
+// profile-fields.js — same fields rendered the same way, different scope and
+// save path afterward.
 
 export function createView(app) {
   const { api, ui, store } = app;
@@ -53,6 +25,7 @@ export function createView(app) {
   /* ---------- lazily loaded siblings (never static imports) ---------- */
   let shellMod = null; // editor-shell.js
   let previewMod = null; // payload-preview.js
+  let fieldsMod = null; // profile-fields.js (shared field schema/renderer)
 
   /* ---------- per-mount state ---------- */
   let mountToken = 0;
@@ -62,7 +35,7 @@ export function createView(app) {
   let discardBtn = null;
 
   let profileId = null; // null → new profile (POST); set → existing (PUT)
-  let state = { name: "", form: { ...DEFAULTS } };
+  let state = { name: "", form: {} }; // form populated from fieldsMod.DEFAULTS once loaded
   let pristineState = null; // deep copy for "Discard changes"
   let pristine = ""; // normalized snapshot for the dirty getter
   let wgProfiles = []; // [{id, alias, excluded_wifi}] for the link select + preview
@@ -72,11 +45,13 @@ export function createView(app) {
   /* ---------- dirty tracking ---------- */
 
   // Inputs hand back strings, so normalize every non-bool field to a string
-  // before comparing — otherwise 5 vs "5" would read as dirty.
+  // before comparing — otherwise 5 vs "5" would read as dirty. Only
+  // profile-scope keys participate, so legacy process keys stored on old
+  // profiles can't trip dirty-tracking.
   function snapshot(s) {
     const norm = {};
-    for (const key of Object.keys(DEFAULTS)) {
-      norm[key] = typeof DEFAULTS[key] === "boolean" ? !!s.form[key] : String(s.form[key] ?? "");
+    for (const key of fieldsMod.PROFILE_KEYS) {
+      norm[key] = typeof fieldsMod.DEFAULTS[key] === "boolean" ? !!s.form[key] : String(s.form[key] ?? "");
     }
     return JSON.stringify({ name: String(s.name ?? ""), fields: norm });
   }
@@ -87,268 +62,26 @@ export function createView(app) {
 
   /* ---------- form section rendering ---------- */
 
-  const val = (key) => state.form[key] ?? "";
-
-  function textField({ key, label, help, placeholder = "", type = "text", attrs = "" }) {
-    return `
-      <div class="field" data-field="${esc(key)}">
-        <label>${esc(label)}</label>
-        <input class="input" type="${esc(type)}" data-key="${esc(key)}" value="${esc(val(key))}"
-          placeholder="${esc(placeholder)}" ${attrs}>
-        ${help ? `<div class="field__help">${esc(help)}</div>` : ""}
-      </div>`;
-  }
-
-  function numberField({ key, label, help, min = 0, max }) {
-    return textField({
-      key, label, help, type: "number",
-      attrs: `min="${min}"${max != null ? ` max="${max}"` : ""}`,
-    });
-  }
-
-  function selectField({ key, label, help, options, disabled = false }) {
-    const current = String(val(key));
-    const opts = options
-      .map(
-        (o) => `<option value="${esc(o.value)}" ${String(o.value) === current ? "selected" : ""}>${esc(o.label)}</option>`
-      )
-      .join("");
-    return `
-      <div class="field" data-field="${esc(key)}">
-        <label>${esc(label)}</label>
-        <select class="select" data-key="${esc(key)}" ${disabled ? "disabled" : ""}>${opts}</select>
-        ${help ? `<div class="field__help">${esc(help)}</div>` : ""}
-      </div>`;
-  }
-
-  function toggleField({ key, label, help }) {
-    return `
-      <div data-field="${esc(key)}">
-        <label class="toggle">
-          <input type="checkbox" data-key="${esc(key)}" ${val(key) ? "checked" : ""}>
-          <span>${esc(label)}</span>
-        </label>
-        ${help ? `<div class="field__help" style="margin:-4px 0 12px 24px;">${esc(help)}</div>` : ""}
-      </div>`;
-  }
-
-  function sectionHeading(title, desc) {
-    return `<h2>${esc(title)}</h2><p class="editor__form-desc">${esc(desc)}</p>`;
-  }
-
-  function renderConnection() {
-    return `
-      ${sectionHeading("Connection", "Where the device connects and which guest account it signs in as.")}
+  function renderSection(id) {
+    activeSection = fieldsMod.sectionsFor(fieldsMod.PROFILE_KEYS).some((s) => s.id === id) ? id : "connection";
+    if (!handle) return;
+    // "Profile name" is a profile-editor-only concept (not part of the shared
+    // fields schema device provisioning views use), so it's spliced in ahead
+    // of the shared Connection section markup rather than living in
+    // profile-fields.js.
+    const nameFieldHtml = activeSection === "connection" ? `
       <div class="field" data-field="name">
         <label>Profile name</label>
         <input class="input" data-key="name" value="${esc(state.name)}" placeholder="e.g. Guest tablet">
         <div class="field__help">Auto-generated if blank.</div>
-      </div>
-      ${textField({ key: "host_url", label: "Host URL *", placeholder: "http://192.168.1.21:8123", help: "The Home Assistant URL the device will use. Required." })}
-      ${textField({ key: "username", label: "Username *", placeholder: "guest", help: "Guest account the device signs in as. Required." })}
-      ${textField({ key: "password", label: "Password", placeholder: "(auto-generated at provision)", help: "Leave blank to auto-generate a secure password at provision time." })}
-      ${textField({ key: "pin", label: "PIN", placeholder: "123456", attrs: 'maxlength="6" inputmode="numeric" autocomplete="off"', help: "Optional, max 6 digits." })}
-      ${toggleField({ key: "deauthenticate_existing", label: "Sign out existing sessions at provision", help: "Deauthenticates the account's existing connections when a device is provisioned." })}`;
-  }
-
-  function renderAppUi() {
-    const mode = String(val("theme_color_mode") || "inherit");
-    const colorDisabled = mode === "inherit";
-    const raw = String(val("custom_color")).trim();
-    const pickValue = HEX_RE.test(raw) ? raw : "#000000";
-    return `
-      ${sectionHeading("App UI", "Dashboard, chrome, and theming for the provisioned app.")}
-      ${textField({ key: "default_dashboard", label: "Default dashboard", placeholder: "/lovelace/home", help: "Path the app opens on launch." })}
-      ${textField({ key: "welcome_url", label: "Welcome URL", help: "Optional URL shown after provisioning." })}
-      ${selectField({
-        key: "immersive_level", label: "Immersive level",
-        options: [
-          { value: "1", label: "Level 1 (Standard)" },
-          { value: "2", label: "Level 2 (Transparent status bar)" },
-          { value: "3", label: "Level 3 (Fullscreen)" },
-        ],
-      })}
-      ${selectField({
-        key: "theme_color_mode", label: "Theme color mode",
-        options: [
-          { value: "inherit", label: "Inherit from HA" },
-          { value: "custom", label: "Custom color" },
-          { value: "inherit_with_fallback", label: "Inherit with fallback" },
-        ],
-      })}
-      <div class="field" data-field="custom_color">
-        <label>Custom color</label>
-        <div class="field-row">
-          <input type="color" data-ref="color-pick" value="${esc(pickValue)}" ${colorDisabled ? "disabled" : ""}
-            style="flex:none; width:44px; height:36px; padding:2px; border:1px solid var(--casa-divider); border-radius:var(--casa-radius-sm); background:var(--casa-card-bg); cursor:pointer;">
-          <input class="input" data-key="custom_color" value="${esc(val("custom_color"))}"
-            placeholder="#03A9F4" ${colorDisabled ? "disabled" : ""}>
-        </div>
-        <div class="field__help">Hex color used when the theme color mode is not "Inherit from HA".</div>
-      </div>`;
-  }
-
-  function renderAccess() {
-    const allowAll = !!val("allow_all_pages");
-    return `
-      ${sectionHeading("Access Control", "Restrict which pages and networks the device may use.")}
-      ${toggleField({ key: "allow_all_pages", label: "Allow all pages", help: "When on, the device may open any page (payload sends /*)." })}
-      <div class="field" data-field="allowed_pages">
-        <label>Allowed pages</label>
-        <input class="input" data-key="allowed_pages" value="${esc(val("allowed_pages"))}"
-          placeholder="${allowAll ? "/*" : "/lovelace/home, /dashboard-1/*"}" ${allowAll ? "disabled" : ""}>
-        <div class="field__help">Comma-separated paths the device may open. Ignored while "Allow all pages" is on.</div>
-      </div>
-      ${textField({ key: "allowed_wifi", label: "Allowed Wi-Fi", placeholder: "HomeSSID, OfficeSSID", help: "Comma-separated SSIDs the app may be used on. Blank = any network." })}`;
-  }
-
-  function renderPushVpn() {
-    const linkedId = String(val("wireguard_profile_id"));
-    const linked = linkedId ? wgProfiles.find((p) => p && p.id === linkedId) || null : null;
-    const options = [{ value: "", label: "-- None / paste config below --" }].concat(
-      wgProfiles.map((p) => ({ value: p.id, label: p.alias || p.id }))
-    );
-    // A saved link to a since-deleted WG profile still needs a visible option
-    // so the select doesn't silently snap back to "None".
-    if (linkedId && !linked) options.push({ value: linkedId, label: `(missing profile ${linkedId})` });
-
-    const inlineHtml = linked
-      ? `<div class="muted" style="font-size:13px; margin:2px 0 14px;">
-           Config comes from profile '${esc(linked.alias || linked.id)}'.
-         </div>`
-      : `
-        <div class="field" data-field="wireguard_config">
-          <label>WireGuard config</label>
-          <textarea class="textarea" data-key="wireguard_config" placeholder="[Interface]&#10;PrivateKey = ...">${esc(val("wireguard_config"))}</textarea>
-          <div class="field__help">Full client config pushed to the device. Ignored when a WireGuard profile is linked above.</div>
-        </div>
-        ${textField({ key: "wireguard_excluded_wifi", label: "WireGuard excluded Wi-Fi", placeholder: "HomeSSID", help: "SSIDs on which the tunnel stays down (device is already local)." })}`;
-
-    return `
-      ${sectionHeading("Push & VPN", "Push notification policy and the WireGuard tunnel for remote access.")}
-      ${selectField({
-        key: "push_notifications", label: "Push notifications",
-        options: [
-          { value: "false", label: "Disabled" },
-          { value: "true", label: "Enabled" },
-          { value: "mandatory", label: "Mandatory" },
-        ],
-      })}
-      ${toggleField({ key: "allow_wireguard", label: "Allow WireGuard", help: "Lets the device bring up the VPN tunnel for remote access." })}
-      ${selectField({ key: "wireguard_profile_id", label: "Link WireGuard profile", options, help: "Linking a profile overrides the pasted config below." })}
-      ${inlineHtml}`;
-  }
-
-  function renderTiming() {
-    return `
-      ${sectionHeading("Timing & Security", "Provisioning-code lifetime, session expiration, and password hygiene.")}
-      ${numberField({ key: "timeout_minutes", label: "Timeout (minutes)", min: 0, max: 60, help: "Minutes before the provisioning code expires. 0 = code never expires." })}
-      ${numberField({ key: "expiration_hours", label: "Session expiration (hours)", min: 0, max: 87600, help: "How long the provisioned session lasts. 0 = permanent session." })}
-      ${toggleField({ key: "password_scramble", label: "Scramble password after window", help: "Rotates the guest password once the provisioning window closes." })}
-      ${numberField({ key: "password_scramble_in", label: "Password scramble in (minutes)", min: 0, max: 120, help: "0 = inherit from timeout." })}
-      ${textField({ key: "cache_control_hours", label: "Cache control (hours)", placeholder: "48", help: "Blank = app default (48h)." })}`;
-  }
-
-  function renderWifi() {
-    return `
-      ${sectionHeading("Wi-Fi & Extras", "Optionally join the device to a Wi-Fi network during provisioning.")}
-      ${textField({ key: "connect_wifi_ssid", label: "Connect Wi-Fi SSID", placeholder: "MyNetwork", help: "Network the device joins during provisioning. Blank = skip." })}
-      <div class="field" data-field="connect_wifi_password">
-        <label>Connect Wi-Fi password</label>
-        <div class="field-row">
-          <input class="input" type="password" data-key="connect_wifi_password" value="${esc(val("connect_wifi_password"))}" placeholder="Password" autocomplete="off">
-          <button type="button" class="btn btn--icon" data-ref="reveal-pw" title="Show password" style="flex:none;">
-            <ha-icon icon="mdi:eye-outline"></ha-icon>
-          </button>
-        </div>
-      </div>`;
-  }
-
-  const SECTION_RENDERERS = {
-    connection: renderConnection,
-    appui: renderAppUi,
-    access: renderAccess,
-    pushvpn: renderPushVpn,
-    timing: renderTiming,
-    wifi: renderWifi,
-  };
-
-  function renderSection(id) {
-    activeSection = SECTION_RENDERERS[id] ? id : "connection";
-    if (!handle) return;
-    handle.formEl.innerHTML = SECTION_RENDERERS[activeSection]();
+      </div>` : "";
+    handle.formEl.innerHTML = nameFieldHtml + fieldsMod.renderSectionHtml(activeSection, state.form, { readOnly: false, wgProfiles, esc, fields: fieldsMod.PROFILE_KEYS });
     handle.formEl.scrollTop = 0;
-  }
-
-  /* ---------- form events (delegated; formEl persists across sections) ---------- */
-
-  function commit(el) {
-    const key = el.dataset.key;
-    if (!key) return;
-    const value = el.type === "checkbox" ? el.checked : el.value;
-    if (key === "name") state.name = value;
-    else state.form[key] = value;
-  }
-
-  function clearFieldError(el) {
-    const wrap = el.closest(".field");
-    if (!wrap) return;
-    wrap.classList.remove("field--error");
-    wrap.querySelector(".field__error")?.remove();
   }
 
   function afterChange() {
     updateDirtyUi();
     schedulePreview();
-  }
-
-  function onFormInput(e) {
-    const t = e.target;
-    if (t.dataset.ref === "color-pick") {
-      // Color swatch drives the text twin (both map to custom_color).
-      state.form.custom_color = t.value;
-      const twin = handle.formEl.querySelector('[data-key="custom_color"]');
-      if (twin) twin.value = t.value;
-      afterChange();
-      return;
-    }
-    const key = t.dataset.key;
-    if (!key) return;
-    if (key === "pin") {
-      const cleaned = t.value.replace(/\D/g, "").slice(0, 6);
-      if (cleaned !== t.value) t.value = cleaned;
-    }
-    commit(t);
-    if (key === "custom_color") {
-      const trimmed = t.value.trim();
-      const pick = handle.formEl.querySelector('[data-ref="color-pick"]');
-      if (pick && HEX_RE.test(trimmed)) pick.value = trimmed;
-    }
-    clearFieldError(t);
-    afterChange();
-  }
-
-  function onFormChange(e) {
-    const t = e.target;
-    if (!t.dataset.key) return;
-    commit(t);
-    // These fields gate the visibility/enabled state of siblings, so re-render
-    // the section from state (nothing is lost — state is committed above).
-    if (["theme_color_mode", "allow_all_pages", "wireguard_profile_id"].includes(t.dataset.key)) {
-      renderSection(activeSection);
-    }
-    afterChange();
-  }
-
-  function onFormClick(e) {
-    const btn = e.target.closest('[data-ref="reveal-pw"]');
-    if (!btn || !handle) return;
-    const input = handle.formEl.querySelector('[data-key="connect_wifi_password"]');
-    if (!input) return;
-    const show = input.type === "password";
-    input.type = show ? "text" : "password";
-    btn.title = show ? "Hide password" : "Show password";
-    btn.innerHTML = `<ha-icon icon="${show ? "mdi:eye-off-outline" : "mdi:eye-outline"}"></ha-icon>`;
   }
 
   /* ---------- live payload preview ---------- */
@@ -358,9 +91,10 @@ export function createView(app) {
       Parenthesized values are placeholders the server resolves at provision time.
     </div>
     <div class="muted" style="padding:6px 16px 14px; font-size:12px; line-height:1.5;">
-      Not part of the payload: <span class="mono">deauthenticate_existing</span>,
-      <span class="mono">password_scramble</span> / <span class="mono">password_scramble_in</span>,
-      and timeout enforcement — the server applies these at provision time.
+      Username, password, PIN, Wi-Fi join, provisioning timeout, password
+      scramble, and session sign-out are provisioning-process settings —
+      entered in the wizard (or casa.provision service call) each time, not
+      stored in this profile.
     </div>`;
 
   function currentPreview() {
@@ -401,16 +135,25 @@ export function createView(app) {
     schedulePreview();
   }
 
+  /* ---------- name field (profile-specific; not part of the shared fields form) ---------- */
+
+  function onNameInput(e) {
+    const t = e.target;
+    if (t.dataset.key !== "name") return;
+    state.name = t.value;
+    afterChange();
+  }
+
   /* ---------- save ---------- */
 
-  function autoName(username, hostUrl) {
+  function autoName(hostUrl) {
     let host = hostUrl;
     try {
       host = new URL(hostUrl).host || hostUrl;
     } catch (_e) {
       /* not a parsable URL — use as-is */
     }
-    return `${username} @ ${host}`;
+    return `Profile @ ${host}`;
   }
 
   function markRequiredError(key) {
@@ -423,27 +166,19 @@ export function createView(app) {
   async function save() {
     if (!handle) return;
     const hostUrl = String(state.form.host_url ?? "").trim();
-    const username = String(state.form.username ?? "").trim();
-    if (!hostUrl || !username) {
+    if (!hostUrl) {
       handle.setActive("connection");
       renderSection("connection");
-      if (!hostUrl) markRequiredError("host_url");
-      if (!username) markRequiredError("username");
-      ui.toast("Host URL and Username are required.", { error: true });
+      markRequiredError("host_url");
+      ui.toast("Host URL is required.", { error: true });
       return;
     }
 
     // Legacy/server body shape: flat — name (+ id for updates) alongside every
-    // field key at the top level; ints coerced like the legacy editor.
-    const payload = { name: String(state.name ?? "").trim() || autoName(username, hostUrl) };
-    for (const [key, def] of Object.entries(DEFAULTS)) {
-      const raw = state.form[key];
-      if (typeof def === "boolean") payload[key] = !!raw;
-      else if (typeof def === "number") payload[key] = parseInt(raw, 10) || 0;
-      else payload[key] = String(raw ?? "");
-    }
+    // field key at the top level; ints coerced like the legacy editor. Only
+    // profile-scope keys are sent (the server filters too).
+    const payload = { name: String(state.name ?? "").trim() || autoName(hostUrl), ...fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS) };
     payload.host_url = hostUrl;
-    payload.username = username;
     if (profileId) payload.id = profileId;
 
     saveBtn.disabled = true;
@@ -492,13 +227,13 @@ export function createView(app) {
       title: titleText(),
       titleChips: "",
       navHint: "Configure the provisioning profile. The preview shows the payload a device will receive.",
-      sections: SECTIONS,
+      sections: fieldsMod.sectionsFor(fieldsMod.PROFILE_KEYS),
       activeSection,
       onSelectSection: (id) => renderSection(id),
       codeTitle: "payload.json — live preview (v2)",
       onCopyCode: () => JSON.stringify(currentPreview(), null, 2),
       footerHtml: `
-        <span class="muted" style="font-size:12px;">Saved profiles appear in the provisioning wizard.</span>
+        <span class="muted" style="font-size:12px;">Saved profiles appear in the provision device flow.</span>
         <span class="spacer"></span>
         <button class="btn btn--text" data-act="discard" hidden>Discard changes</button>
         <button class="btn btn--primary" data-act="save" disabled>Save</button>`,
@@ -507,9 +242,15 @@ export function createView(app) {
     discardBtn = handle.footerEl.querySelector('[data-act="discard"]');
     saveBtn.addEventListener("click", save);
     discardBtn.addEventListener("click", discard);
-    handle.formEl.addEventListener("input", onFormInput);
-    handle.formEl.addEventListener("change", onFormChange);
-    handle.formEl.addEventListener("click", onFormClick);
+    fieldsMod.bindFieldEvents(handle.formEl, {
+      values: state.form,
+      readOnly: false,
+      onChange: afterChange,
+      onSectionRerender: () => renderSection(activeSection),
+    });
+    // The profile "name" field lives in the shell chrome, not the shared
+    // fields form, so it needs its own listener alongside the shared one.
+    handle.formEl.addEventListener("input", onNameInput);
     renderSection(activeSection);
     renderPreview();
   }
@@ -520,7 +261,7 @@ export function createView(app) {
     id: "profile-editor",
     header: (params) => ({
       title: loaded ? titleText() : params && params.profileId ? "Editing profile…" : "Editing New profile",
-      back: "/",
+      back: "/profiles",
     }),
     polling: "paused",
 
@@ -536,27 +277,38 @@ export function createView(app) {
       el.appendChild(hostEl);
 
       try {
-        const [shell, preview, ppRes, wgRes] = await Promise.all([
+        const [shell, preview, fields, ppRes, wgRes] = await Promise.all([
           shellMod || app.loadModule("editor-shell.js"),
           previewMod || app.loadModule("payload-preview.js"),
+          fieldsMod || app.loadModule("views/profile-fields.js"),
           profileId ? api.getProvisionProfiles() : null,
           api.getWireguardProfiles().catch(() => ({ profiles: [] })),
         ]);
         if (token !== mountToken) return;
         shellMod = shell;
         previewMod = preview;
+        fieldsMod = fields;
         wgProfiles = (wgRes && wgRes.profiles) || [];
 
+        // Seed only profile-scope keys — legacy process keys stored on old
+        // profiles are neither rendered nor resubmitted.
+        const seedForm = (src) => {
+          const form = {};
+          for (const key of fieldsMod.PROFILE_KEYS) {
+            form[key] = src && src[key] !== undefined ? src[key] : fieldsMod.DEFAULTS[key];
+          }
+          return form;
+        };
         if (profileId) {
           const profile = ((ppRes && ppRes.profiles) || []).find((p) => p && p.id === profileId);
           if (!profile) {
             ui.showInfo({ title: "Profile not found", message: "That provisioning profile no longer exists." });
-            app.navigate("/", { replace: true });
+            app.navigate("/profiles", { replace: true });
             return;
           }
-          state = { name: profile.name || "", form: { ...DEFAULTS, ...(profile.fields || {}) } };
+          state = { name: profile.name || "", form: seedForm(profile.fields) };
         } else {
-          state = { name: "", form: { ...DEFAULTS } };
+          state = { name: "", form: seedForm(null) };
         }
       } catch (err) {
         if (token !== mountToken) return;

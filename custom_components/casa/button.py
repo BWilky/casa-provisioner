@@ -120,7 +120,7 @@ class CasaDeviceReloadButton(ButtonEntity):
             "target": push_token,
             "site_id": stored_data.get("site_id"),
             "site_key": stored_data.get("site_key"),
-            "command": "clear_cache_and_reload"
+            "data": {"command": "clear_cache_and_reload"}
         }
 
         _LOGGER.info(

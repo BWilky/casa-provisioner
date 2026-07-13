@@ -15,7 +15,7 @@ All endpoints are authenticated with the device's normal HA bearer token.
 
 ## 1. Heartbeat — `POST /api/casa/heartbeat`
 
-Response gained three fields:
+Response fields:
 
 ```json
 {
@@ -23,7 +23,10 @@ Response gained three fields:
   "reregister": false,
   "updates": true,
   "device_key": "<64 hex chars>",
-  "device_key_id": "<8 hex chars>"
+  "device_key_id": "<8 hex chars>",
+  "require_alias": false,
+  "has_alias": true,
+  "heartbeat_interval_seconds": 300
 }
 ```
 
@@ -32,6 +35,24 @@ Response gained three fields:
 - If `updates == true`, call the pull endpoint (§2).
 - `device_key`/`device_key_id` are only ever `null` if the site key isn't set yet
   (shouldn't happen in normal operation).
+- `heartbeat_interval_seconds` is the site's admin-configured cadence (default 300,
+  range 60–3600). Always present. The app should apply it as its new heartbeat
+  interval going forward, and reset to the 300s default on reprovision — a custom
+  interval must never carry over from a previous site/session.
+
+### Device alias flow
+
+The request body accepts an optional `alias` (string) alongside the usual fields. The
+server accepts it **only while the stored alias is empty** (trimmed, capped at 60
+chars) — an admin-set alias always wins and is never overwritten.
+
+- `require_alias` is the **site-wide** flag only. The per-profile flag arrives in the
+  provisioning payload (`require_alias`) and in `profile` update payloads
+  (`fields.require_alias`); the app ORs the two sources.
+- `has_alias` reflects whether the device currently has a non-empty alias. When the
+  requirement is active and `has_alias` is `false`, the app blocks with a name prompt
+  and sends the entered value as `alias` on every heartbeat until `has_alias` flips
+  `true` (also the signal to clear any locally pending submission).
 
 ## 2. Pull updates — `GET /api/casa/profile_updates?device_id=<id>`
 
@@ -124,6 +145,27 @@ data: { "update_id": "...", "type": "...", "action": "..." }
 ```
 
 Treat as a nudge: heartbeat + pull.
+
+### Check-in nudge pushes (`request_heartbeat` / `request_profile_report`)
+
+Content-free silent pushes asking the app to act immediately instead of
+waiting for its next scheduled tick. No encryption, no queue entry:
+
+```
+title / message: ""   // silent
+data: { "command": "request_heartbeat" | "request_profile_report" }
+```
+
+- `request_heartbeat` → send a heartbeat right now. If the response's
+  `updates` flag is true, this naturally triggers the normal pull path
+  (§2) — the same mechanism the periodic heartbeat timer already uses.
+  Sent automatically by the server after most admin actions that change a
+  device's or site's state (provisioning field edits, profile/WireGuard
+  queue pushes, expiration changes, device-key rotation), and also
+  available as a standalone `casa.request_heartbeat` HA service call.
+- `request_profile_report` → POST the current provisioning snapshot to
+  `/api/casa/profile_report` right now, instead of waiting up to
+  `profile_report_interval_seconds`. Available as `casa.request_device_report`.
 
 ---
 

@@ -25,6 +25,7 @@ Home Assistant custom integration for provisioning and managing [Casa](https://b
 Enable **Show Panel** in the integration options to get a **Casa** sidebar entry (admins only). The panel is a full app in the style of the ESPHome Device Builder:
 
 - **Device list** (default page) — searchable, sortable table or card grid with status dots (heartbeat recency), app-version chips, filter and column pickers, select-multiple bulk actions (reload / delete / deprovision), pagination, and a per-device menu (edit, test push, reload, push WireGuard/provision profile, re-provision, delete record, deprovision). An **Accounts** tab manages guest users with one-time-credential dialogs.
+- **Guided provisioning** — visiting the provision page offers a scenario picker; "New device with its own account" opens a guided flow (`/provision/guided`) that names the device (the name is auto-applied as the device alias on first registration), creates a fresh guest account (slugged username with live availability check, auto-generated or custom one-time password), starts from a saved profile with tweaks (diverging changes can be forked into a new shared profile or kept device-specific), and delivers via setup link (default) with optional QR — BLE broadcast, PIN, and password-scramble live under Advanced. Credentials are shown once on the final screen alongside the links/QR.
 - **Provision wizard** ("+ Provision device") — stepped flow: pick a method (Guided QR — recommended — or Deep link only / BLE beacon), pick a provisioning profile from a searchable card grid or choose Manual configuration (full field set, server URL and site binding pre-filled, optional save-as-profile), enter connection details, and get the result: QR image, `hascasa://` deep link + universal link with copy buttons, or per-beacon broadcast status. (`casa.provision` with `method: manual` remains available at the service level for reading values into the phone's manual sheet.)
 - **Device editor** — three-pane page per device: section navigator (Overview, Session & Expiration, Push, VPN/WireGuard, Pending Updates, Danger Zone), forms in the middle, and a live read-only `device.json` pane on the right. Expiration changes (set/extend/permanent/expire-now) apply on the device's next heartbeat and show as *pending* until confirmed.
 - **Profile editor** — same three-pane layout for provisioning profiles, with a **live `payload.json` preview** of the v2 provisioning payload that updates as you type (provision-time values shown as placeholders), and dirty-state Save.
@@ -47,8 +48,9 @@ Generates an encrypted provisioning payload. Supports four methods: `qr`, `ble`,
 | `method` | ✅ | — | `qr`, `ble`, `deep_link`, or `manual` |
 | `profile` | | — | Saved provisioning profile (ID or name) to load template settings from |
 | `host_url` | ✅ | — | HA URL the device connects to (e.g., `http://192.168.1.100:8123`) |
-| `username` | ✅ | — | Target HA guest user account |
+| `username` | ✅ | — | Target HA guest user account (matched by display name or login username) |
 | `password` | | auto-generated | Specific password (otherwise random 12-char) |
+| `device_alias` | | — | Alias auto-applied when the device first registers (within 30 min); never overwrites an existing alias |
 | `pin` | | — | Max 6-digit PIN required before provisioning completes |
 
 **App UI**
@@ -69,6 +71,7 @@ Generates an encrypted provisioning payload. Supports four methods: `qr`, `ble`,
 | `allow_all_pages` | `false` | Grant access to all dashboards (`/*`) |
 | `allowed_pages` | `[]` | List of allowed paths (e.g., `/dashboard-1/*`) |
 | `allowed_wifi` | `[]` | Wi-Fi SSIDs the app is restricted to |
+| `require_alias` | `false` | Block the app with a name prompt until the device has an alias |
 
 **Push Notifications & VPN**
 
@@ -95,7 +98,7 @@ Generates an encrypted provisioning payload. Supports four methods: `qr`, `ble`,
 | Field | Applies To | Description |
 |-------|-----------|-------------|
 | `qr_filename` | QR | Custom filename (auto: `qr_[user]_[timestamp].png`) |
-| `esphome_service` | BLE | List of ESPHome services to push payload to |
+| `esphome_service` | All | List of ESPHome services to push the payload to (required for `ble`; with other methods, broadcast in addition to the primary output, and `successful_targets` is included in the response) |
 | `connect_wifi_ssid` | All | Wi-Fi SSID the device should auto-join |
 | `connect_wifi_password` | All | Password for the above network |
 | `payload_version` | All | `2` (default, JSON + hybrid encryption) or `1` (legacy pipe-delimited) |

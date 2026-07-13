@@ -37,6 +37,12 @@ provision:
       required: false
       selector:
         text: {}
+    device_alias:
+      name: "Device Alias (Optional)"
+      description: "Alias auto-applied to the device when it first registers (within 30 minutes of provisioning). Never overwrites an alias that is already set."
+      required: false
+      selector:
+        text: {}
     password:
       name: "Password (Optional)"
       description: "Use an existing password instead of generating a random one. If left blank, a secure random password is automatically generated."
@@ -117,6 +123,12 @@ provision:
       selector:
         text:
           multiple: true
+    require_alias:
+      name: "Require Device Alias"
+      description: "If enabled, the app blocks the user with a name prompt until the device has an alias (admin-set aliases satisfy it)."
+      default: false
+      selector:
+        boolean: {}
 
     # 4. Push Notifications & VPN
     push_notifications:
@@ -175,7 +187,7 @@ provision:
         text: {}
     esphome_service:
       name: "ESPHome Target Services"
-      description: "BLE Method only. Add ESPHome API services one by one (e.g., esphome.lobby_beacon_update_payload)."
+      description: "Add ESPHome API services one by one (e.g., esphome.lobby_beacon_update_payload). Required for the BLE method; with other methods, targets are broadcast in addition to the primary output."
       selector:
         text:
           multiple: true
@@ -341,6 +353,12 @@ generate_qr:
       selector:
         text:
           multiple: true
+    require_alias:
+      name: "Require Device Alias"
+      description: "If enabled, the app blocks the user with a name prompt until the device has an alias (admin-set aliases satisfy it)."
+      default: false
+      selector:
+        boolean: {}
 
     # 4. Push Notifications & VPN
     push_notifications:
@@ -616,6 +634,11 @@ provision_ble_beacon:
       selector:
         text:
           multiple: true
+    require_alias:
+      name: "Require Device Alias"
+      default: false
+      selector:
+        boolean: {}
 
     # 4. Push Notifications & VPN
     push_notifications:
@@ -805,6 +828,28 @@ reload_device:
     device_id:
       name: "Device ID"
       description: "The unique identifier (UUID) of the target device to reload."
+      required: true
+      selector:
+        text: {}
+
+request_device_report:
+  name: "Request Device Provisioning Report"
+  description: "Sends a silent background push notification asking a device to immediately report its current provisioning/profile state, instead of waiting for its next periodic self-report."
+  fields:
+    device_id:
+      name: "Device ID"
+      description: "The unique identifier (UUID) of the target device."
+      required: true
+      selector:
+        text: {}
+
+request_heartbeat:
+  name: "Request Device Heartbeat"
+  description: "Sends a silent background push notification asking a device to check in (heartbeat) immediately, instead of waiting for its next scheduled tick. Any provisioning/WireGuard update already queued for the device is pulled and applied as part of that heartbeat."
+  fields:
+    device_id:
+      name: "Device ID"
+      description: "The unique identifier (UUID) of the target device."
       required: true
       selector:
         text: {}

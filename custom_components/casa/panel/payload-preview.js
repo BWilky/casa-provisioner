@@ -1,9 +1,11 @@
 // Casa admin panel — pure helpers (no DOM, no sibling imports) that mirror the
 // server's v2 provisioning payload assembly so editors can show a live,
-// truthful preview. Semantics track `_provision_internal` and
-// `CasaProvisionProfilesView._DEFAULT_FIELDS` in custom_components/casa/__init__.py;
-// values the server computes at provision time (password, timestamps, linked
-// WireGuard config) render as parenthesized placeholder strings.
+// truthful preview. Semantics track `_provision_internal` in
+// custom_components/casa/__init__.py and the field-scope constants in
+// const.py (see also profile-fields.js FIELD_SCOPES); values the server
+// computes or that arrive as one-time process inputs at provision time
+// (username, password, PIN, timestamps, linked WireGuard config) render as
+// parenthesized placeholder strings when absent.
 
 const DEFAULT_EXPIRATION_HOURS = 336; // server default: 14 days
 const DEFAULT_TIMEOUT_MINUTES = 5;
@@ -80,7 +82,7 @@ export function buildV2PayloadPreview(fields, ctx = {}) {
   return {
     v: 2,
     server_url: trimStr(f.host_url) || "(host URL required)",
-    username: trimStr(f.username) || "(username required)",
+    username: trimStr(f.username) || "(entered at provision)",
     password: trimStr(f.password) || "(auto-generated at provision)",
     site_id: trimStr(ctx.siteId) || "(this site)",
     pin: trimStr(f.pin).slice(0, 6),

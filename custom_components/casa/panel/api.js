@@ -141,6 +141,9 @@ export class CasaApi {
   reloadDevice(deviceId) {
     return this._hass.callService("casa", "reload_device", { device_id: deviceId });
   }
+  requestDeviceReport(deviceId) {
+    return this._hass.callService("casa", "request_device_report", { device_id: deviceId });
+  }
   notifyUser({ deviceId, username, title, message, data }) {
     const payload = { title, message };
     if (deviceId) payload.device_id = deviceId;
@@ -196,10 +199,20 @@ export class CasaApi {
     return this._hass.callApi("DELETE", `casa/admin/provision_profiles?id=${encodeURIComponent(id)}`);
   }
 
+  checkUsername(username, name = "") {
+    const q = `username=${encodeURIComponent(username)}&name=${encodeURIComponent(name)}`;
+    return this._hass.callApi("GET", `casa/admin/check_username?${q}`);
+  }
+
   // Presence-conditional: pass only the keys you want to change
   // ({device_id, alias?, expires_at_override?}).
   updateDevice(body) {
     return this._hass.callApi("PUT", "casa/admin/device", body);
+  }
+  // "Force Device Changes": pushes an off-profile fields override to a
+  // single device (see CasaAdminDeviceView.put's provisioning_fields branch).
+  updateDeviceProvisioning(deviceId, fields) {
+    return this.updateDevice({ device_id: deviceId, provisioning_fields: fields });
   }
   queueUpdate(req) {
     return this._hass.callApi("POST", "casa/admin/queue_update", req);
@@ -212,5 +225,19 @@ export class CasaApi {
   }
   regenerateDeviceKey() {
     return this._hass.callApi("POST", "casa/admin/regenerate_device_key");
+  }
+  getSessions() {
+    return this._hass.callApi("GET", "casa/admin/sessions");
+  }
+  revokeSession(userId, tokenId) {
+    return this._hass.callApi(
+      "DELETE",
+      `casa/admin/sessions?user_id=${encodeURIComponent(userId)}&token_id=${encodeURIComponent(tokenId)}`
+    );
+  }
+  // Presence-conditional: pass only the keys you want to change
+  // ({require_device_alias?}).
+  updateSettings(body) {
+    return this._hass.callApi("PUT", "casa/admin/settings", body);
   }
 }

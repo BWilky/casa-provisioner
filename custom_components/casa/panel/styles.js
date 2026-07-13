@@ -74,7 +74,7 @@ const CSS = `
 }
 .card--danger { border-color: var(--casa-error); }
 
-/* Big option card (wizard step 1, ESPHome "Create new project" style) */
+/* Big option card (provision entry / deploy method cards, ESPHome "Create new project" style) */
 .option-card {
   display: flex; align-items: center; gap: 14px; width: 100%; text-align: left;
   padding: 18px 16px; margin: 0 0 12px 0;
@@ -208,6 +208,20 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--casa-primary);
 }
 .tab--active { color: var(--casa-primary); border-bottom-color: var(--casa-primary); }
 
+/* Step tabs (provision flow) — progress indicators, backward-clickable only */
+.tabs--steps .tab { display: inline-flex; align-items: center; gap: 8px; }
+.tabs--steps .tab:disabled { opacity: 0.45; cursor: default; }
+.tabs--steps .tab--active:disabled { opacity: 1; cursor: default; }
+.tab--done { color: var(--casa-text); }
+.step-dot {
+  width: 20px; height: 20px; border-radius: 50%; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600;
+  background: var(--casa-bg-2); color: var(--casa-text-2);
+}
+.tab--active .step-dot { background: var(--casa-primary); color: var(--casa-on-primary); }
+.tab--done .step-dot { background: color-mix(in srgb, var(--casa-success) 18%, transparent); color: var(--casa-success); }
+
 /* ---------- Table ---------- */
 .table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .table th {
@@ -245,6 +259,15 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--casa-primary);
 }
 .list-footer .select { width: auto; padding: 4px 8px; }
 .page-btn { width: 32px; height: 32px; }
+
+/* ---------- Two-pane split (sessions view) ---------- */
+.split { display: flex; gap: 18px; align-items: flex-start; }
+.split__nav { width: 250px; flex: none; }
+.split__main { flex: 1; min-width: 0; }
+@media (max-width: 700px) {
+  .split { flex-direction: column; }
+  .split__nav { width: 100%; }
+}
 
 /* ---------- Card grid (device cards view / profile picker) ---------- */
 .grid-cards {
