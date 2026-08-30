@@ -14,6 +14,22 @@ export function esc(val) {
     .replaceAll("'", "&#39;");
 }
 
+// Human-readable message from any rejection shape. HA's callApi/callWS reject
+// with plain objects ({body, message, error, code}), not Error instances, so
+// naive `err.message || err` interpolation renders "[object Object]" and hides
+// the real HTTP status. This never does.
+export function errMsg(err) {
+  if (err == null) return "Unknown error";
+  if (typeof err === "string") return err;
+  const candidates = [err.body && err.body.message, err.body, err.message, err.error];
+  for (const v of candidates) {
+    if (typeof v === "string" && v) return v;
+    if (v && typeof v === "object" && typeof v.message === "string" && v.message) return v.message;
+  }
+  if (err.status_code) return `HTTP ${err.status_code}`;
+  try { return JSON.stringify(err); } catch (_e) { return String(err); }
+}
+
 export function fmtTime(iso) {
   if (!iso) return "—";
   try {
@@ -278,7 +294,7 @@ export function createUi({ popoverLayer, modalLayer, shadowRoot }) {
   }
 
   return {
-    esc, fmtTime, fmtExpiry, relTime, copyText,
+    esc, errMsg, fmtTime, fmtExpiry, relTime, copyText,
     openPopover, openMenu, closePopover,
     openModal, showConfirm, showInfo,
     toast, bindCopyButton,

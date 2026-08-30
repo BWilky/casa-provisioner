@@ -26,7 +26,7 @@ export function createView(app) {
       data = await api.getSessions();
       if (refs) refs.err.innerHTML = "";
     } catch (err) {
-      if (refs) refs.err.innerHTML = `<div class="errbar">${ui.esc((err && err.message) || err)}</div>`;
+      if (refs) refs.err.innerHTML = `<div class="errbar">${ui.esc(ui.errMsg(err))}</div>`;
       if (!quiet) data = null;
     }
     if (selectedUserId && !byUserId(selectedUserId)) selectedUserId = null;
@@ -177,7 +177,7 @@ export function createView(app) {
           ui.toast("Session revoked.");
           load({ quiet: true });
         } catch (err) {
-          ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }
       },
     });
@@ -224,7 +224,7 @@ export function createView(app) {
             <button class="tab" id="ss-tab-devices">Devices</button>
             <button class="tab" id="ss-tab-accounts">Accounts</button>
             <button class="tab tab--active">Sessions</button>
-            <button class="tab" id="ss-tab-profiles">Provision Profiles</button>
+            <button class="tab" id="ss-tab-profiles">Provision Templates</button>
             <button class="tab" id="ss-tab-wireguard">WireGuard Profiles</button>
           </div>
           <div class="list-meta" id="ss-meta"></div>
@@ -243,7 +243,7 @@ export function createView(app) {
 
       el.querySelector("#ss-tab-devices").addEventListener("click", () => app.navigate("/"));
       el.querySelector("#ss-tab-accounts").addEventListener("click", () => app.navigate("/accounts"));
-      el.querySelector("#ss-tab-profiles").addEventListener("click", () => app.navigate("/profiles"));
+      el.querySelector("#ss-tab-profiles").addEventListener("click", () => app.navigate("/templates"));
       el.querySelector("#ss-tab-wireguard").addEventListener("click", () => app.navigate("/wireguard"));
       refs.nav.addEventListener("click", onNavClick);
       refs.results.addEventListener("click", onResultsClick);

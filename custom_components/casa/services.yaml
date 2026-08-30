@@ -2,10 +2,10 @@ provision:
   name: "Provision Casa Device"
   description: "Generates an encrypted provisioning payload and either outputs a QR code or pushes it to ESPHome BLE beacons."
   fields:
-    # 0. Profile Template (Optional)
+    # 0. Provision Template (Optional)
     profile:
-      name: "Provisioning Profile"
-      description: "A preconfigured provisioning profile (ID or Name) to load template settings from."
+      name: "Provision Template"
+      description: "A provision template (ID or Name) whose saved fields seed this provision — explicit fields below override it, and its unset fields fall back to defaults. The service also accepts this value under the key 'template'."
       required: false
       selector:
         text: {}
@@ -34,6 +34,12 @@ provision:
     username:
       name: "Username"
       description: "e.g., guest. The Home Assistant user account to provision."
+      required: false
+      selector:
+        text: {}
+    user_id:
+      name: "User ID"
+      description: "Optional exact HA user id to provision. Takes precedence over username matching (used by the guided panel flow)."
       required: false
       selector:
         text: {}

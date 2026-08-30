@@ -75,7 +75,7 @@ export function createView(app) {
           <p class="muted" style="font-size:13px; margin:0 0 12px;">
             When enabled, every provisioned device without an alias blocks the user with a
             name prompt until one is provided (delivered on the next heartbeat). Admin-set
-            aliases satisfy it. Can also be enforced per provisioning profile.
+            aliases satisfy it. Can also be enforced per provision template.
           </p>
           <label class="toggle">
             <input type="checkbox" id="st-require-alias" ${summary.require_device_alias ? "checked" : ""}>
@@ -144,7 +144,7 @@ export function createView(app) {
       ui.toast(value ? "Device alias is now required." : "Device alias requirement disabled.");
       app.refresh(); // summary re-render restores the toggle state
     } catch (err) {
-      ui.toast("Failed to update setting: " + ((err && err.message) || err), { error: true });
+      ui.toast("Failed to update setting: " + ui.errMsg(err), { error: true });
       input.checked = !value;
       input.disabled = false;
     }
@@ -165,7 +165,7 @@ export function createView(app) {
       ui.toast(`Heartbeat interval updated to ${value}s.`);
       app.refresh(); // summary re-render restores the field
     } catch (err) {
-      ui.toast("Failed to update setting: " + ((err && err.message) || err), { error: true });
+      ui.toast("Failed to update setting: " + ui.errMsg(err), { error: true });
       input.value = previous;
       input.disabled = false;
     }
@@ -186,7 +186,7 @@ export function createView(app) {
       ui.toast(`Profile report interval updated to ${value}s.`);
       app.refresh(); // summary re-render restores the field
     } catch (err) {
-      ui.toast("Failed to update setting: " + ((err && err.message) || err), { error: true });
+      ui.toast("Failed to update setting: " + ui.errMsg(err), { error: true });
       input.value = previous;
       input.disabled = false;
     }
@@ -203,7 +203,7 @@ export function createView(app) {
       ui.toast(`Encryption key rotated. New key id: ${keyId}`);
       app.refresh(); // summary re-render restores the button
     } catch (err) {
-      ui.toast("Key rotation failed: " + ((err && err.message) || err), { error: true });
+      ui.toast("Key rotation failed: " + ui.errMsg(err), { error: true });
       btn.disabled = false;
       btn.textContent = "Rotate Encryption Key";
     }
@@ -223,7 +223,7 @@ export function createView(app) {
           ui.toast("Site regenerated. All devices must be re-provisioned.");
           app.refresh();
         } catch (err) {
-          ui.toast("Regenerate failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Regenerate failed: " + ui.errMsg(err), { error: true });
         }
       },
     });
@@ -239,7 +239,7 @@ export function createView(app) {
       wgProfiles = (res && res.profiles) || [];
     } catch (err) {
       wgProfiles = [];
-      ui.toast("Failed to load WireGuard profiles: " + ((err && err.message) || err), { error: true });
+      ui.toast("Failed to load WireGuard profiles: " + ui.errMsg(err), { error: true });
     }
     wgLoading = false;
     if (refs && tab === "wireguard") renderWireguard();
@@ -288,7 +288,7 @@ export function createView(app) {
 
     refs.form.innerHTML = `
       <h2>WireGuard Profiles</h2>
-      <p class="editor__form-desc">Stored WireGuard VPN configurations available to provisioning profiles.</p>
+      <p class="editor__form-desc">Stored WireGuard VPN configurations available to provision templates.</p>
       <div class="list-toolbar">
         <button class="btn btn--primary" data-act="add">+ Add profile</button>
         <button class="btn btn--outlined" data-act="refresh" ${wgLoading ? "disabled" : ""}>
@@ -348,7 +348,7 @@ export function createView(app) {
               loadWgProfiles();
             } catch (err) {
               errEl.hidden = false;
-              errEl.textContent = "Failed: " + ((err && err.message) || err);
+              errEl.textContent = "Failed: " + ui.errMsg(err);
               btn.disabled = false;
               btn.textContent = "Save";
               return false;
@@ -360,10 +360,10 @@ export function createView(app) {
   }
 
   async function confirmDeleteWg(profile) {
-    // In-use check: provisioning profiles that link this WG profile by id.
+    // In-use check: provision templates that link this WG profile by id.
     let usedBy = [];
     try {
-      const res = await api.getProvisionProfiles();
+      const res = await api.getProvisionTemplates();
       usedBy = ((res && res.profiles) || [])
         .filter((pp) => pp && pp.fields && pp.fields.wireguard_profile_id === profile.id)
         .map((pp) => pp.name || pp.id);
@@ -374,7 +374,7 @@ export function createView(app) {
     let message = `Delete WireGuard profile '${profile.alias || profile.id}'?`;
     if (usedBy.length) {
       message +=
-        ` Used by provisioning profile(s): ${usedBy.join(", ")} — ` +
+        ` Used by provision template(s): ${usedBy.join(", ")} — ` +
         "provisioning with them will fall back to inline/empty config.";
     }
 
@@ -387,7 +387,7 @@ export function createView(app) {
           await api.deleteWireguardProfile(profile.id);
           ui.toast("WireGuard profile deleted.");
         } catch (err) {
-          ui.toast("Delete failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Delete failed: " + ui.errMsg(err), { error: true });
         }
         loadWgProfiles();
       },

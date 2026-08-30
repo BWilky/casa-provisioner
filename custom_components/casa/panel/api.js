@@ -47,7 +47,7 @@ export class CasaApi {
     try {
       summary = await this._hass.callApi("GET", "casa/admin/summary");
     } catch (err) {
-      error = (err && err.message) || String(err);
+      error = (err && (err.message || (err.body && err.body.message) || err.error)) || "Request failed";
     }
     if (seq !== this._reqSeq) return this.summary;
     if (error === null) {
@@ -188,15 +188,41 @@ export class CasaApi {
     return this._hass.callApi("DELETE", `casa/admin/wireguard_profiles?id=${encodeURIComponent(id)}`);
   }
 
-  getProvisionProfiles() {
+  // Provision templates (the REST path keeps its historical
+  // "provision_profiles" name for compatibility). Templates are sparse:
+  // `fields` carries only explicitly-set keys, nested under a "fields" key —
+  // {id?, name, fields: {...}}.
+  getProvisionTemplates() {
     return this._hass.callApi("GET", "casa/admin/provision_profiles");
   }
-  saveProvisionProfile(profile) {
-    const method = profile.id ? "PUT" : "POST";
-    return this._hass.callApi(method, "casa/admin/provision_profiles", profile);
+  saveProvisionTemplate(template) {
+    // A version-skewed backend (updated on disk, not yet restarted) predates
+    // the nested sparse `fields` body and would silently save an empty or
+    // stale template — refuse instead; the skew banner tells the admin to
+    // restart Home Assistant.
+    const backend = this.summary && this.summary.version;
+    if (this.panelVersion && backend && backend !== this.panelVersion) {
+      return Promise.reject(new Error("Casa was updated on disk — restart Home Assistant before saving templates."));
+    }
+    const method = template.id ? "PUT" : "POST";
+    return this._hass.callApi(method, "casa/admin/provision_profiles", template);
   }
-  deleteProvisionProfile(id) {
+  deleteProvisionTemplate(id) {
     return this._hass.callApi("DELETE", `casa/admin/provision_profiles?id=${encodeURIComponent(id)}`);
+  }
+  // One-time bulk apply of a template's set live fields to selected devices;
+  // devices do not become attached to the template.
+  applyTemplateToDevices({ templateId, deviceIds, sendPush = true, notifyPush = false, title = "", message = "" }) {
+    return this.queueUpdate({
+      update_type: "profile",
+      action: "update",
+      profile_id: templateId,
+      device_ids: deviceIds,
+      send_update_push: sendPush,
+      notify_push: notifyPush,
+      title,
+      message,
+    });
   }
 
   checkUsername(username, name = "") {
@@ -209,13 +235,26 @@ export class CasaApi {
   updateDevice(body) {
     return this._hass.callApi("PUT", "casa/admin/device", body);
   }
-  // "Force Device Changes": pushes an off-profile fields override to a
+  // "Force Device Changes": one-time direct stamp of live fields onto a
   // single device (see CasaAdminDeviceView.put's provisioning_fields branch).
   updateDeviceProvisioning(deviceId, fields) {
     return this.updateDevice({ device_id: deviceId, provisioning_fields: fields });
   }
   queueUpdate(req) {
     return this._hass.callApi("POST", "casa/admin/queue_update", req);
+  }
+  // Reauthenticate a device with a new username/password
+  // ({device_id, user_id? | username? | create_user: {name, username},
+  //   password?, scramble_old?, send_update_push?}).
+  reauthDevice(body) {
+    // A version-skewed backend (updated on disk, not yet restarted) has no
+    // reauth_device route and would 404 confusingly — refuse instead; the
+    // skew banner tells the admin to restart Home Assistant.
+    const backend = this.summary && this.summary.version;
+    if (this.panelVersion && backend && backend !== this.panelVersion) {
+      return Promise.reject(new Error("Casa was updated on disk — restart Home Assistant before reauthenticating devices."));
+    }
+    return this._hass.callApi("POST", "casa/admin/reauth_device", body);
   }
   deleteQueuedUpdate(deviceId, updateId) {
     return this._hass.callApi(

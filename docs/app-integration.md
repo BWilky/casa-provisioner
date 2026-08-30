@@ -91,17 +91,49 @@ Removes the entries from the queue. Returns `{ "status": "ok", "remaining": <n> 
 
 ## 4. Update schema & how to apply
 
-| `type`      | `action` | `payload`                                                      | Apply                              |
-|-------------|----------|----------------------------------------------------------------|------------------------------------|
-| `wireguard` | `update` | `{ "config": "<wg .conf text>", "excluded_wifi": "<ssid|''>" }` | install / replace the tunnel       |
-| `wireguard` | `revoke` | `{}`                                                           | remove the tunnel                  |
-| `profile`   | `update` | `{ "profile_id": "...", "name": "...", "fields": { ... } }`     | apply `fields` (same as provisioning) |
+| `type`      | `action`         | `payload`                                                      | Apply                              |
+|-------------|------------------|----------------------------------------------------------------|------------------------------------|
+| `wireguard` | `update`         | `{ "config": "<wg .conf text>", "excluded_wifi": "<ssid|''>" }` | install / replace the tunnel       |
+| `wireguard` | `revoke`         | `{}`                                                           | remove the tunnel                  |
+| `profile`   | `update`         | `{ "profile_id": "...", "name": "...", "fields": { ... } }`     | apply `fields` (same as provisioning) |
+| `auth`      | `reauthenticate` | `{ "username": "...", "password": "..." }`                     | log out and auto-login as the new user (below) |
+
+### `auth` / `reauthenticate` — remote credential rotation
+
+Admin-initiated switch of the account a device logs in as, without a full
+re-provision. On applying:
+
+1. Keep everything except the HA session: `device_id`, push registration,
+   `device_key`/`device_key_id`, server URL, and all provisioning fields
+   stay untouched.
+2. **Do not ack this entry** (unlike every other type). Tear down only the
+   web session: unmount the WebView, wipe WebKit data (drops the old
+   `hassTokens`), remount the same server URL, and let the auto-login
+   injector sign in with the new `username`/`password`.
+3. A failed login lands the device on the HA login screen and eventually
+   follows the normal auth-failure wipe paths — there is no rollback.
+
+Server-side lifecycle: the queue entry is **auto-dequeued** on the device's
+first authenticated contact (register or heartbeat) as the new user, which is
+also when the server moves the device record, rebinds `refresh_token_id`, and
+revokes the old session token. That is why the device must NOT ack: leaving
+the entry queued means a broken apply simply re-delivers on the next
+heartbeat pull until the reauth completes (or the device wipes). Apps that
+predate this type ignore the entry and never ack it either — the server
+clears it at completion or on admin cancel. The push copy travels only inside
+the encrypted `casa_update` envelope (§5), never in plaintext APNs payload.
 
 ---
 
 ## 5. Push payloads
 
 Delivered via APNs through the relay — same channel as today's WireGuard pushes.
+
+Silent pushes are sent with `apns-push-type: background` / `apns-priority: 5`
+and a `content-available: 1` payload with no `alert` key (requires a relay
+built after 26.07; older relays degrade to an empty-alert push that only
+reaches a foregrounded app). The app must declare the `remote-notification`
+background mode to be woken for these while suspended.
 
 ### Silent update push (new, ackable)
 

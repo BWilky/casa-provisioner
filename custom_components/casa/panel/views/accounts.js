@@ -109,7 +109,12 @@ export function createView(app) {
 
   /* ---------- actions ---------- */
 
-  function openCreateModal() {
+  async function openCreateModal() {
+    // Shared name→username slug + live availability chip (same module the
+    // guided wizard and Reauthenticate modal use). null → degrade to plain
+    // lowercase-on-input; create_user stays the authoritative validator.
+    const usernameUtils = await app.loadModule("views/username-utils.js").catch(() => null);
+
     const body = document.createElement("div");
     body.innerHTML = `
       <div class="field">
@@ -119,6 +124,8 @@ export function createView(app) {
       <div class="field">
         <label>Username *</label>
         <input class="input" id="acc-username" placeholder="e.g. john" autocapitalize="none" autocomplete="off">
+        <div class="field__help">Auto-generated from the name — edit to override.</div>
+        <div id="acc-availability" style="margin-top:4px;"></div>
       </div>
       <div class="field">
         <label>Password</label>
@@ -127,9 +134,18 @@ export function createView(app) {
       </div>
       <div class="field__error" id="acc-err" hidden></div>`;
     const userInput = body.querySelector("#acc-username");
-    userInput.addEventListener("input", () => {
-      userInput.value = userInput.value.toLowerCase();
-    });
+    if (usernameUtils) {
+      usernameUtils.attachUsernameField({
+        nameInput: body.querySelector("#acc-name"),
+        usernameInput: userInput,
+        hintEl: body.querySelector("#acc-availability"),
+        checkUsername: (u, n) => api.checkUsername(u, n),
+      });
+    } else {
+      userInput.addEventListener("input", () => {
+        userInput.value = userInput.value.toLowerCase();
+      });
+    }
     ui.openModal({
       title: "Create guest account",
       bodyEl: body,
@@ -151,6 +167,18 @@ export function createView(app) {
             btn.disabled = true;
             btn.textContent = "Creating…";
             try {
+              // Advisory pre-flight for a friendlier message than the raw
+              // create_user error; create_user remains authoritative.
+              const avail = await api.checkUsername(username, name).catch(() => null);
+              if (avail && avail.available === false) {
+                errEl.hidden = false;
+                errEl.textContent = avail.username_conflict
+                  ? "That username is already taken."
+                  : "A user with this name already exists.";
+                btn.disabled = false;
+                btn.textContent = "Create";
+                return false;
+              }
               const res = await api.createUser({ name, username, password: password || undefined, localOnly: true });
               const resp = unwrap(res);
               // Form modal closes (return undefined); credentials get their own
@@ -165,7 +193,7 @@ export function createView(app) {
               app.refresh();
             } catch (err) {
               errEl.hidden = false;
-              errEl.textContent = "Failed: " + ((err && err.message) || err);
+              errEl.textContent = "Failed: " + ui.errMsg(err);
               btn.disabled = false;
               btn.textContent = "Create";
               return false;
@@ -192,7 +220,7 @@ export function createView(app) {
             password: resp.password || "(randomly scrambled)",
           });
         } catch (err) {
-          ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }
       },
     });
@@ -209,7 +237,7 @@ export function createView(app) {
           ui.toast(`Account '${a.username}' removed.`);
           app.refresh();
         } catch (err) {
-          ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }
       },
     });
@@ -263,7 +291,7 @@ export function createView(app) {
             <button class="tab" id="ac-tab-devices">Devices</button>
             <button class="tab tab--active">Accounts</button>
             <button class="tab" id="ac-tab-sessions">Sessions</button>
-            <button class="tab" id="ac-tab-profiles">Provision Profiles</button>
+            <button class="tab" id="ac-tab-profiles">Provision Templates</button>
             <button class="tab" id="ac-tab-wireguard">WireGuard Profiles</button>
           </div>
           <div class="list-toolbar">
@@ -295,7 +323,7 @@ export function createView(app) {
       });
       el.querySelector("#ac-tab-devices").addEventListener("click", () => app.navigate("/"));
       el.querySelector("#ac-tab-sessions").addEventListener("click", () => app.navigate("/sessions"));
-      el.querySelector("#ac-tab-profiles").addEventListener("click", () => app.navigate("/profiles"));
+      el.querySelector("#ac-tab-profiles").addEventListener("click", () => app.navigate("/templates"));
       el.querySelector("#ac-tab-wireguard").addEventListener("click", () => app.navigate("/wireguard"));
       el.querySelector("#ac-create").addEventListener("click", openCreateModal);
       refs.results.addEventListener("click", onResultsClick);

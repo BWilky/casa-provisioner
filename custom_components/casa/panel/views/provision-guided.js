@@ -1,21 +1,20 @@
 // Casa admin panel — guided "new device + individual account" flow at
 // /provision/guided, reached from the scenario popup on /provision. Unlike
 // the classic wizard (provision.js), this flow CREATES the guest account:
-// Device (name → slugged username + auto password) → Profile (pick a saved
-// profile and tweak it) → Deliver (setup link by default, QR optional, BLE
+// Device (name → slugged username + auto password) → Template (pick a saved
+// template and tweak it) → Deliver (setup link by default, QR optional, BLE
 // under Advanced) → Done (one-time credentials + links/QR).
 //
 // Deploy order is create_user → provision, both keyed off state so a retry
 // after a failed provision never duplicates the account (createdUser guard),
-// never re-saves a forked profile (savedProfileId guard) and never rotates
+// never re-saves a forked template (savedTemplateId guard) and never rotates
 // the password (it is sent explicitly). The typed device name rides
 // casa.provision as device_alias and is applied server-side when the device
-// self-registers, so profile process fields (username etc.) are irrelevant
-// here — the new account always wins.
+// self-registers.
 
 const STEPS = [
   { id: "device", label: "Device" },
-  { id: "profile", label: "Profile" },
+  { id: "profile", label: "Template" },
   { id: "deliver", label: "Deliver" },
   { id: "result", label: "Done" },
 ];
@@ -29,8 +28,6 @@ const KEY_SECTION = {
   wireguard_profile_id: "pushvpn",
 };
 
-const USERNAME_RE = /^[a-z0-9][a-z0-9-]*$/;
-
 export function createView(app) {
   const { api, ui } = app;
   const esc = ui.esc;
@@ -39,20 +36,10 @@ export function createView(app) {
   const trim = (v) => String(v ?? "").trim();
   const bleAvailable = () => !!(app.hass() && app.hass().services && app.hass().services.esphome);
 
-  const slugify = (s) =>
-    String(s)
-      .toLowerCase()
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-z0-9\s_-]/g, "")
-      .trim()
-      .replace(/[\s_]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-
   /* ---------- lazily loaded siblings (never static imports) ---------- */
   let fieldsMod = null; // views/profile-fields.js
   let previewMod = null; // payload-preview.js
+  let utilsMod = null; // views/username-utils.js \u2014 slugify/USERNAME_RE, needed by step 1
 
   /* ---------- per-mount state ---------- */
   let mountToken = 0;
@@ -73,18 +60,19 @@ export function createView(app) {
       password: "",
       deviceError: "",
       createdUser: null, // {name, username, password, user_id} once create_user succeeds
-      // step 2 — profile
-      profiles: null, // null = loading
+      // step 2 — template
+      profiles: null, // null = loading (saved templates; API key stays "profiles")
       profilesError: null,
-      chosen: false, // a starting point (profile or defaults) was picked
-      profile: null, // selected saved-profile object, null = defaults
+      chosen: false, // a starting point (template or defaults) was picked
+      profile: null, // selected saved-template object, null = defaults
+      templateSetKeys: null, // Set of fields the selected template sets
       form: null, // fieldsMod.DEFAULTS shape
       baseline: null, // collectFields snapshot at selection, for divergence diff
       formOpen: { connection: false, appui: false, access: false, pushvpn: false },
       profileError: "",
       forkChoice: null, // null | "shared" | "oneoff" — remembered across retries
       forkName: "",
-      savedProfileId: null, // set once the forked profile saves (retry guard)
+      savedProfileId: null, // set once the forked template saves (retry guard)
       // step 3 — deliver
       linkChecked: true,
       qrChecked: false,
@@ -116,15 +104,15 @@ export function createView(app) {
     if (state.step === "profile") render();
     const token = mountToken;
     try {
-      const res = await api.getProvisionProfiles();
+      const res = await api.getProvisionTemplates();
       if (token !== mountToken || !state) return;
       state.profiles = (res && res.profiles) || [];
     } catch (err) {
       if (token !== mountToken || !state) return;
       state.profiles = [];
-      state.profilesError = (err && err.message) || String(err);
+      state.profilesError = ui.errMsg(err);
     }
-    // A site with no profiles shouldn't hit a dead "pick one" screen.
+    // A site with no templates shouldn't hit a dead "pick one" screen.
     if (!state.profiles.length && !state.chosen && fieldsMod) selectStartingPoint(null, { rerender: false });
     if (state.step === "profile") render();
   }
@@ -152,17 +140,8 @@ export function createView(app) {
   /* ---------- username availability (advisory — create_user is authoritative) ---------- */
 
   function availabilityHtml() {
-    if (state.createdUser) return "";
-    const a = state.availability;
-    const username = trim(state.username);
-    if (!username || !a) return "";
-    if (a.checking) return `<span class="muted" style="font-size:12px;">Checking availability…</span>`;
-    if (a.for !== username) return "";
-    if (a.available) {
-      return `<span class="chip chip--ok"><ha-icon icon="mdi:check-circle" style="--mdc-icon-size:14px;"></ha-icon> Available</span>`;
-    }
-    const what = a.username_conflict ? "Username already in use" : "A user with this name already exists";
-    return `<span class="chip chip--error"><ha-icon icon="mdi:alert-circle" style="--mdc-icon-size:14px;"></ha-icon> ${esc(what)}</span>`;
+    if (state.createdUser || !utilsMod) return "";
+    return utilsMod.availabilityHintHtml(state.availability, trim(state.username), esc);
   }
 
   function renderAvailability() {
@@ -173,7 +152,7 @@ export function createView(app) {
   function scheduleAvailability() {
     clearTimeout(availTimer);
     const username = trim(state.username);
-    if (!username || state.createdUser || !USERNAME_RE.test(username)) {
+    if (!username || state.createdUser || !utilsMod || !utilsMod.USERNAME_RE.test(username)) {
       state.availability = null;
       renderAvailability();
       return;
@@ -291,7 +270,7 @@ export function createView(app) {
         missing.forEach((m) => markFieldError(m === "Device name" ? "deviceName" : "username", "Required."));
         return;
       }
-      if (!USERNAME_RE.test(username)) {
+      if (utilsMod && !utilsMod.USERNAME_RE.test(username)) {
         state.deviceError = "Username can only contain lowercase letters, numbers and dashes.";
         render();
         markFieldError("username", "Lowercase letters, numbers and dashes only.");
@@ -310,18 +289,21 @@ export function createView(app) {
     gotoStep("profile");
   }
 
-  /* ---------- step 2: profile ---------- */
+  /* ---------- step 2: template ---------- */
 
   function selectStartingPoint(profile, { rerender = true } = {}) {
     state.chosen = true;
     state.profile = profile || null;
     const f = (profile && profile.fields) || {};
+    // Templates are sparse — set fields overlay the defaults, and
+    // templateSetKeys drives the "from template" / "review" badges.
     state.form = { ...fieldsMod.DEFAULTS, ...f };
+    state.templateSetKeys = profile
+      ? new Set(Object.keys(f).filter((k) => fieldsMod.PROFILE_KEYS.has(k)))
+      : null;
     if (!trim(state.form.host_url)) state.form.host_url = window.location.origin;
     state.baseline = fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS);
-    // Legacy profiles may carry stored process values — honor timeout if so.
-    const legacyTimeout = parseInt(f.timeout_minutes, 10);
-    state.timeoutMinutes = Number.isFinite(legacyTimeout) ? legacyTimeout : fieldsMod.DEFAULTS.timeout_minutes;
+    state.timeoutMinutes = fieldsMod.DEFAULTS.timeout_minutes;
     // A new selection is a new baseline — any earlier fork decision is stale.
     state.forkChoice = null;
     state.savedProfileId = null;
@@ -346,13 +328,13 @@ export function createView(app) {
 
   function profilePickerHtml() {
     if (state.profiles === null) {
-      return `<div class="empty-state" style="padding:32px 16px;"><span class="muted">Loading profiles…</span></div>`;
+      return `<div class="empty-state" style="padding:32px 16px;"><span class="muted">Loading templates…</span></div>`;
     }
     let errHtml = "";
     if (state.profilesError) {
       errHtml = `
         <div class="errbar" style="display:flex; align-items:center; gap:10px;">
-          <span style="flex:1;">Failed to load profiles: ${esc(state.profilesError)}</span>
+          <span style="flex:1;">Failed to load templates: ${esc(state.profilesError)}</span>
           <button class="btn btn--outlined" data-act="retry-profiles" style="height:28px; flex:none;">Retry</button>
         </div>`;
     }
@@ -366,7 +348,7 @@ export function createView(app) {
         id: p.id,
         icon: "mdi:file-cog-outline",
         title: p.name || "(unnamed)",
-        desc: trim(f.host_url) || "Saved provisioning profile",
+        desc: trim(f.host_url) || "Saved provision template",
         chips,
         active: !!(state.chosen && state.profile && state.profile.id === p.id),
       });
@@ -376,17 +358,29 @@ export function createView(app) {
         act: "select-defaults",
         icon: "mdi:tune",
         title: "Start from defaults",
-        desc: "No profile — sensible defaults you can adjust below",
+        desc: "No template — sensible defaults you can adjust below",
         active: !!(state.chosen && !state.profile),
       })
     );
     return `${errHtml}<div style="display:flex; flex-direction:column; gap:10px;">${cards.join("")}</div>`;
   }
 
+  // Same badge semantics as the classic wizard: template-set fields are
+  // "from template", unset PROFILE-scope fields are "review".
+  function templateAnnotations() {
+    if (!state.profile || !state.templateSetKeys) return null;
+    const ann = {};
+    for (const key of fieldsMod.PROFILE_KEYS) {
+      ann[key] = state.templateSetKeys.has(key) ? "template" : "review";
+    }
+    return ann;
+  }
+
   function tweakSectionDefs() {
     const F = fieldsMod;
+    const annotations = templateAnnotations();
     const shared = (sectionId, extra = {}) =>
-      F.renderSectionHtml(sectionId, state.form, { esc, heading: false, wgProfiles: state.wgProfiles || [], ...extra });
+      F.renderSectionHtml(sectionId, state.form, { esc, heading: false, wgProfiles: state.wgProfiles || [], annotations, ...extra });
     return [
       { id: "connection", label: "Connection", render: () => shared("connection", { fields: new Set(["host_url"]) }) },
       { id: "appui", label: "App UI", render: () => shared("appui", { fields: F.LIVE_KEYS }) },
@@ -416,7 +410,7 @@ export function createView(app) {
         </div>`;
     }).join("");
     const note = state.profile
-      ? `Tweak anything below — you'll be asked whether changes become a new shared profile or stay with this device.`
+      ? `Tweak anything below — you'll be asked whether changes become a new template or stay with this device.`
       : `Adjust the device's configuration below.`;
     return `
       <h4 style="margin:18px 0 4px; font-size:14px; font-weight:600;">Settings</h4>
@@ -427,7 +421,7 @@ export function createView(app) {
   function renderProfileStep() {
     return `
       ${state.profileError ? `<div class="errbar">${esc(state.profileError)}</div>` : ""}
-      <h4 style="margin:0 0 10px; font-size:14px; font-weight:600;">Start from a provisioning profile</h4>
+      <h4 style="margin:0 0 10px; font-size:14px; font-weight:600;">Start from a template</h4>
       <div id="pg-picker">${profilePickerHtml()}</div>
       ${tweaksHtml()}
       ${stepFooter("Continue", "to-deliver")}`;
@@ -436,7 +430,7 @@ export function createView(app) {
   function toDeliver() {
     state.profileError = "";
     if (!state.chosen || !state.form) {
-      state.profileError = "Choose a starting point — a saved profile, or the defaults.";
+      state.profileError = "Choose a starting point — a saved template, or the defaults.";
       render();
       return;
     }
@@ -544,7 +538,7 @@ export function createView(app) {
             <span class="muted">— ${esc(trim(state.username))} @ ${esc(trim(f.host_url))}</span></span>
           <span class="spacer"></span>
           ${state.profile
-            ? `<span class="chip chip--app">Profile: ${esc(state.profile.name || state.profile.id)}</span>`
+            ? `<span class="chip chip--app">Template: ${esc(state.profile.name || state.profile.id)}</span>`
             : `<span class="chip chip--neutral">Defaults</span>`}
         </div>
       </div>
@@ -603,7 +597,7 @@ export function createView(app) {
     input.focus();
   }
 
-  /* ---------- fork prompt (profile diverged) ---------- */
+  /* ---------- fork prompt (template diverged) ---------- */
 
   function changedProfileKeys(fields) {
     if (!state.profile || !state.baseline) return [];
@@ -629,13 +623,13 @@ export function createView(app) {
       body.innerHTML = `
         <p style="margin:0 0 10px; font-size:14px; line-height:1.5;">
           You changed ${changedKeys.length} setting${changedKeys.length === 1 ? "" : "s"} from
-          <strong>${esc(profileName)}</strong>. Save them as a new reusable profile, or keep them just for this device?
+          <strong>${esc(profileName)}</strong>. Save them as a new reusable template, or keep them just for this device?
         </p>
         <div style="display:flex; flex-wrap:wrap; gap:4px; margin:0 0 14px;">${chips}</div>
         <div class="field" data-field="forkName">
-          <label>New profile name</label>
+          <label>New template name</label>
           <input class="input" id="pg-fork-name" value="${esc(profileName + " (copy)")}">
-          <div class="field__help">Only used if you save as a shared profile.</div>
+          <div class="field__help">Only used if you save as a new template.</div>
         </div>`;
       const modal = ui.openModal({
         title: "Save your changes?",
@@ -644,7 +638,7 @@ export function createView(app) {
           { label: "Cancel", variant: "text", onClick: () => done(null) },
           { label: "This device only", variant: "outlined", onClick: () => done({ kind: "oneoff" }) },
           {
-            label: "Save as shared profile",
+            label: "Save as new template",
             variant: "primary",
             onClick: () => {
               const name = body.querySelector("#pg-fork-name").value.trim();
@@ -652,7 +646,7 @@ export function createView(app) {
                 const wrap = body.querySelector('[data-field="forkName"]');
                 if (wrap && !wrap.classList.contains("field--error")) {
                   wrap.classList.add("field--error");
-                  wrap.insertAdjacentHTML("beforeend", `<div class="field__error">Name the new profile.</div>`);
+                  wrap.insertAdjacentHTML("beforeend", `<div class="field__error">Name the new template.</div>`);
                 }
                 return false;
               }
@@ -698,17 +692,24 @@ export function createView(app) {
     state.busy = true;
     render();
 
-    // 2. Save the forked profile (skipped on retry via savedProfileId).
+    // 2. Save the forked template (skipped on retry via savedProfileId).
+    // Sparse: the fork sets the original template's set keys plus whatever
+    // the admin changed here — untouched defaults stay unset on the fork.
     if (state.forkChoice === "shared" && !state.savedProfileId) {
       try {
-        const res = await api.saveProvisionProfile({ name: state.forkName, ...fields });
+        const forkKeys = new Set([...(state.templateSetKeys || []), ...changedKeys]);
+        const forkFields = {};
+        for (const key of Object.keys(fields)) {
+          if (forkKeys.has(key)) forkFields[key] = fields[key];
+        }
+        const res = await api.saveProvisionTemplate({ name: state.forkName, fields: forkFields });
         if (token !== mountToken || !state) return;
         if (res && res.id) state.savedProfileId = res.id;
-        ui.toast(`Profile '${state.forkName}' created.`);
+        ui.toast(`Template '${state.forkName}' created.`);
       } catch (err) {
         if (token !== mountToken || !state) return;
         state.busy = false;
-        state.deployError = "Failed to save profile: " + ((err && err.message) || String(err));
+        state.deployError = "Failed to save template: " + (ui.errMsg(err));
         render();
         return;
       }
@@ -726,7 +727,7 @@ export function createView(app) {
         resp = unwrap(res);
       } catch (err) {
         if (token !== mountToken || !state) return;
-        resp = { error: (err && err.message) || String(err) };
+        resp = { error: ui.errMsg(err) };
       }
       if (resp && resp.error) {
         // Almost always a name/username collision — send them back to fix it.
@@ -751,6 +752,9 @@ export function createView(app) {
       method,
       ...fields,
       username: state.createdUser.username,
+      // Exact target: name/credential matching can't confuse accounts whose
+      // display name differs from the login username (guided accounts always do).
+      user_id: state.createdUser.user_id || undefined,
       password: state.createdUser.password,
       device_alias: trim(state.deviceName),
       timeout_minutes: parseInt(state.timeoutMinutes, 10) || 0,
@@ -759,8 +763,8 @@ export function createView(app) {
     };
     const pin = trim(state.pin);
     if (pin) data.pin = pin;
-    // Lineage: the forked shared profile, or the unchanged original. One-off
-    // forks carry no profile id — the fields alone describe the device.
+    // Lineage: the forked template, or the unchanged original. One-off
+    // forks carry no template id — the fields alone describe the device.
     if (state.savedProfileId) data.profile = state.savedProfileId;
     else if (state.profile && state.forkChoice !== "oneoff") data.profile = state.profile.id;
     if (state.bleChecked) data.esphome_service = state.bleTargets.slice();
@@ -786,7 +790,7 @@ export function createView(app) {
     } catch (err) {
       if (token !== mountToken || !state) return;
       state.busy = false;
-      state.deployError = (err && err.message) || String(err);
+      state.deployError = ui.errMsg(err);
       render();
     }
   }
@@ -980,8 +984,8 @@ export function createView(app) {
     switch (field) {
       case "deviceName":
         state.deviceName = t.value;
-        if (!state.usernameEdited) {
-          state.username = slugify(t.value);
+        if (!state.usernameEdited && utilsMod) {
+          state.username = utilsMod.slugify(t.value);
           const userInput = refs.body.querySelector('input[data-field="username"]');
           if (userInput) userInput.value = state.username;
         }
@@ -1075,7 +1079,16 @@ export function createView(app) {
       refs.body.addEventListener("input", onBodyInput);
       refs.body.addEventListener("keydown", onBodyKeydown);
       window.addEventListener("beforeunload", onBeforeUnload);
-      render(); // step 1 needs no async data — usable immediately
+      // username-utils is needed by step 1's inputs (name→username slug), so
+      // load it before the first render; the guards in onBodyInput make a
+      // failed load degrade to manual username entry rather than breaking.
+      try {
+        utilsMod = utilsMod || (await app.loadModule("views/username-utils.js"));
+      } catch {
+        utilsMod = null;
+      }
+      if (token !== mountToken) return;
+      render(); // step 1 needs no other async data — usable immediately
 
       try {
         const [fields, preview] = await Promise.all([
@@ -1087,7 +1100,7 @@ export function createView(app) {
         previewMod = preview;
       } catch (err) {
         if (token !== mountToken) return;
-        refs.body.innerHTML = `<div class="errbar">Failed to load: ${esc(String((err && err.message) || err))}</div>`;
+        refs.body.innerHTML = `<div class="errbar">Failed to load: ${esc(ui.errMsg(err))}</div>`;
         return;
       }
 
@@ -1130,7 +1143,7 @@ export function createView(app) {
                   try {
                     await api.removeUser(created.username);
                   } catch (err) {
-                    ui.toast("Failed to remove account: " + ((err && err.message) || err), { error: true });
+                    ui.toast("Failed to remove account: " + ui.errMsg(err), { error: true });
                   }
                   done(true);
                 },

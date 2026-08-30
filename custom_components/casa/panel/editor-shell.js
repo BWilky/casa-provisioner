@@ -1,7 +1,7 @@
 // Casa admin panel — shared three-pane editor shell (ESPHome Device Builder
 // style): top bar with title/chips/pane toggles, left navigator accordion,
 // center form pane, right read-only JSON code pane, optional footer. Consumed
-// by the device and profile editor views via app.loadModule("editor-shell.js").
+// by the device and template editor views via app.loadModule("editor-shell.js").
 // No sibling imports — the `ui` object and `store` are passed in by the view.
 
 /* ---------- editor shell ---------- */

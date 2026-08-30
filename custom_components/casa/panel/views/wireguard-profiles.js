@@ -22,7 +22,7 @@ export function createView(app) {
       const res = await api.getWireguardProfiles();
       profiles = (res && res.profiles) || [];
     } catch (err) {
-      if (refs) refs.err.innerHTML = `<div class="errbar">${ui.esc((err && err.message) || err)}</div>`;
+      if (refs) refs.err.innerHTML = `<div class="errbar">${ui.esc(ui.errMsg(err))}</div>`;
       profiles = [];
     }
     loading = false;
@@ -130,7 +130,7 @@ export function createView(app) {
               load();
             } catch (err) {
               errEl.hidden = false;
-              errEl.textContent = "Failed: " + ((err && err.message) || err);
+              errEl.textContent = "Failed: " + ui.errMsg(err);
               btn.disabled = false;
               btn.textContent = existing ? "Save" : "Create";
               return false;
@@ -144,7 +144,7 @@ export function createView(app) {
   function confirmRemove(p) {
     ui.showConfirm({
       title: "Delete profile",
-      message: `Are you sure you want to delete WireGuard profile '${p.alias || p.id}'? Provisioning profiles linking to it will fall back to no VPN until re-linked.`,
+      message: `Are you sure you want to delete WireGuard profile '${p.alias || p.id}'? Provision templates linking to it will fall back to no VPN until re-linked.`,
       confirmLabel: "Delete",
       onConfirm: async () => {
         try {
@@ -152,7 +152,7 @@ export function createView(app) {
           ui.toast(`Profile '${p.alias || p.id}' deleted.`);
           load();
         } catch (err) {
-          ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }
       },
     });
@@ -206,7 +206,7 @@ export function createView(app) {
             <button class="tab" id="wg-tab-devices">Devices</button>
             <button class="tab" id="wg-tab-accounts">Accounts</button>
             <button class="tab" id="wg-tab-sessions">Sessions</button>
-            <button class="tab" id="wg-tab-profiles">Provision Profiles</button>
+            <button class="tab" id="wg-tab-profiles">Provision Templates</button>
             <button class="tab tab--active">WireGuard Profiles</button>
           </div>
           <div class="list-toolbar">
@@ -239,7 +239,7 @@ export function createView(app) {
       el.querySelector("#wg-tab-devices").addEventListener("click", () => app.navigate("/"));
       el.querySelector("#wg-tab-accounts").addEventListener("click", () => app.navigate("/accounts"));
       el.querySelector("#wg-tab-sessions").addEventListener("click", () => app.navigate("/sessions"));
-      el.querySelector("#wg-tab-profiles").addEventListener("click", () => app.navigate("/profiles"));
+      el.querySelector("#wg-tab-profiles").addEventListener("click", () => app.navigate("/templates"));
       el.querySelector("#wg-create").addEventListener("click", () => openProfileModal(null));
       refs.results.addEventListener("click", onResultsClick);
 

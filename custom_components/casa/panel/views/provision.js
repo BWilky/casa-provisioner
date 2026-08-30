@@ -1,19 +1,27 @@
 // Casa admin panel — provision device flow. Full-page view at /provision
-// with a step-tab flow: Profile (pick a saved profile, create a new one, or
+// with a step-tab flow: Template (pick a saved template, create a new one, or
 // one-off config) → Configure → Deploy (QR / deep link / BLE) → Done. Tabs
 // are progress indicators — earlier tabs are clickable and preserve state,
 // forward movement only happens through the footer buttons so validation
-// can't be skipped. "Create new profile" saves via the profiles API at
-// deploy time (no orphan profiles if the flow is abandoned); retries reuse
-// the created id so a failed provision never duplicates the profile.
+// can't be skipped. "Create new template" saves via the templates API at
+// deploy time (no orphan templates if the flow is abandoned); retries reuse
+// the created id so a failed provision never duplicates the template.
 //
-// The field schema/renderer is shared with the profile editor and device
+// Templates are sparse (they store only explicitly-set fields), so the
+// configure step always shows the full form: fields the template sets are
+// badged "from template", the rest are badged "review" and prefilled with
+// the system defaults for the admin to fill in or accept. The resolved
+// values are stamped at provision time — precedence is admin input >
+// template > default, enforced both here (the form is seeded that way) and
+// server-side (get_field).
+//
+// The field schema/renderer is shared with the template editor and device
 // editor via profile-fields.js — this view renders the same sections
 // filtered by scope: template (LIVE + expiration_hours) fields alongside
 // process-only fields (username/password/pin, deauth, timeout, scramble,
 // Wi-Fi join), which are legitimate here because this flow IS the
 // provisioning action. Process values ride casa.provision service_data and
-// are never persisted to a profile.
+// are never persisted to a template.
 
 const METHOD_LABELS = {
   qr: "Generate Link & QR Code",
@@ -43,7 +51,7 @@ const FORM_PROCESS_SET = new Set([
 ]);
 
 const STEPS = [
-  { id: "profile", label: "Profile" },
+  { id: "template", label: "Template" },
   { id: "configure", label: "Configure" },
   { id: "deploy", label: "Deploy" },
   { id: "result", label: "Done" },
@@ -61,7 +69,6 @@ export function createView(app) {
   /* ---------- lazily loaded siblings (never static imports) ---------- */
   let fieldsMod = null; // views/profile-fields.js
   let previewMod = null; // payload-preview.js
-  let renderJsonCode = null; // editor-shell.js named export
 
   /* ---------- per-mount state ---------- */
   let mountToken = 0;
@@ -73,25 +80,21 @@ export function createView(app) {
 
   function freshState() {
     return {
-      step: "profile", // "profile" | "configure" | "deploy" | "result"
-      entry: null, // "profile" | "new" | "oneoff"
+      step: "template", // "template" | "configure" | "deploy" | "result"
+      entry: null, // "template" | "new" | "oneoff"
       // step 1
-      profiles: null, // null = loading
-      profilesError: null,
+      templates: null, // null = loading
+      templatesError: null,
       search: "",
-      profile: null, // selected saved-profile object
+      template: null, // selected saved-template object
+      templateSetKeys: null, // Set of fields the selected template sets
       presetUsername: "",
-      // step 2 — profile path (compact)
-      details: { host_url: "", username: "", pin: "" },
-      procOpts: null, // process-setting overrides; seeded per selected profile
-      procOptionsOpen: false,
-      previewOpen: false,
-      overrideFields: false, // compact path escaped to the full form
-      // step 2 — new / one-off / override path (full form)
+      // step 2 — full form (all entry kinds)
       form: null, // fieldsMod.DEFAULTS shape; built once per run
+      newSetKeys: null, // entry === "new": fields the admin touched (sparse template save)
       formOpen: { connection: true, appui: false, access: false, pushvpn: false, timing: false, process: false },
-      profileName: "", // entry === "new" only
-      savedProfileId: null, // set once saveProvisionProfile succeeds (retry guard)
+      templateName: "", // entry === "new" only
+      savedTemplateId: null, // set once saveProvisionTemplate succeeds (retry guard)
       configError: "",
       // step 3
       method: "qr",
@@ -107,26 +110,25 @@ export function createView(app) {
     };
   }
 
-  const isCompact = () => state.entry === "profile" && !state.overrideFields;
   const dirty = () => !!(state && state.entry !== null && state.step !== "result");
 
   /* ---------- data ---------- */
 
-  async function loadProfiles() {
-    state.profiles = null;
-    state.profilesError = null;
-    if (state.step === "profile") render();
+  async function loadTemplates() {
+    state.templates = null;
+    state.templatesError = null;
+    if (state.step === "template") render();
     const token = mountToken;
     try {
-      const res = await api.getProvisionProfiles();
+      const res = await api.getProvisionTemplates();
       if (token !== mountToken || !state) return;
-      state.profiles = (res && res.profiles) || [];
+      state.templates = (res && res.profiles) || [];
     } catch (err) {
       if (token !== mountToken || !state) return;
-      state.profiles = [];
-      state.profilesError = (err && err.message) || String(err);
+      state.templates = [];
+      state.templatesError = ui.errMsg(err);
     }
-    if (state.step === "profile") render();
+    if (state.step === "template") render();
   }
 
   function ensureWgProfiles() {
@@ -146,7 +148,6 @@ export function createView(app) {
       .then(() => {
         if (token !== mountToken || !state) return;
         rerenderFormSection("pushvpn");
-        updatePreview();
       });
   }
 
@@ -157,25 +158,23 @@ export function createView(app) {
     render();
   }
 
-  function selectProfile(profile) {
+  function selectTemplate(template) {
     if (!fieldsMod) return; // sibling modules still loading (sub-second window)
-    state.entry = "profile";
-    state.overrideFields = false;
-    state.profile = profile || null;
-    const f = (profile && profile.fields) || {};
-    state.details.host_url = trim(f.host_url) || window.location.origin;
-    state.details.username = state.presetUsername || trim(f.username);
-    state.details.pin = trim(f.pin).slice(0, 6);
-    // Process settings for this generation: prefilled from the profile's
-    // LEGACY stored process values when present (older profiles saved them),
-    // else defaults — what's shown is exactly what gets sent. username/pin
-    // stay compact top-level inputs.
-    state.procOpts = {};
-    for (const key of fieldsMod.PROCESS_KEYS) {
-      if (key === "username" || key === "pin") continue;
-      state.procOpts[key] = f[key] !== undefined ? f[key] : fieldsMod.DEFAULTS[key];
+    state.entry = "template";
+    state.template = template || null;
+    const f = (template && template.fields) || {};
+    // Seed the full form: template-set fields on top of the defaults. The
+    // admin can override anything — precedence admin input > template >
+    // default holds because the template's values are just the starting
+    // point, and get_field re-applies the same order server-side.
+    state.form = { ...fieldsMod.DEFAULTS };
+    for (const key of Object.keys(f)) {
+      if (fieldsMod.PROFILE_KEYS.has(key)) state.form[key] = f[key];
     }
-    state.procOptionsOpen = false;
+    state.templateSetKeys = new Set(Object.keys(f).filter((k) => fieldsMod.PROFILE_KEYS.has(k)));
+    state.formSource = "template";
+    if (!trim(state.form.host_url)) state.form.host_url = window.location.origin;
+    if (state.presetUsername) state.form.username = state.presetUsername;
     state.configError = "";
     gotoStep("configure");
   }
@@ -183,8 +182,12 @@ export function createView(app) {
   function selectEntry(kind) {
     if (!fieldsMod) return; // sibling modules still loading (sub-second window)
     state.entry = kind; // "new" | "oneoff"
-    state.overrideFields = false;
-    state.profile = null;
+    state.template = null;
+    state.templateSetKeys = null;
+    if (kind === "new" && !state.newSetKeys) state.newSetKeys = new Set();
+    // A form seeded from a template must not leak into a manual entry.
+    if (state.formSource === "template") state.form = null;
+    state.formSource = "manual";
     if (!state.form) {
       // Built once per run — later expander/gating re-renders always read
       // back from this object, so no keystroke is ever lost.
@@ -196,25 +199,8 @@ export function createView(app) {
     gotoStep("configure");
   }
 
-  // "Override fields" escape hatch from the compact profile-path configure
-  // screen: seeds the full form from the profile's fields plus whatever the
-  // admin already typed in the compact host/username/pin inputs and the
-  // Provisioning-options panel, then routes to the same full-form renderer.
-  // One-way — no path back to the compact view once triggered.
-  function overrideFieldsFromProfile() {
-    if (!state.profile) return;
-    const f = (state.profile && state.profile.fields) || {};
-    state.form = { ...fieldsMod.DEFAULTS, ...f, ...(state.procOpts || {}) };
-    state.form.host_url = trim(state.details.host_url) || state.form.host_url;
-    state.form.username = trim(state.details.username) || state.form.username;
-    state.form.pin = trim(state.details.pin) || state.form.pin;
-    state.overrideFields = true;
-    state.configError = "";
-    render();
-  }
-
   function goBack() {
-    if (state.step === "configure") gotoStep("profile");
+    if (state.step === "configure") gotoStep("template");
     else if (state.step === "deploy") gotoStep("configure");
   }
 
@@ -231,7 +217,7 @@ export function createView(app) {
       </button>`).join("");
   }
 
-  /* ---------- step 1: profile ---------- */
+  /* ---------- step 1: template ---------- */
 
   function entryCardsHtml() {
     return `
@@ -239,8 +225,8 @@ export function createView(app) {
         <button class="option-card" data-act="entry-new" style="flex:1; min-width:260px;">
           <ha-icon icon="mdi:file-plus-outline" style="color:var(--casa-text-2);"></ha-icon>
           <span class="option-card__text">
-            <span class="option-card__title" style="display:block;">Create new profile</span>
-            <span class="option-card__desc" style="display:block;">Build a reusable profile as you go — saved when you deploy</span>
+            <span class="option-card__title" style="display:block;">Create new template</span>
+            <span class="option-card__desc" style="display:block;">Build a reusable template as you go — saved when you deploy</span>
           </span>
           <ha-icon class="chevron" icon="mdi:chevron-right"></ha-icon>
         </button>
@@ -255,44 +241,45 @@ export function createView(app) {
       </div>`;
   }
 
-  function profileTableHtml() {
-    if (state.profiles === null) {
-      return `<div class="empty-state" style="padding:32px 16px;"><span class="muted">Loading profiles…</span></div>`;
+  function templateTableHtml() {
+    if (state.templates === null) {
+      return `<div class="empty-state" style="padding:32px 16px;"><span class="muted">Loading templates…</span></div>`;
     }
     let errHtml = "";
-    if (state.profilesError) {
+    if (state.templatesError) {
       errHtml = `
         <div class="errbar" style="display:flex; align-items:center; gap:10px;">
-          <span style="flex:1;">Failed to load profiles: ${esc(state.profilesError)}</span>
-          <button class="btn btn--outlined" data-act="retry-profiles" style="height:28px; flex:none;">Retry</button>
+          <span style="flex:1;">Failed to load templates: ${esc(state.templatesError)}</span>
+          <button class="btn btn--outlined" data-act="retry-templates" style="height:28px; flex:none;">Retry</button>
         </div>`;
     }
-    if (!state.profiles.length) {
+    if (!state.templates.length) {
       return `${errHtml}
         <div class="empty-state">
           <ha-icon icon="mdi:file-cog-outline"></ha-icon>
-          <div>No provisioning profiles yet</div>
+          <div>No provision templates yet</div>
           <div class="muted" style="font-size:13px;">Create one as you provision, or configure this device one-off.</div>
-          <button class="btn btn--primary" data-act="entry-new">+ Create new profile</button>
+          <button class="btn btn--primary" data-act="entry-new">+ Create new template</button>
         </div>`;
     }
     const q = state.search.trim().toLowerCase();
-    const matches = state.profiles.filter((p) => {
+    const matches = state.templates.filter((p) => {
       if (!q) return true;
       const f = p.fields || {};
-      return [p.name, f.username, f.host_url].some((v) => String(v || "").toLowerCase().includes(q));
+      return [p.name, f.host_url].some((v) => String(v || "").toLowerCase().includes(q));
     });
     if (!matches.length) {
       return `${errHtml}
         <div class="empty-state">
           <ha-icon icon="mdi:magnify-close"></ha-icon>
-          <div>No profiles match "${esc(state.search.trim())}"</div>
+          <div>No templates match "${esc(state.search.trim())}"</div>
           <button class="btn btn--text" data-act="clear-search">Clear search</button>
         </div>`;
     }
     const trs = matches
       .map((p) => {
         const f = p.fields || {};
+        const setCount = Object.keys(f).length;
         const chips = (previewMod ? previewMod.profileChips(p) : [])
           .map((c) => `<span class="chip ${esc(c.cls || "chip--neutral")}">${esc(c.label)}</span>`)
           .join("");
@@ -301,11 +288,12 @@ export function createView(app) {
             <strong>${esc(p.name || "(unnamed)")}</strong>
             ${chips ? `<div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">${chips}</div>` : ""}
           </td>
-          <td class="mono">${esc(f.host_url || "—")}${f.username ? ` <span class="muted">(${esc(f.username)})</span>` : ""}</td>
+          <td class="mono">${esc(f.host_url || "—")}</td>
+          <td><span class="chip chip--neutral">sets ${setCount} field${setCount === 1 ? "" : "s"}</span></td>
           <td>${esc(ui.fmtTime(p.updated_at))}</td>
           <td class="col-actions">
-            <button class="btn btn--icon" data-act="edit-profile" data-id="${esc(p.id)}" title="Edit profile"><ha-icon icon="mdi:pencil"></ha-icon></button>
-            <button class="btn btn--text" data-act="select-profile" data-id="${esc(p.id)}" style="height:28px;">Select</button>
+            <button class="btn btn--icon" data-act="edit-template" data-id="${esc(p.id)}" title="Edit template"><ha-icon icon="mdi:pencil"></ha-icon></button>
+            <button class="btn btn--text" data-act="select-template" data-id="${esc(p.id)}" style="height:28px;">Select</button>
           </td>
         </tr>`;
       })
@@ -313,29 +301,29 @@ export function createView(app) {
     return `${errHtml}
       <div class="card" style="overflow-x:auto;">
         <table class="table">
-          <thead><tr><th>Name</th><th>Host</th><th>Updated</th><th></th></tr></thead>
+          <thead><tr><th>Name</th><th>Host</th><th>Fields</th><th>Updated</th><th></th></tr></thead>
           <tbody>${trs}</tbody>
         </table>
       </div>`;
   }
 
-  function renderProfileStep() {
+  function renderTemplateStep() {
     return `
       ${entryCardsHtml()}
       <div style="border-top:1px solid var(--casa-divider); margin:8px 0 14px;"></div>
-      <h4 style="margin:0 0 10px; font-size:14px; font-weight:600;">Or start from a saved profile</h4>
+      <h4 style="margin:0 0 10px; font-size:14px; font-weight:600;">Or start from a saved template</h4>
       <div class="list-toolbar">
         <div class="search-field">
           <ha-icon icon="mdi:magnify"></ha-icon>
-          <input class="input" id="pw-search" type="search" placeholder="Search profiles…" value="${esc(state.search)}">
+          <input class="input" id="pw-search" type="search" placeholder="Search templates…" value="${esc(state.search)}">
         </div>
       </div>
-      <div id="pw-table">${profileTableHtml()}</div>`;
+      <div id="pw-table">${templateTableHtml()}</div>`;
   }
 
-  function rerenderProfileTable() {
+  function rerenderTemplateTable() {
     const table = refs && refs.body.querySelector("#pw-table");
-    if (table) table.innerHTML = profileTableHtml();
+    if (table) table.innerHTML = templateTableHtml();
   }
 
   /* ---------- step 2: configure ---------- */
@@ -351,99 +339,19 @@ export function createView(app) {
   }
 
   function originChipHtml() {
-    if (state.entry === "profile") {
-      return `<span class="chip chip--app">Profile: ${esc(state.profile ? state.profile.name || state.profile.id : "")}</span>`;
+    if (state.entry === "template") {
+      return `<span class="chip chip--app">Template: ${esc(state.template ? state.template.name || state.template.id : "")}</span>`;
     }
     if (state.entry === "new") {
-      return `<span class="chip chip--app">New profile: ${esc(trim(state.profileName) || "(unnamed)")}</span>`;
+      return `<span class="chip chip--app">New template: ${esc(trim(state.templateName) || "(unnamed)")}</span>`;
     }
     return `<span class="chip chip--neutral">One-off configuration</span>`;
   }
 
-  // Compact-path process settings (everything PROCESS-scope except the
-  // username/pin compact inputs): password override, deauth, provisioning
-  // window, scramble, Wi-Fi join. Prefilled from the selected profile's
-  // legacy stored values where present; always sent explicitly.
-  function procOptionsHtml() {
-    if (!fieldsMod || !state.procOpts) return "";
-    const procSet = new Set(Object.keys(state.procOpts));
-    const opts = { esc, heading: false, fields: procSet };
-    return `
-      <button class="btn btn--text" data-act="toggle-proc-options" style="margin:2px 0 8px; padding-left:0;">
-        <ha-icon icon="mdi:chevron-down" style="transition:transform 0.15s; transform:rotate(${state.procOptionsOpen ? "180deg" : "0deg"});"></ha-icon>
-        Provisioning options
-      </button>
-      <div ${state.procOptionsOpen ? "" : "hidden"}>
-        <div class="muted" style="font-size:12px; margin:0 0 10px;">
-          One-time settings for this provisioning run — prefilled from this
-          profile's saved settings where present, never stored on the device.
-        </div>
-        <div id="pw-proc-fields">
-          ${fieldsMod.renderSectionHtml("connection", state.procOpts, opts)}
-          ${fieldsMod.renderSectionHtml("timing", state.procOpts, opts)}
-          ${fieldsMod.renderSectionHtml("wifi", state.procOpts, opts)}
-        </div>
-      </div>`;
-  }
-
-  function previewAndOverrideHtml() {
-    return `
-      <div style="border-top:1px solid var(--casa-divider); margin-top:14px; padding-top:10px; display:flex; align-items:center; justify-content:space-between; gap:8px;">
-        <button class="btn btn--text" data-act="toggle-preview" style="padding-left:0;">
-          <ha-icon icon="mdi:chevron-down" style="transition:transform 0.15s; transform:rotate(${state.previewOpen ? "180deg" : "0deg"});"></ha-icon>
-          Preview full configuration
-        </button>
-        <button class="btn btn--text" data-act="override-fields">Override fields</button>
-      </div>
-      <div ${state.previewOpen ? "" : "hidden"}>
-        <div id="pw-preview-body" style="border:1px solid var(--casa-divider); border-radius:var(--casa-radius-sm); max-height:320px; overflow:auto; margin-top:4px; background:var(--casa-bg-2);"></div>
-      </div>`;
-  }
-
-  function renderCompactConfigure() {
-    const d = state.details;
-    return `
-      <div style="margin:0 0 14px;">${originChipHtml()}</div>
-      ${state.configError ? `<div class="errbar">${esc(state.configError)}</div>` : ""}
-      <div class="field">
-        <label>Host URL *</label>
-        <input class="input" data-field="host_url" value="${esc(d.host_url)}" placeholder="https://ha.example.com">
-      </div>
-      <div class="field">
-        <label>Username *</label>
-        <input class="input" data-field="username" value="${esc(d.username)}" placeholder="e.g. guest-john" autocapitalize="none" autocomplete="off">
-      </div>
-      <div class="field">
-        <label>PIN</label>
-        <input class="input" data-field="pin" value="${esc(d.pin)}" maxlength="6" placeholder="Optional — up to 6 digits" autocomplete="off">
-      </div>
-      ${procOptionsHtml()}
-      ${previewAndOverrideHtml()}
-      ${stepFooter("Continue", "to-deploy")}`;
-  }
-
-  // Rebuilds the read-only payload preview from the profile's stored fields
-  // merged with the compact form's live host/username/pin edits. No-op unless
-  // the disclosure is open, so it's safe to call speculatively.
-  function updatePreview() {
-    if (!state || !isCompact() || !state.profile) return;
-    if (state.step !== "configure" || !state.previewOpen || !renderJsonCode || !previewMod) return;
-    const body = refs.body.querySelector("#pw-preview-body");
-    if (!body) return;
-    const f = {
-      ...(state.profile.fields || {}),
-      ...(state.procOpts || {}),
-      host_url: state.details.host_url,
-      username: state.details.username,
-      pin: state.details.pin,
-    };
-    renderJsonCode(body, previewMod.buildV2PayloadPreview(f, { siteId: app.summary && app.summary()?.site_id, wgProfiles: state.wgProfiles || [] }));
-  }
-
-  /* ---------- step 2: configure (full-form paths) ---------- */
+  /* ---------- step 2: configure (full form) ---------- */
 
   // Post-render required-error insertion into the shared renderer's
-  // [data-field] wrappers — same pattern profile-editor.js uses.
+  // [data-field] wrappers — same pattern template-editor.js uses.
   function markFieldError(key, msg) {
     const wrap = refs.body.querySelector(`[data-field="${key}"]`);
     if (!wrap || wrap.classList.contains("field--error")) return;
@@ -451,18 +359,43 @@ export function createView(app) {
     wrap.insertAdjacentHTML("beforeend", `<div class="field__error">${esc(msg)}</div>`);
   }
 
+  // Template-entry badges: PROFILE-scope fields the template sets get "from
+  // template"; the rest get "review" (prefilled with the default for the
+  // admin to fill in or accept). Process fields are always per-run, so they
+  // carry no badge.
+  function templateAnnotations() {
+    if (state.entry !== "template" || !state.templateSetKeys) return null;
+    const ann = {};
+    for (const key of fieldsMod.PROFILE_KEYS) {
+      ann[key] = state.templateSetKeys.has(key) ? "template" : "review";
+    }
+    return ann;
+  }
+
+  // Count of "review" (template-unset) PROFILE-scope fields in a section.
+  function sectionReviewCount(sectionId) {
+    if (state.entry !== "template" || !state.templateSetKeys) return 0;
+    const keys = fieldsMod.SECTION_FIELDS[sectionId] || [];
+    return keys.filter((k) => fieldsMod.PROFILE_KEYS.has(k) && !state.templateSetKeys.has(k)).length;
+  }
+
   // Accordion sections, each rendered by the shared profile-fields.js
   // renderer filtered to its scope. Connection intentionally includes the
   // process-scope account fields (username/password/pin/deauth) — this flow
   // IS the provisioning action, so they're first-class here even though the
-  // profile editor no longer shows them. Template-scope timing fields stay
+  // template editor no longer shows them. Template-scope timing fields stay
   // under "Timing & Security"; the remaining process fields (provisioning
   // window, scramble, Wi-Fi join) get their own "Provisioning options"
   // section. QR/BLE delivery options live on the Deploy step.
   function formSectionDefs() {
     const F = fieldsMod;
+    const annotations = templateAnnotations();
     const shared = (sectionId, extra = {}) =>
-      F.renderSectionHtml(sectionId, state.form, { esc, heading: false, wgProfiles: state.wgProfiles || [], ...extra });
+      F.renderSectionHtml(sectionId, state.form, {
+        esc, heading: false, wgProfiles: state.wgProfiles || [], annotations,
+        setKeys: state.entry === "new" ? state.newSetKeys : null,
+        ...extra,
+      });
     const siteNote = () => {
       const summary = app.summary && app.summary();
       const line = summary && summary.site_id
@@ -487,7 +420,7 @@ export function createView(app) {
   // Re-render one section's body from state (used for gating changes and the
   // lazy WireGuard-profile load) so sibling sections keep their DOM untouched.
   function rerenderFormSection(id) {
-    if (!state || isCompact() || state.step !== "configure" || !fieldsMod || !state.form) return;
+    if (!state || state.step !== "configure" || !fieldsMod || !state.form) return;
     const def = formSectionDefs().find((s) => s.id === id);
     const body = refs.body.querySelector(`[data-section-body="${id}"]`);
     if (def && body) body.innerHTML = def.render();
@@ -496,58 +429,62 @@ export function createView(app) {
   function renderFullConfigure() {
     const sections = formSectionDefs().map(({ id, label, render: renderFn }) => {
       const open = !!state.formOpen[id];
+      const reviewCount = sectionReviewCount(id);
+      const reviewChip = reviewCount
+        ? ` <span class="chip chip--warn">${reviewCount} to review</span>`
+        : "";
       return `
         <div style="border-top:1px solid var(--casa-divider);">
           <button class="btn btn--text" data-act="toggle-section" data-section="${esc(id)}" style="margin:6px 0; padding-left:0;">
             <ha-icon icon="mdi:chevron-down" style="transition:transform 0.15s; transform:rotate(${open ? "180deg" : "0deg"});"></ha-icon>
-            ${esc(label)}
+            ${esc(label)}${reviewChip}
           </button>
           <div data-section-body="${esc(id)}" ${open ? "" : "hidden"}>${renderFn()}</div>
         </div>`;
     }).join("");
     const nameFieldHtml = state.entry === "new" ? `
-      <div class="field" data-field="profileName">
-        <label>Profile name *</label>
-        <input class="input" data-field="profileName" value="${esc(state.profileName)}" placeholder="e.g. Guest tablet">
-        <div class="field__help">Saved as a provisioning profile when you deploy.</div>
+      <div class="field" data-field="templateName">
+        <label>Template name *</label>
+        <input class="input" data-field="templateName" value="${esc(state.templateName)}" placeholder="e.g. Guest tablet">
+        <div class="field__help">Saved as a provision template when you deploy — only the fields you touch are stored on it.</div>
+      </div>` : "";
+    const reviewHint = state.entry === "template" ? `
+      <div class="muted" style="font-size:12px; margin:0 0 12px;">
+        <span class="chip chip--app">from template</span> fields come from the
+        selected template; <span class="chip chip--warn">review</span> fields
+        are not set by it and show the system default — fill them in or accept
+        as-is. You can override anything for this provision.
       </div>` : "";
     return `
       <div style="margin:0 0 14px;">${originChipHtml()}</div>
       ${state.configError ? `<div class="errbar">${esc(state.configError)}</div>` : ""}
+      ${reviewHint}
       ${nameFieldHtml}
       <div id="pw-form-sections">${sections}</div>
       ${stepFooter("Continue", "to-deploy")}`;
   }
 
   function renderConfigureStep() {
-    return isCompact() ? renderCompactConfigure() : renderFullConfigure();
+    return renderFullConfigure();
   }
 
   function toDeploy() {
     state.configError = "";
-    if (isCompact()) {
-      if (!trim(state.details.host_url) || !trim(state.details.username)) {
-        state.configError = "Host URL and Username are required.";
-        render();
-        return;
-      }
-    } else {
-      const host = trim(state.form.host_url);
-      const user = trim(state.form.username);
-      const needName = state.entry === "new" && !trim(state.profileName);
-      if (!host || !user || needName) {
-        const missing = [];
-        if (needName) missing.push("Profile name");
-        if (!host) missing.push("Host URL");
-        if (!user) missing.push("Username");
-        state.configError = missing.join(", ") + (missing.length === 1 ? " is" : " are") + " required.";
-        if (!host || !user) state.formOpen.connection = true;
-        render();
-        if (needName) markFieldError("profileName", "Name this profile — it's created when you deploy.");
-        if (!host) markFieldError("host_url", "Required.");
-        if (!user) markFieldError("username", "Required.");
-        return;
-      }
+    const host = trim(state.form.host_url);
+    const user = trim(state.form.username);
+    const needName = state.entry === "new" && !trim(state.templateName);
+    if (!host || !user || needName) {
+      const missing = [];
+      if (needName) missing.push("Template name");
+      if (!host) missing.push("Host URL");
+      if (!user) missing.push("Username");
+      state.configError = missing.join(", ") + (missing.length === 1 ? " is" : " are") + " required.";
+      if (!host || !user) state.formOpen.connection = true;
+      render();
+      if (needName) markFieldError("templateName", "Name this template — it's created when you deploy.");
+      if (!host) markFieldError("host_url", "Required.");
+      if (!user) markFieldError("username", "Required.");
+      return;
     }
     if (state.method === "ble" && !bleAvailable()) state.method = "qr";
     state.deployError = "";
@@ -635,7 +572,7 @@ export function createView(app) {
   }
 
   function renderDeployStep() {
-    const src = isCompact() ? state.details : state.form;
+    const src = state.form;
     return `
       <div class="card" style="margin:0 0 16px;">
         <div class="card__body" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
@@ -708,7 +645,7 @@ export function createView(app) {
     } catch (err) {
       if (token !== mountToken || !state) return;
       state.busy = false;
-      state.deployError = (err && err.message) || String(err);
+      state.deployError = ui.errMsg(err);
       render();
     }
   }
@@ -720,84 +657,57 @@ export function createView(app) {
       return;
     }
 
-    let data;
-    if (isCompact()) {
-      data = {
-        method: state.method,
-        host_url: trim(state.details.host_url),
-        username: trim(state.details.username),
-      };
-      const pin = trim(state.details.pin);
-      if (pin) data.pin = pin;
-      if (state.profile && state.profile.id) data.profile = state.profile.id;
-      // Process settings from the Provisioning-options panel ride service_data
-      // explicitly (bools/numbers verbatim — an explicit false/0 wins over a
-      // legacy profile value server-side; strings only when non-empty, since
-      // get_field treats "" as unset and would fall back anyway).
-      if (fieldsMod && state.procOpts) {
-        for (const [key, raw] of Object.entries(state.procOpts)) {
-          const def = fieldsMod.DEFAULTS[key];
-          if (typeof def === "boolean") data[key] = !!raw;
-          else if (typeof def === "number") {
-            const n = parseInt(raw, 10);
-            data[key] = Number.isFinite(n) ? n : def;
-          } else {
-            const s = trim(raw);
-            if (s) data[key] = s;
-          }
-        }
-      }
-    } else {
-      // Coerce by the defaults' types: booleans as booleans, numbers via
-      // parseInt (falling back to the default), strings trimmed. The server's
-      // get_field treats "" as unset, so blank optional keys are harmless.
-      const fields = {};
-      for (const [key, def] of Object.entries(fieldsMod.DEFAULTS)) {
-        const raw = state.form[key];
-        if (typeof def === "boolean") fields[key] = !!raw;
-        else if (typeof def === "number") {
-          const n = parseInt(raw, 10);
-          fields[key] = Number.isFinite(n) ? n : def;
-        } else fields[key] = trim(raw);
-      }
-
-      if (state.entry === "new") {
-        // Save-then-provision: the profile is created here, at deploy time.
-        // Flat body shape — { name, ...fields } — matches the server view;
-        // only profile-scope keys are saved (process inputs are for this
-        // generation only). A retry after a failed provision carries the id
-        // from the first save, so it updates instead of duplicating.
-        state.deployError = "";
-        state.busy = true;
-        render();
-        const token = mountToken;
-        try {
-          const profileFields = {};
-          for (const key of fieldsMod.PROFILE_KEYS) profileFields[key] = fields[key];
-          const body = { name: trim(state.profileName), ...profileFields };
-          if (state.savedProfileId) body.id = state.savedProfileId;
-          const res = await api.saveProvisionProfile(body);
-          if (token !== mountToken || !state) return;
-          if (!state.savedProfileId) {
-            if (res && res.id) state.savedProfileId = res.id;
-            ui.toast(`Profile '${trim(state.profileName)}' created.`);
-          }
-        } catch (err) {
-          if (token !== mountToken || !state) return;
-          state.busy = false;
-          state.deployError = "Failed to save profile: " + ((err && err.message) || String(err));
-          render();
-          return;
-        }
-      }
-
-      data = { method: state.method, ...fields };
-      // Lineage only — explicit fields already win server-side per-key
-      // (_provision_internal's get_field), so this doesn't change resolved
-      // values, it just correlates the device back to its originating profile.
-      if (state.entry === "new" && state.savedProfileId) data.profile = state.savedProfileId;
-      else if (state.overrideFields && state.profile && state.profile.id) data.profile = state.profile.id;
+    // Coerce by the defaults' types: booleans as booleans, numbers via
+    // parseInt (falling back to the default), strings trimmed. The server's
+    // get_field treats "" as unset, so blank optional keys are harmless.
+    const fields = {};
+    for (const [key, def] of Object.entries(fieldsMod.DEFAULTS)) {
+      const raw = state.form[key];
+      if (typeof def === "boolean") fields[key] = !!raw;
+      else if (typeof def === "number") {
+        const n = parseInt(raw, 10);
+        fields[key] = Number.isFinite(n) ? n : def;
+      } else fields[key] = trim(raw);
     }
+
+    if (state.entry === "new") {
+      // Save-then-provision: the template is created here, at deploy time.
+      // Nested sparse body — { name, fields: {only-touched-keys} } — so a
+      // wizard-authored template stores only what the admin actually set;
+      // process inputs are for this generation only. A retry after a failed
+      // provision carries the id from the first save, so it updates instead
+      // of duplicating.
+      state.deployError = "";
+      state.busy = true;
+      render();
+      const token = mountToken;
+      try {
+        const body = {
+          name: trim(state.templateName),
+          fields: fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS, { setKeys: state.newSetKeys }),
+        };
+        if (state.savedTemplateId) body.id = state.savedTemplateId;
+        const res = await api.saveProvisionTemplate(body);
+        if (token !== mountToken || !state) return;
+        if (!state.savedTemplateId) {
+          if (res && res.id) state.savedTemplateId = res.id;
+          ui.toast(`Template '${trim(state.templateName)}' created.`);
+        }
+      } catch (err) {
+        if (token !== mountToken || !state) return;
+        state.busy = false;
+        state.deployError = "Failed to save template: " + (ui.errMsg(err));
+        render();
+        return;
+      }
+    }
+
+    const data = { method: state.method, ...fields };
+    // Lineage only — explicit fields already win server-side per-key
+    // (_provision_internal's get_field), so this doesn't change resolved
+    // values, it just correlates the device back to its originating template.
+    if (state.entry === "new" && state.savedTemplateId) data.profile = state.savedTemplateId;
+    else if (state.entry === "template" && state.template && state.template.id) data.profile = state.template.id;
 
     if (state.method === "ble") data.esphome_service = state.bleTargets.slice();
     if (state.method === "qr") {
@@ -861,7 +771,7 @@ export function createView(app) {
         </div>`
       )
       .join("");
-    const pin = isCompact() ? state.details.pin : trim(state.form && state.form.pin);
+    const pin = trim(state.form && state.form.pin);
     return `
       <div class="muted" style="font-size:13px; margin-bottom:12px;">Bring the device near a beacon to provision it.</div>
       ${rows}
@@ -893,7 +803,7 @@ export function createView(app) {
   function render() {
     if (!refs || !state) return;
     renderTabs();
-    if (state.step === "profile") refs.body.innerHTML = renderProfileStep();
+    if (state.step === "template") refs.body.innerHTML = renderTemplateStep();
     else if (state.step === "configure") refs.body.innerHTML = renderConfigureStep();
     else if (state.step === "deploy") refs.body.innerHTML = renderDeployStep();
     else refs.body.innerHTML = renderResultStep();
@@ -910,17 +820,11 @@ export function createView(app) {
         fieldsMod.bindFieldEvents(formContainer, {
           values: state.form,
           onSectionRerender: (key) => rerenderFormSection(KEY_SECTION[key]),
+          setKeys: state.entry === "new" ? state.newSetKeys : null,
+          esc,
         });
       }
-      const procContainer = refs.body.querySelector("#pw-proc-fields");
-      if (procContainer && state.procOpts) {
-        fieldsMod.bindFieldEvents(procContainer, { values: state.procOpts });
-      }
-      if (!isCompact() && state.formOpen.pushvpn) ensureWgProfiles();
-      if (isCompact() && state.previewOpen) {
-        ensureWgProfiles();
-        updatePreview();
-      }
+      if (state.formOpen.pushvpn) ensureWgProfiles();
     }
   }
 
@@ -942,23 +846,23 @@ export function createView(app) {
         case "entry-oneoff":
           selectEntry("oneoff");
           return;
-        case "retry-profiles":
-          loadProfiles();
+        case "retry-templates":
+          loadTemplates();
           return;
         case "clear-search": {
           state.search = "";
           const input = refs.body.querySelector("#pw-search");
           if (input) input.value = "";
-          rerenderProfileTable();
+          rerenderTemplateTable();
           return;
         }
-        case "select-profile": {
-          const p = (state.profiles || []).find((x) => x && x.id === el.dataset.id);
-          if (p) selectProfile(p);
+        case "select-template": {
+          const p = (state.templates || []).find((x) => x && x.id === el.dataset.id);
+          if (p) selectTemplate(p);
           return;
         }
-        case "edit-profile":
-          app.navigate("/profiles/" + encodeURIComponent(el.dataset.id));
+        case "edit-template":
+          app.navigate("/templates/" + encodeURIComponent(el.dataset.id));
           return;
         case "to-deploy":
           toDeploy();
@@ -970,17 +874,6 @@ export function createView(app) {
         case "toggle-qr-options":
           state.qrOptionsOpen = !state.qrOptionsOpen;
           render();
-          return;
-        case "toggle-preview":
-          state.previewOpen = !state.previewOpen;
-          render();
-          return;
-        case "toggle-proc-options":
-          state.procOptionsOpen = !state.procOptionsOpen;
-          render();
-          return;
-        case "override-fields":
-          overrideFieldsFromProfile();
           return;
         case "toggle-section": {
           // Flip visibility in place — no re-render, so in-progress edits and
@@ -1011,7 +904,7 @@ export function createView(app) {
           // a same-path remount) and strip any preset segment from the URL.
           state = freshState();
           wgRequested = false;
-          loadProfiles();
+          loadTemplates();
           render();
           if (mountedWithPresetPath) app.navigate("/provision", { replace: true });
           return;
@@ -1023,11 +916,11 @@ export function createView(app) {
       }
       return;
     }
-    // Row click (no data-act target) selects the profile.
+    // Row click (no data-act target) selects the template.
     const row = e.target.closest("tr[data-id]");
-    if (row && state.step === "profile") {
-      const p = (state.profiles || []).find((x) => x && x.id === row.dataset.id);
-      if (p) selectProfile(p);
+    if (row && state.step === "template") {
+      const p = (state.templates || []).find((x) => x && x.id === row.dataset.id);
+      if (p) selectTemplate(p);
     }
   }
 
@@ -1038,13 +931,13 @@ export function createView(app) {
     const t = e.target;
     if (t.id === "pw-search") {
       state.search = t.value;
-      rerenderProfileTable();
+      rerenderTemplateTable();
       return;
     }
     const field = t.dataset && t.dataset.field;
     if (!field) return;
-    if (field === "profileName") {
-      state.profileName = t.value;
+    if (field === "templateName") {
+      state.templateName = t.value;
       return;
     }
     if (field === "deleteQr") {
@@ -1054,10 +947,6 @@ export function createView(app) {
     if (field === "qrFilename") {
       state.qrFilename = t.value;
       return;
-    }
-    state.details[field] = t.type === "checkbox" ? t.checked : t.value;
-    if (isCompact() && state.previewOpen && (field === "host_url" || field === "username" || field === "pin")) {
-      updatePreview();
     }
   }
 
@@ -1071,7 +960,7 @@ export function createView(app) {
   /* ---------- scenario picker ---------- */
 
   // Shown on plain /provision visits only — preset paths (/provision/user/…,
-  // /provision/profile/…) already declare their intent. Dismissing lands on
+  // /provision/template/…) already declare their intent. Dismissing lands on
   // the classic wizard, which is fully rendered underneath.
   function openScenarioModal() {
     const card = ({ act, icon, title, desc }) => `
@@ -1090,7 +979,7 @@ export function createView(app) {
           act: "guided",
           icon: "mdi:account-plus-outline",
           title: "New device with its own account",
-          desc: "Guided — name the device, we create the account, pick a profile, get a link or QR",
+          desc: "Guided — name the device, we create the account, pick a template, get a link or QR",
         })}
         ${card({
           act: "reprovision",
@@ -1102,7 +991,7 @@ export function createView(app) {
           act: "advanced",
           icon: "mdi:tune",
           title: "Advanced / manual setup",
-          desc: "Full control — profiles, one-off config, BLE beacons",
+          desc: "Full control — templates, one-off config, BLE beacons",
         })}
       </div>`;
     body.addEventListener("click", (e) => {
@@ -1144,8 +1033,8 @@ export function createView(app) {
       const token = ++mountToken;
       state = freshState();
       state.presetUsername = (params && params.username) || "";
-      const presetProfileId = (params && params.profileId) || null;
-      mountedWithPresetPath = !!(state.presetUsername || presetProfileId);
+      const presetTemplateId = (params && params.templateId) || null;
+      mountedWithPresetPath = !!(state.presetUsername || presetTemplateId);
       wgRequested = false;
 
       el.innerHTML = `
@@ -1164,30 +1053,28 @@ export function createView(app) {
       render(); // loading state while modules + profiles land
 
       try {
-        const [fields, preview, shell] = await Promise.all([
+        const [fields, preview] = await Promise.all([
           fieldsMod || app.loadModule("views/profile-fields.js"),
           previewMod || app.loadModule("payload-preview.js"),
-          renderJsonCode ? null : app.loadModule("editor-shell.js"),
         ]);
         if (token !== mountToken) return;
         fieldsMod = fields;
         previewMod = preview;
-        if (shell) renderJsonCode = shell.renderJsonCode;
       } catch (err) {
         if (token !== mountToken) return;
-        refs.body.innerHTML = `<div class="errbar">Failed to load: ${esc(String((err && err.message) || err))}</div>`;
+        refs.body.innerHTML = `<div class="errbar">Failed to load: ${esc(ui.errMsg(err))}</div>`;
         return;
       }
 
-      await loadProfiles();
+      await loadTemplates();
       if (token !== mountToken || !state) return;
-      if (presetProfileId) {
-        const p = (state.profiles || []).find((x) => x && x.id === presetProfileId);
+      if (presetTemplateId) {
+        const p = (state.templates || []).find((x) => x && x.id === presetTemplateId);
         if (p) {
-          selectProfile(p);
+          selectTemplate(p);
           return;
         }
-        ui.toast("That provisioning profile no longer exists.", { error: true });
+        ui.toast("That provision template no longer exists.", { error: true });
       }
       render();
       if (!mountedWithPresetPath) openScenarioModal();

@@ -1,4 +1,11 @@
 DOMAIN = "casa"
+
+# Integration version, served in /api/casa/admin/summary and compared by the
+# panel against PANEL_VERSION in panel/version.js — keep the two in sync.
+# Any skew (including a stale Python process after an update) makes the panel
+# show a "restart Home Assistant" banner.
+CASA_VERSION = "26.07.21"
+
 CONF_ADMIN_SYSTEM_ONLY = "admin_system_only"
 CONF_CREATE_DEVICES = "create_devices"
 CONF_SHOW_PANEL = "show_panel"
@@ -27,7 +34,7 @@ MAX_PROFILE_REPORT_INTERVAL_SECONDS = 86400
 # template settings vs one-time provisioning-process inputs. Mirrored on the
 # panel side by FIELD_SCOPES in panel/views/profile-fields.js — keep in sync.
 #
-# LIVE: genuine ongoing device state — savable in provisioning profiles,
+# LIVE: genuine ongoing device state — savable on provision templates,
 # editable per-device via "Force Device Changes", and round-tripped by the
 # device's own profile self-report.
 LIVE_PROVISIONING_FIELDS = {
@@ -59,7 +66,7 @@ PROFILE_ONLY_PROVISIONING_FIELDS = {
 # PROCESS: one-time provisioning-ceremony inputs and server-side-only actions
 # (deauthenticate_existing revokes sessions; password_scramble* schedules a
 # rotation task; timeout_minutes sizes the QR/BLE window). Accepted only as
-# casa.provision service_data — never persisted in profiles or on devices.
+# casa.provision service_data — never persisted on templates or devices.
 PROCESS_PROVISIONING_FIELDS = {
     "username": "",
     "password": "",
@@ -72,7 +79,9 @@ PROCESS_PROVISIONING_FIELDS = {
     "connect_wifi_password": "",
 }
 
-# What a saved provisioning profile may contain.
+# What a saved provision template may contain. Templates are sparse: only
+# explicitly-set fields are stored — an absent key means "unset", surfaced to
+# the admin as a fill-in-the-blank at provision time.
 PROFILE_PROVISIONING_FIELDS = {
     **LIVE_PROVISIONING_FIELDS,
     **PROFILE_ONLY_PROVISIONING_FIELDS,

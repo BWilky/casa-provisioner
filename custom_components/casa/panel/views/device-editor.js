@@ -14,7 +14,7 @@ const RECORD_KEYS = [
   "wireguard_connected", "current_url", "provisioned_at", "expires_at",
   "expires_at_override", "expires_at_override_set_at", "pending_updates",
   "pending_update_list", "provisioning_fields", "provisioning_reported_at",
-  "custom_provisioning", "provisioning_pending_push",
+  "provisioning_pending_push",
 ];
 
 function orderedRecord(d) {
@@ -58,7 +58,7 @@ function buildWireguardRequest(deviceId, profileId, profiles, sendPush, notifyPu
 
 function buildProfileRequest(deviceId, profileId, profiles, sendPush, notifyPush) {
   const profile = (profiles || []).find((p) => p.id === profileId);
-  if (!profile) throw new Error("Selected provisioning profile not found.");
+  if (!profile) throw new Error("Selected provision template not found.");
   const req = {
     device_id: deviceId,
     update_type: "profile",
@@ -68,14 +68,19 @@ function buildProfileRequest(deviceId, profileId, profiles, sendPush, notifyPush
     notify_push: notifyPush,
   };
   if (notifyPush) {
-    req.title = "Profile updated";
-    req.message = `A new configuration profile (${profile.name}) is available.`;
+    req.title = "Settings updated";
+    req.message = `New settings from template '${profile.name}' were applied.`;
   }
-  return { req, label: `Profile '${profile.name}'` };
+  return { req, label: `Template '${profile.name}'` };
 }
 
-const queueSuccessText = (label, res) =>
-  `${label} queued (queued ${res.queued}, pushed ${res.pushed}, notified ${res.notified}, skipped ${res.skipped}).`;
+const queueSuccessText = (label, res) => {
+  const extras = [];
+  if (res.skipped) extras.push(`${res.skipped} without push`);
+  if (res.not_found) extras.push(`${res.not_found} not found`);
+  return `${label} queued for ${res.queued} device${res.queued === 1 ? "" : "s"}` +
+    `${extras.length ? ` (${extras.join(", ")})` : ""} — push sending in background.`;
+};
 
 /* ---------- shared kebab modal (used by the device list) ---------- */
 
@@ -88,10 +93,10 @@ export async function openPushModal(app, device, kind) {
 
   let profiles;
   try {
-    const res = isWg ? await api.getWireguardProfiles() : await api.getProvisionProfiles();
+    const res = isWg ? await api.getWireguardProfiles() : await api.getProvisionTemplates();
     profiles = (res && res.profiles) || [];
   } catch (err) {
-    ui.toast("Failed to load profiles: " + ((err && err.message) || err), { error: true });
+    ui.toast(`Failed to load ${isWg ? "profiles" : "templates"}: ` + ui.errMsg(err), { error: true });
     return;
   }
 
@@ -101,23 +106,24 @@ export async function openPushModal(app, device, kind) {
   const body = document.createElement("div");
   body.innerHTML = `
     <div class="field">
-      <label>${isWg ? "WireGuard Profile" : "Provision Profile"}</label>
+      <label>${isWg ? "WireGuard Profile" : "Provision template"}</label>
       <select class="select" data-pm-profile style="width:100%;">
-        <option value="">${isWg ? "-- None / Revoke VPN --" : "-- Select a profile --"}</option>
+        <option value="">${isWg ? "-- None / Revoke VPN --" : "-- Select a template --"}</option>
         ${options}
       </select>
     </div>
+    ${isWg ? "" : '<div class="muted" style="font-size:12px; margin:0 0 10px;">One-time apply of the template\'s set device fields — the device does not follow the template afterwards.</div>'}
     <label class="toggle"><input type="checkbox" data-pm-send> Send update via push</label>
     <label class="toggle"><input type="checkbox" data-pm-notify> Notify via push</label>
     <div class="field__error" data-pm-err hidden></div>`;
 
   ui.openModal({
-    title: `${isWg ? "Queue VPN update" : "Queue profile update"} — ${device.alias || device.device_id}`,
+    title: `${isWg ? "Queue VPN update" : "Apply template"} — ${device.alias || device.device_id}`,
     bodyEl: body,
     buttons: [
       { label: "Cancel", variant: "text" },
       {
-        label: isWg ? "Queue VPN Update" : "Queue Profile Update",
+        label: isWg ? "Queue VPN Update" : "Apply Template",
         variant: "primary",
         onClick: async () => {
           const errEl = body.querySelector("[data-pm-err]");
@@ -127,7 +133,7 @@ export async function openPushModal(app, device, kind) {
           const notifyPush = body.querySelector("[data-pm-notify]").checked;
           if (!isWg && !profileId) {
             errEl.hidden = false;
-            errEl.textContent = "Select a provisioning profile first.";
+            errEl.textContent = "Select a template first.";
             return false;
           }
           try {
@@ -139,7 +145,259 @@ export async function openPushModal(app, device, kind) {
             app.refresh();
           } catch (err) {
             errEl.hidden = false;
-            errEl.textContent = "Failed to queue: " + ((err && err.message) || err);
+            errEl.textContent = "Failed to queue: " + ui.errMsg(err);
+            return false;
+          }
+        },
+      },
+    ],
+  });
+}
+
+// openReauthModal(app, device) — reauthenticate a device with a new
+// username/password: pick an existing (non-admin) user or create one inline,
+// auto-generate or supply the password, deliver via encrypted push and/or the
+// durable heartbeat queue. Generated passwords get the same non-dismissable
+// one-time reveal the Accounts view uses.
+export async function openReauthModal(app, device) {
+  const { api, ui } = app;
+  const esc = ui.esc;
+
+  let sessionUsers;
+  let usernameUtils = null;
+  try {
+    const [res, utils] = await Promise.all([
+      api.getSessions(),
+      app.loadModule("views/username-utils.js").catch(() => null),
+    ]);
+    usernameUtils = utils; // null → degrade to manual username entry
+    sessionUsers = ((res && res.users) || []).filter(
+      (u) => !u.is_admin && !u.is_owner && u.is_active !== false
+    );
+  } catch (err) {
+    ui.toast("Failed to load users: " + ui.errMsg(err), { error: true });
+    return;
+  }
+
+  const currentUsername = device.username || "";
+  const userOptions = sessionUsers
+    .map((u) => {
+      const uname = u.username || u.name;
+      const label = u.username && u.username !== u.name ? `${u.name} (${u.username})` : u.name;
+      const selected = uname && uname.toLowerCase() === currentUsername.toLowerCase() ? " selected" : "";
+      const chip = u.casa_managed ? " · casa" : "";
+      return `<option value="${esc(u.user_id)}" data-username="${esc(uname || "")}"${selected}>${esc(label)}${chip}</option>`;
+    })
+    .join("");
+
+  const body = document.createElement("div");
+  body.innerHTML = `
+    <div class="field">
+      <label>Target account</label>
+      <label class="toggle"><input type="radio" name="ra-mode" value="existing" checked> Existing user</label>
+      <label class="toggle"><input type="radio" name="ra-mode" value="create"> Create new user</label>
+    </div>
+    <div data-ra-existing>
+      <div class="field">
+        <select class="select" data-ra-user style="width:100%;">${userOptions}</select>
+      </div>
+    </div>
+    <div data-ra-create hidden>
+      <div class="field">
+        <label>Full Name *</label>
+        <input class="input" data-ra-name placeholder="e.g. John Doe">
+      </div>
+      <div class="field">
+        <label>Username *</label>
+        <input class="input" data-ra-username placeholder="e.g. john" autocapitalize="none" autocomplete="off">
+        <div class="field__help">Auto-generated from the name — edit to override.</div>
+        <div data-ra-avail style="margin-top:4px;"></div>
+      </div>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input class="input" data-ra-password type="password" placeholder="••••••••" autocomplete="new-password">
+      <div class="field__help" data-ra-pwhelp>Leave blank to auto-generate a secure password.</div>
+    </div>
+    <label class="toggle" data-ra-scramble-row hidden>
+      <input type="checkbox" data-ra-scramble checked>
+      <span data-ra-scramble-label></span>
+    </label>
+    <label class="toggle">
+      <input type="checkbox" data-ra-push ${device.push_registered ? "checked" : "disabled"}>
+      Send via encrypted push${device.push_registered ? "" : " (device has no push registration)"}
+    </label>
+    <div class="muted" style="font-size:12px; margin:6px 0 10px;">
+      Always queued durably — applied on the device's next check-in if the push is missed.
+      Older app builds ignore this command; a stuck request can be cancelled from Pending Updates.
+    </div>
+    <div style="display:flex; gap:8px; align-items:center; margin:0 0 10px; padding:10px 12px; border-radius:8px; background:color-mix(in srgb, var(--casa-warning) 16%, transparent); color:var(--casa-warning); font-size:13px;">
+      <ha-icon icon="mdi:alert" style="--mdc-icon-size:18px; flex:none;"></ha-icon>
+      <span>The device will log out and sign back in as the selected user. If the login fails, the device resets and must be re-provisioned.</span>
+    </div>
+    <div class="field__error" data-ra-err hidden></div>`;
+
+  const existingWrap = body.querySelector("[data-ra-existing]");
+  const createWrap = body.querySelector("[data-ra-create]");
+  const userSelect = body.querySelector("[data-ra-user]");
+  const nameInput = body.querySelector("[data-ra-name]");
+  const usernameInput = body.querySelector("[data-ra-username]");
+  const passwordInput = body.querySelector("[data-ra-password]");
+  const pwHelp = body.querySelector("[data-ra-pwhelp]");
+  const scrambleRow = body.querySelector("[data-ra-scramble-row]");
+  const scrambleLabel = body.querySelector("[data-ra-scramble-label]");
+  const errEl = body.querySelector("[data-ra-err]");
+
+  // Auto-slug the username from the name + live availability chip (shared
+  // with the guided wizard). Falls back to plain lowercase-on-input if the
+  // module failed to load; the submit-time checkUsername stays authoritative.
+  if (usernameUtils) {
+    usernameUtils.attachUsernameField({
+      nameInput,
+      usernameInput,
+      hintEl: body.querySelector("[data-ra-avail]"),
+      checkUsername: (u, n) => api.checkUsername(u, n),
+    });
+  } else {
+    usernameInput.addEventListener("input", () => {
+      usernameInput.value = usernameInput.value.toLowerCase();
+    });
+  }
+
+  const mode = () => body.querySelector("input[name='ra-mode']:checked").value;
+  const selectedUsername = () => {
+    if (mode() === "create") return usernameInput.value.trim();
+    const opt = userSelect.selectedOptions[0];
+    return (opt && opt.dataset.username) || "";
+  };
+  const isSwitching = () => {
+    const target = selectedUsername();
+    return !!currentUsername && !!target && target.toLowerCase() !== currentUsername.toLowerCase();
+  };
+
+  function refreshDynamic() {
+    const creating = mode() === "create";
+    existingWrap.hidden = creating;
+    createWrap.hidden = !creating;
+    pwHelp.textContent = creating
+      ? "Leave blank to auto-generate a secure password."
+      : "Leave blank to auto-generate. A typed password must already be that user's password — it will not be changed.";
+    const switching = isSwitching();
+    scrambleRow.hidden = !switching;
+    if (switching) {
+      scrambleLabel.textContent = `Also scramble '${currentUsername}'s password and revoke their other sessions`;
+    }
+  }
+  for (const radio of body.querySelectorAll("input[name='ra-mode']")) {
+    radio.addEventListener("change", refreshDynamic);
+  }
+  userSelect.addEventListener("change", refreshDynamic);
+  usernameInput.addEventListener("input", refreshDynamic);
+  // Typing the name can rewrite the username via auto-slug (no input event
+  // fires on programmatic writes), so re-evaluate the scramble row here too.
+  nameInput.addEventListener("input", refreshDynamic);
+  refreshDynamic();
+
+  // Non-dismissable one-time reveal for generated passwords — same UX as
+  // the Accounts view's showCredentials.
+  function showRevealModal(username, password) {
+    const rbody = document.createElement("div");
+    const row = (label, value) => `
+      <div class="field-row" style="margin-bottom:10px;">
+        <span style="width:88px; flex:none; font-weight:600; font-size:13px;">${esc(label)}</span>
+        <span class="mono" style="flex:1; min-width:0; word-break:break-all;">${esc(value)}</span>
+        <button class="btn btn--outlined" style="height:28px; padding:0 10px; font-size:12px;" data-copy="${esc(value)}">Copy</button>
+      </div>`;
+    rbody.innerHTML = `
+      <div style="text-align:center; margin-bottom:16px;">
+        <ha-icon icon="mdi:check-circle" style="--mdc-icon-size:48px; color:var(--casa-success);"></ha-icon>
+        <h4 style="margin:8px 0 0; font-size:16px;">Reauthentication queued</h4>
+      </div>
+      ${row("Username", username)}
+      ${row("Password", password)}
+      <div style="display:flex; gap:8px; align-items:center; margin-top:14px; padding:10px 12px; border-radius:8px; background:color-mix(in srgb, var(--casa-warning) 16%, transparent); color:var(--casa-warning); font-size:13px;">
+        <ha-icon icon="mdi:alert" style="--mdc-icon-size:18px; flex:none;"></ha-icon>
+        <span>This password is shown only once.</span>
+      </div>`;
+    for (const btn of rbody.querySelectorAll("[data-copy]")) {
+      ui.bindCopyButton(btn, () => btn.dataset.copy);
+    }
+    ui.openModal({
+      title: "One-time credentials",
+      bodyEl: rbody,
+      dismissable: false,
+      buttons: [{ label: "Done", variant: "primary", onClick: () => { app.refresh(); } }],
+    });
+  }
+
+  ui.openModal({
+    title: `Reauthenticate — ${device.alias || device.device_id}`,
+    bodyEl: body,
+    buttons: [
+      { label: "Cancel", variant: "text" },
+      {
+        label: "Reauthenticate",
+        variant: "primary",
+        onClick: async (btn) => {
+          errEl.hidden = true;
+          const creating = mode() === "create";
+          const password = passwordInput.value.trim();
+          const req = {
+            device_id: device.device_id,
+            password: password || undefined,
+            scramble_old: !scrambleRow.hidden && body.querySelector("[data-ra-scramble]").checked,
+            send_update_push: body.querySelector("[data-ra-push]").checked,
+          };
+          if (creating) {
+            const name = nameInput.value.trim();
+            const username = usernameInput.value.trim().toLowerCase();
+            if (!name || !username) {
+              errEl.hidden = false;
+              errEl.textContent = "Name and Username are required.";
+              return false;
+            }
+            req.create_user = { name, username };
+          } else {
+            const userId = userSelect.value;
+            if (!userId) {
+              errEl.hidden = false;
+              errEl.textContent = "Select a user first.";
+              return false;
+            }
+            req.user_id = userId;
+          }
+          btn.disabled = true;
+          btn.textContent = "Queueing…";
+          try {
+            if (creating) {
+              const avail = await api.checkUsername(req.create_user.username, req.create_user.name);
+              if (avail && avail.available === false) {
+                errEl.hidden = false;
+                errEl.textContent = avail.username_conflict
+                  ? "That username is already taken."
+                  : "That name is already taken.";
+                btn.disabled = false;
+                btn.textContent = "Reauthenticate";
+                return false;
+              }
+            }
+            const res = await api.reauthDevice(req);
+            const deliveredNote = res.pushed
+              ? "encrypted push sent"
+              : res.push_skipped
+                ? "no push possible — queued for next check-in"
+                : "queued for next check-in";
+            if (res.password) {
+              showRevealModal(res.username, res.password);
+            } else {
+              ui.toast(`Reauthentication to '${res.username}' queued (${deliveredNote}).`);
+            }
+            app.refresh();
+          } catch (err) {
+            errEl.hidden = false;
+            errEl.textContent = "Failed: " + ui.errMsg(err);
+            btn.disabled = false;
+            btn.textContent = "Reauthenticate";
             return false;
           }
         },
@@ -238,7 +496,7 @@ export function createView(app) {
     if (ppProfiles !== null || ppLoading) return;
     ppLoading = true;
     api
-      .getProvisionProfiles()
+      .getProvisionTemplates()
       .then((res) => { ppProfiles = (res && res.profiles) || []; })
       .catch(() => { ppProfiles = []; })
       .finally(() => {
@@ -275,7 +533,7 @@ export function createView(app) {
         shellMod = await app.loadModule("editor-shell.js");
       } catch (err) {
         if (mounted && host)
-          host.innerHTML = `<div class="page"><div class="errbar">Failed to load editor shell: ${esc(String((err && err.message) || err))}</div></div>`;
+          host.innerHTML = `<div class="page"><div class="errbar">Failed to load editor shell: ${esc(ui.errMsg(err))}</div></div>`;
         return;
       }
     }
@@ -337,7 +595,7 @@ export function createView(app) {
 
   function updateNavBadges() {
     if (!shell) return;
-    shell.setBadge("provisioning", device.custom_provisioning ? "custom" : null, "badge--pending");
+    shell.setBadge("provisioning", device.provisioning_pending_push ? "pending" : null, "badge--pending");
     shell.setBadge("session", device.expires_at_override != null ? "pending" : null, "badge--pending");
     shell.setBadge(
       "updates",
@@ -463,7 +721,7 @@ export function createView(app) {
       ui.toast("Alias updated successfully.");
       await app.refresh();
     } catch (err) {
-      msgs.alias = { error: "Failed: " + ((err && err.message) || err) };
+      msgs.alias = { error: "Failed: " + ui.errMsg(err) };
     }
     if (mounted && active === "overview") renderSection();
   }
@@ -471,9 +729,9 @@ export function createView(app) {
   // Read-only by default, sourced from the device's self-reported state (the
   // only durable source of "what this device actually has" — see
   // CasaDeviceProfileReportView). "Force Device Changes" swaps into an
-  // editable copy of the same fields/markup the shared provisioning-profile
-  // editor uses (profile-fields.js) — saving pushes an off-profile override
-  // straight to this one device.
+  // editable copy of the same fields/markup the template editor uses
+  // (profile-fields.js) — saving pushes the changes straight to this one
+  // device (one-time; templates never sync automatically).
   function renderProvisioning() {
     const d = device;
     ensureFieldsMod();
@@ -500,9 +758,6 @@ export function createView(app) {
     const values = provisioningEditing ? provisioningDraft : baseline;
     const hasReport = !!d.provisioning_reported_at;
 
-    const badge = d.custom_provisioning
-      ? '<span class="chip chip--warn">Custom settings (off-profile)</span>'
-      : '<span class="chip chip--ok">Following shared profile</span>';
     const freshness = d.provisioning_pending_push
       ? '<span class="badge badge--pending" title="Applied on the device\'s next heartbeat or refresh">Pending device confirmation</span>'
       : hasReport
@@ -514,7 +769,7 @@ export function createView(app) {
     // this feature, or whose registration missed the 30-min pending window,
     // simply won't have this and the line is omitted.
     const provisionedFromHtml = d.provisioning_profile_name
-      ? `<div class="muted" style="font-size:12px; margin-top:6px;">Originally provisioned from: ${
+      ? `<div class="muted" style="font-size:12px; margin-top:6px;">Provisioned from template: ${
           d.provisioning_profile_id
             ? `<a href="#" data-prov-profile-link="${esc(d.provisioning_profile_id)}" style="color:var(--casa-primary);">${esc(d.provisioning_profile_name)}</a>`
             : esc(d.provisioning_profile_name)
@@ -562,11 +817,10 @@ export function createView(app) {
       <p class="editor__form-desc">What this specific device is currently configured with — read-only unless "Force Device Changes" is active.</p>
       <div class="card section-card"><div class="card__body">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          ${badge}
           ${freshness}
         </div>
         ${provisionedFromHtml}
-        ${provisioningEditing ? '<p class="field__help" style="margin:8px 0 0;">Editing takes this device off its shared profile — changes are pushed directly to it.</p>' : ""}
+        ${provisioningEditing ? '<p class="field__help" style="margin:8px 0 0;">Changes are pushed directly to this device (one-time — templates never sync automatically).</p>' : ""}
       </div></div>
       ${bodyHtml}
       ${msgHtml(msgs.provisioning)}
@@ -583,7 +837,7 @@ export function createView(app) {
     if (profLink) {
       profLink.addEventListener("click", (e) => {
         e.preventDefault();
-        app.navigate("/profiles/" + encodeURIComponent(profLink.dataset.provProfileLink));
+        app.navigate("/templates/" + encodeURIComponent(profLink.dataset.provProfileLink));
       });
     }
 
@@ -616,12 +870,12 @@ export function createView(app) {
     try {
       const fields = fieldsMod.collectFields(provisioningDraft, fieldsMod.LIVE_KEYS);
       await api.updateDeviceProvisioning(device.device_id, fields);
-      ui.toast("Device settings force-pushed — this device is now off its shared profile.");
+      ui.toast("Device settings pushed.");
       provisioningEditing = false;
       provisioningDraft = null;
       await app.refresh();
     } catch (err) {
-      msgs.provisioning = { error: "Failed to save: " + ((err && err.message) || err) };
+      msgs.provisioning = { error: "Failed to save: " + ui.errMsg(err) };
     }
     if (mounted && active === "provisioning") renderSection();
   }
@@ -637,7 +891,7 @@ export function createView(app) {
           await api.requestDeviceReport(device.device_id);
           ui.toast("Refresh request sent.");
         } catch (err) {
-          ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }
       },
     });
@@ -748,7 +1002,7 @@ export function createView(app) {
       };
       await app.refresh();
     } catch (err) {
-      msgs.session = { error: "Failed: " + ((err && err.message) || err) };
+      msgs.session = { error: "Failed: " + ui.errMsg(err) };
     }
     if (mounted && active === "session") renderSection();
   }
@@ -808,7 +1062,7 @@ export function createView(app) {
       await api.notifyUser({ deviceId: device.device_id, title, message });
       msgs.push = { success: "Push notification command sent." };
     } catch (err) {
-      msgs.push = { error: "Failed to send: " + ((err && err.message) || err) };
+      msgs.push = { error: "Failed to send: " + ui.errMsg(err) };
     }
     if (mounted && active === "push") renderSection();
   }
@@ -824,7 +1078,7 @@ export function createView(app) {
           await api.reloadDevice(device.device_id);
           ui.toast("Reload push sent.");
         } catch (err) {
-          ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }
       },
     });
@@ -882,7 +1136,7 @@ export function createView(app) {
       msgs.vpn = { success: queueSuccessText(label, res) };
       await app.refresh();
     } catch (err) {
-      msgs.vpn = { error: "Failed to queue: " + ((err && err.message) || err) };
+      msgs.vpn = { error: "Failed to queue: " + ui.errMsg(err) };
     }
     if (mounted && active === "vpn") renderSection();
   }
@@ -923,19 +1177,20 @@ export function createView(app) {
       <p class="editor__form-desc">Updates queued for this device and tools to queue new ones.</p>
       ${listHtml}
       <div class="card section-card"><div class="card__body">
-        <h5>Queue Profile Update</h5>
+        <h5>Apply Template</h5>
         <div class="field">
-          <label>Provision Profile</label>
+          <label>Provision template</label>
           <select class="select" id="dev-pp-profile" style="width:100%;">
-            <option value="">-- Select a profile --</option>
+            <option value="">-- Select a template --</option>
             ${options}
           </select>
-          ${ppProfiles === null ? '<div class="field__help">Loading profiles…</div>' : ""}
-          <div class="field__help"><a href="#" id="dev-pp-manage" hidden style="color:var(--casa-primary);">Manage profile</a></div>
+          ${ppProfiles === null ? '<div class="field__help">Loading templates…</div>' : ""}
+          <div class="field__help">One-time apply of the template's set device fields — the device does not follow the template afterwards.</div>
+          <div class="field__help"><a href="#" id="dev-pp-manage" hidden style="color:var(--casa-primary);">Manage template</a></div>
         </div>
         <label class="toggle"><input type="checkbox" id="dev-pp-send-push"> Send update via push</label>
         <label class="toggle"><input type="checkbox" id="dev-pp-notify-push"> Notify via push</label>
-        <button class="btn btn--primary" id="dev-push-pp">Queue Profile Update</button>
+        <button class="btn btn--primary" id="dev-push-pp">Apply Template</button>
         ${msgHtml(msgs.updates)}
       </div></div>`;
 
@@ -954,7 +1209,7 @@ export function createView(app) {
     syncManage();
     manage.addEventListener("click", (e) => {
       e.preventDefault();
-      if (select.value) app.navigate("/profiles/" + encodeURIComponent(select.value));
+      if (select.value) app.navigate("/templates/" + encodeURIComponent(select.value));
     });
   }
 
@@ -971,7 +1226,7 @@ export function createView(app) {
         try {
           await api.deleteQueuedUpdate(device.device_id, updateId);
         } catch (err) {
-          msgs.pending = { error: "Failed to delete: " + ((err && err.message) || err) };
+          msgs.pending = { error: "Failed to delete: " + ui.errMsg(err) };
         }
         await app.refresh();
         if (mounted && active === "updates") renderSection();
@@ -988,7 +1243,7 @@ export function createView(app) {
     const notifyPush = !!shell.formEl.querySelector("#dev-pp-notify-push")?.checked;
     msgs.updates = {};
     if (!profileId) {
-      msgs.updates = { error: "Select a provisioning profile first." };
+      msgs.updates = { error: "Select a template first." };
       renderSection();
       return;
     }
@@ -1000,7 +1255,7 @@ export function createView(app) {
       msgs.updates = { success: queueSuccessText(label, res) };
       await app.refresh();
     } catch (err) {
-      msgs.updates = { error: "Failed to queue: " + ((err && err.message) || err) };
+      msgs.updates = { error: "Failed to queue: " + ui.errMsg(err) };
     }
     if (mounted && active === "updates") renderSection();
   }
@@ -1072,7 +1327,7 @@ export function createView(app) {
       }
     } catch (err) {
       leaving = false;
-      msgs.danger = { error: "Failed: " + ((err && err.message) || err) };
+      msgs.danger = { error: "Failed: " + ui.errMsg(err) };
       if (mounted && active === "danger") renderSection();
     }
   }

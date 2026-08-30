@@ -149,6 +149,13 @@ const CSS = `
 }
 .btn--icon:hover:not(:disabled) { background: rgba(127, 127, 127, 0.15); }
 .btn--icon.danger { color: var(--casa-error); }
+.btn .spinner {
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  animation: casa-spin 0.7s linear infinite;
+}
+@keyframes casa-spin { to { transform: rotate(360deg); } }
 
 /* ---------- Inputs ---------- */
 .input, .select, .textarea {
@@ -174,6 +181,24 @@ const CSS = `
 
 .toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; margin-bottom: 10px; }
 input[type="checkbox"], input[type="radio"] { accent-color: var(--casa-primary); width: 16px; height: 16px; }
+
+/* ---------- Sparse template fields (profile-fields.js setKeys mode) ---------- */
+.field__labelrow { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+.field__labelrow label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 0; }
+.field__labelrow .toggle { margin-bottom: 0; }
+.field--toggle { margin-bottom: 10px; }
+.field__chip { flex: none; }
+.field__clear {
+  flex: none; margin-left: auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; border: none; border-radius: 50%;
+  background: none; color: var(--casa-text-2); cursor: pointer; --mdc-icon-size: 16px;
+}
+.field__clear:hover { color: var(--casa-error); background: rgba(127, 127, 127, 0.15); }
+.field--unset .input, .field--unset .select, .field--unset .textarea { opacity: 0.55; }
+.field--unset .toggle { opacity: 0.65; }
+.field--unset .field__labelrow label::after {
+  content: " (default)"; color: var(--casa-text-2); font-weight: 400; font-size: 12px;
+}
 
 .search-field { position: relative; min-width: 220px; flex: 0 1 340px; }
 .search-field ha-icon {

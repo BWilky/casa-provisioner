@@ -52,8 +52,10 @@ function normalizePush(val) {
 /* ---------- v2 payload preview ---------- */
 
 // buildV2PayloadPreview(fields, ctx) → plain object in the exact key order of
-// the server's v2 `profile` dict.
-//   fields: a provision-profile `fields` object (see _DEFAULT_FIELDS)
+// the server's v2 `profile` dict (the one-time install profile a device
+// receives).
+//   fields: a fields object — effective values or a template's sparse fields;
+//     absent keys fall back the same way the server's get_field does
 //   ctx: { siteId?, wgProfiles? }  wgProfiles: [{ id, alias, excluded_wifi }]
 export function buildV2PayloadPreview(fields, ctx = {}) {
   const f = fields || {};
@@ -109,10 +111,11 @@ export function buildV2PayloadPreview(fields, ctx = {}) {
   };
 }
 
-/* ---------- profile card chips ---------- */
+/* ---------- template card chips ---------- */
 
-// profileChips(profile) → [{ label, cls }] for the wizard's profile cards and
-// profile lists. profile: { id, name, fields }.
+// profileChips(template) → [{ label, cls }] for the wizard's template cards
+// and template lists. template: { id, name, fields } — fields are sparse;
+// defaulted chips (e.g. "14d session") reflect the effective behavior.
 export function profileChips(profile) {
   const f = (profile && profile.fields) || {};
   const chips = [];

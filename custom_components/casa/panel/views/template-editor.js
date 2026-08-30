@@ -1,17 +1,18 @@
-// Casa admin panel — provisioning-profile editor view. Three-pane editor
-// (editor-shell.js) mounted at /profiles/new and /profiles/{profileId}:
-// left navigator sections, center form bound to `state.form` (the profile's
-// `fields` object, PROFILE-scope keys per profile-fields.js FIELD_SCOPES /
-// const.py PROFILE_PROVISIONING_FIELDS), right live v2 payload preview
-// (payload-preview.js). Saves the legacy flat body shape — { id?, name,
-// ...fields } — because the server view reads every field key from the top
-// level of the JSON body.
+// Casa admin panel — provision-template editor view. Three-pane editor
+// (editor-shell.js) mounted at /templates/new and /templates/{templateId}:
+// left navigator sections, center form bound to `state.form` (effective
+// values, PROFILE-scope keys per profile-fields.js FIELD_SCOPES / const.py
+// PROFILE_PROVISIONING_FIELDS), right live v2 payload preview
+// (payload-preview.js).
 //
-// Profiles hold reusable template settings only. One-time provisioning
-// process inputs (username/password/pin, deauth, timeout, scramble, Wi-Fi
-// join) are entered in the provisioning wizard / casa.provision service call
-// instead. Legacy profiles may still carry those keys server-side; this
-// editor neither shows nor resubmits them.
+// Templates are sparse: `state.setKeys` tracks which fields this template
+// explicitly sets (touched = set; the per-field × button un-sets). Saves the
+// nested body shape — { id?, name, fields: {only-set-keys} } — the server
+// replaces the stored fields wholesale, which is what makes un-setting work.
+//
+// Templates hold reusable settings only. One-time provisioning process
+// inputs (username/password/pin, deauth, timeout, scramble, Wi-Fi join) are
+// entered in the provisioning wizard / casa.provision service call instead.
 //
 // The field schema/markup/coercion is shared with a single device's
 // "Provisioning" section (device-editor.js) and the wizard via
@@ -26,6 +27,7 @@ export function createView(app) {
   let shellMod = null; // editor-shell.js
   let previewMod = null; // payload-preview.js
   let fieldsMod = null; // profile-fields.js (shared field schema/renderer)
+  let templatesMod = null; // views/templates.js (apply-to-devices modal)
 
   /* ---------- per-mount state ---------- */
   let mountToken = 0;
@@ -33,10 +35,11 @@ export function createView(app) {
   let handle = null; // editor-shell handle
   let saveBtn = null;
   let discardBtn = null;
+  let applyBtn = null;
 
-  let profileId = null; // null → new profile (POST); set → existing (PUT)
-  let state = { name: "", form: {} }; // form populated from fieldsMod.DEFAULTS once loaded
-  let pristineState = null; // deep copy for "Discard changes"
+  let templateId = null; // null → new template (POST); set → existing (PUT)
+  let state = { name: "", form: {}, setKeys: new Set() }; // form populated from fieldsMod.DEFAULTS once loaded
+  let pristineState = null; // copy for "Discard changes"
   let pristine = ""; // normalized snapshot for the dirty getter
   let wgProfiles = []; // [{id, alias, excluded_wifi}] for the link select + preview
   let activeSection = "connection";
@@ -45,37 +48,40 @@ export function createView(app) {
   /* ---------- dirty tracking ---------- */
 
   // Inputs hand back strings, so normalize every non-bool field to a string
-  // before comparing — otherwise 5 vs "5" would read as dirty. Only
-  // profile-scope keys participate, so legacy process keys stored on old
-  // profiles can't trip dirty-tracking.
+  // before comparing — otherwise 5 vs "5" would read as dirty. Only set keys
+  // participate (plus the set list itself), so un-setting a field is a change
+  // even when its effective value stays the default.
   function snapshot(s) {
     const norm = {};
     for (const key of fieldsMod.PROFILE_KEYS) {
+      if (!s.setKeys.has(key)) continue;
       norm[key] = typeof fieldsMod.DEFAULTS[key] === "boolean" ? !!s.form[key] : String(s.form[key] ?? "");
     }
-    return JSON.stringify({ name: String(s.name ?? ""), fields: norm });
+    return JSON.stringify({ name: String(s.name ?? ""), set: [...s.setKeys].sort(), fields: norm });
   }
   const dirty = () => loaded && snapshot(state) !== pristine;
-  const deepCopy = (obj) => JSON.parse(JSON.stringify(obj));
+  const copyState = (s) => ({ name: s.name, form: JSON.parse(JSON.stringify(s.form)), setKeys: new Set(s.setKeys) });
 
-  const titleText = () => `Editing ${state.name || "New profile"}`;
+  const titleText = () => `Editing ${state.name || "New template"}`;
 
   /* ---------- form section rendering ---------- */
 
   function renderSection(id) {
     activeSection = fieldsMod.sectionsFor(fieldsMod.PROFILE_KEYS).some((s) => s.id === id) ? id : "connection";
     if (!handle) return;
-    // "Profile name" is a profile-editor-only concept (not part of the shared
-    // fields schema device provisioning views use), so it's spliced in ahead
-    // of the shared Connection section markup rather than living in
+    // "Template name" is a template-editor-only concept (not part of the
+    // shared fields schema device provisioning views use), so it's spliced in
+    // ahead of the shared Connection section markup rather than living in
     // profile-fields.js.
     const nameFieldHtml = activeSection === "connection" ? `
       <div class="field" data-field="name">
-        <label>Profile name</label>
+        <label>Template name</label>
         <input class="input" data-key="name" value="${esc(state.name)}" placeholder="e.g. Guest tablet">
         <div class="field__help">Auto-generated if blank.</div>
       </div>` : "";
-    handle.formEl.innerHTML = nameFieldHtml + fieldsMod.renderSectionHtml(activeSection, state.form, { readOnly: false, wgProfiles, esc, fields: fieldsMod.PROFILE_KEYS });
+    handle.formEl.innerHTML = nameFieldHtml + fieldsMod.renderSectionHtml(activeSection, state.form, {
+      readOnly: false, wgProfiles, esc, fields: fieldsMod.PROFILE_KEYS, setKeys: state.setKeys,
+    });
     handle.formEl.scrollTop = 0;
   }
 
@@ -90,11 +96,16 @@ export function createView(app) {
     <div class="muted" style="padding:12px 16px 2px; font-size:12px; line-height:1.5;">
       Parenthesized values are placeholders the server resolves at provision time.
     </div>
+    <div class="muted" style="padding:6px 16px 2px; font-size:12px; line-height:1.5;">
+      Dimmed "(default)" fields are not set by this template — the preview
+      shows the system default the provision wizard will prefill for the
+      admin to review.
+    </div>
     <div class="muted" style="padding:6px 16px 14px; font-size:12px; line-height:1.5;">
       Username, password, PIN, Wi-Fi join, provisioning timeout, password
       scramble, and session sign-out are provisioning-process settings —
       entered in the wizard (or casa.provision service call) each time, not
-      stored in this profile.
+      stored on this template.
     </div>`;
 
   function currentPreview() {
@@ -126,16 +137,27 @@ export function createView(app) {
     handle.setTitle(titleText(), d ? '<span class="chip chip--warn">unsaved</span>' : "");
     if (saveBtn) saveBtn.disabled = !d;
     if (discardBtn) discardBtn.hidden = !d;
+    if (applyBtn) applyBtn.disabled = d || !templateId || !setLiveKeys().length;
+  }
+
+  function setLiveKeys() {
+    return [...state.setKeys].filter((k) => fieldsMod.LIVE_KEYS.has(k));
   }
 
   function discard() {
-    state = deepCopy(pristineState);
+    // Mutate in place — bindFieldEvents captured `state.form`/`state.setKeys`
+    // at mount, so swapping the objects out would orphan the bindings.
+    state.name = pristineState.name;
+    for (const key of Object.keys(state.form)) delete state.form[key];
+    Object.assign(state.form, JSON.parse(JSON.stringify(pristineState.form)));
+    state.setKeys.clear();
+    for (const k of pristineState.setKeys) state.setKeys.add(k);
     renderSection(activeSection);
     updateDirtyUi();
     schedulePreview();
   }
 
-  /* ---------- name field (profile-specific; not part of the shared fields form) ---------- */
+  /* ---------- name field (template-specific; not part of the shared fields form) ---------- */
 
   function onNameInput(e) {
     const t = e.target;
@@ -146,60 +168,50 @@ export function createView(app) {
 
   /* ---------- save ---------- */
 
-  function autoName(hostUrl) {
-    let host = hostUrl;
-    try {
-      host = new URL(hostUrl).host || hostUrl;
-    } catch (_e) {
-      /* not a parsable URL — use as-is */
+  function autoName() {
+    const hostUrl = state.setKeys.has("host_url") ? String(state.form.host_url ?? "").trim() : "";
+    if (hostUrl) {
+      let host = hostUrl;
+      try {
+        host = new URL(hostUrl).host || hostUrl;
+      } catch (_e) {
+        /* not a parsable URL — use as-is */
+      }
+      return `Template @ ${host}`;
     }
-    return `Profile @ ${host}`;
-  }
-
-  function markRequiredError(key) {
-    const wrap = handle.formEl.querySelector(`[data-field="${key}"]`);
-    if (!wrap || wrap.classList.contains("field--error")) return;
-    wrap.classList.add("field--error");
-    wrap.insertAdjacentHTML("beforeend", '<div class="field__error">Required.</div>');
+    return `Template (${new Date().toISOString().slice(0, 10)})`;
   }
 
   async function save() {
     if (!handle) return;
-    const hostUrl = String(state.form.host_url ?? "").trim();
-    if (!hostUrl) {
-      handle.setActive("connection");
-      renderSection("connection");
-      markRequiredError("host_url");
-      ui.toast("Host URL is required.", { error: true });
-      return;
-    }
-
-    // Legacy/server body shape: flat — name (+ id for updates) alongside every
-    // field key at the top level; ints coerced like the legacy editor. Only
-    // profile-scope keys are sent (the server filters too).
-    const payload = { name: String(state.name ?? "").trim() || autoName(hostUrl), ...fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS) };
-    payload.host_url = hostUrl;
-    if (profileId) payload.id = profileId;
+    // Nested sparse body: only explicitly-set fields are sent; the server
+    // replaces the stored fields wholesale (that's what makes un-setting
+    // possible) and drops values equal to the defaults.
+    const payload = {
+      name: String(state.name ?? "").trim() || autoName(),
+      fields: fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS, { setKeys: state.setKeys }),
+    };
+    if (templateId) payload.id = templateId;
 
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving…";
     try {
-      const res = await api.saveProvisionProfile(payload); // PUT if id else POST
+      const res = await api.saveProvisionTemplate(payload); // PUT if id else POST
       state.name = payload.name;
-      pristineState = deepCopy(state);
+      pristineState = copyState(state);
       pristine = snapshot(state);
-      ui.toast("Profile saved");
-      if (!profileId && res && res.id) {
-        // POST returns the created profile; adopt its id and fix the URL. The
+      ui.toast("Template saved");
+      if (!templateId && res && res.id) {
+        // POST returns the created template; adopt its id and fix the URL. The
         // router remounts this view for the new path (state is clean now).
-        profileId = res.id;
-        app.navigate("/profiles/" + encodeURIComponent(res.id), { replace: true });
+        templateId = res.id;
+        app.navigate("/templates/" + encodeURIComponent(res.id), { replace: true });
         return;
       }
       app.setHeader({ title: titleText() });
       updateDirtyUi();
     } catch (err) {
-      ui.toast("Save failed: " + ((err && err.message) || err), { error: true });
+      ui.toast("Save failed: " + ui.errMsg(err), { error: true });
     } finally {
       // The success path may have navigated away and unmounted us.
       if (saveBtn) {
@@ -207,6 +219,23 @@ export function createView(app) {
         saveBtn.disabled = !dirty();
       }
     }
+  }
+
+  /* ---------- apply to devices ---------- */
+
+  async function applyToDevices() {
+    if (!templateId) return;
+    try {
+      templatesMod = templatesMod || (await app.loadModule("views/templates.js"));
+    } catch (err) {
+      ui.toast("Failed to load: " + ui.errMsg(err), { error: true });
+      return;
+    }
+    templatesMod.openApplyTemplateModal(app, {
+      id: templateId,
+      name: state.name,
+      fields: fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS, { setKeys: state.setKeys }),
+    });
   }
 
   /* ---------- unload guard ---------- */
@@ -223,57 +252,63 @@ export function createView(app) {
     handle = shellMod.renderEditorShell(hostEl, {
       ui,
       store,
-      storeKey: "editor.profile",
+      storeKey: "editor.template",
       title: titleText(),
       titleChips: "",
-      navHint: "Configure the provisioning profile. The preview shows the payload a device will receive.",
+      navHint: "Set only the fields this template should decide — unset fields are filled in by the admin at provision time. The preview shows the payload a device would receive.",
       sections: fieldsMod.sectionsFor(fieldsMod.PROFILE_KEYS),
       activeSection,
       onSelectSection: (id) => renderSection(id),
       codeTitle: "payload.json — live preview (v2)",
       onCopyCode: () => JSON.stringify(currentPreview(), null, 2),
       footerHtml: `
-        <span class="muted" style="font-size:12px;">Saved profiles appear in the provision device flow.</span>
+        <span class="muted" style="font-size:12px;">Saved templates appear in the provision flow.</span>
         <span class="spacer"></span>
+        <button class="btn btn--text" data-act="apply" disabled>Apply to devices…</button>
         <button class="btn btn--text" data-act="discard" hidden>Discard changes</button>
         <button class="btn btn--primary" data-act="save" disabled>Save</button>`,
     });
     saveBtn = handle.footerEl.querySelector('[data-act="save"]');
     discardBtn = handle.footerEl.querySelector('[data-act="discard"]');
+    applyBtn = handle.footerEl.querySelector('[data-act="apply"]');
     saveBtn.addEventListener("click", save);
     discardBtn.addEventListener("click", discard);
+    applyBtn.addEventListener("click", applyToDevices);
     fieldsMod.bindFieldEvents(handle.formEl, {
       values: state.form,
       readOnly: false,
       onChange: afterChange,
       onSectionRerender: () => renderSection(activeSection),
+      setKeys: state.setKeys,
+      esc,
     });
-    // The profile "name" field lives in the shell chrome, not the shared
+    // The template "name" field lives in the shell chrome, not the shared
     // fields form, so it needs its own listener alongside the shared one.
     handle.formEl.addEventListener("input", onNameInput);
     renderSection(activeSection);
     renderPreview();
+    updateDirtyUi();
   }
 
   /* ---------- view ---------- */
 
   return {
-    id: "profile-editor",
+    id: "template-editor",
     header: (params) => ({
-      title: loaded ? titleText() : params && params.profileId ? "Editing profile…" : "Editing New profile",
-      back: "/profiles",
+      title: loaded ? titleText() : params && params.templateId ? "Editing template…" : "Editing New template",
+      back: "/templates",
     }),
     polling: "paused",
 
     async mount(el, params) {
       const token = ++mountToken;
-      profileId = (params && params.profileId) || null;
+      templateId = (params && params.templateId) || null;
       loaded = false;
       activeSection = "connection";
 
       const hostEl = document.createElement("div");
       hostEl.className = "page--flush";
-      hostEl.innerHTML = '<div class="empty-state"><span class="muted">Loading profile…</span></div>';
+      hostEl.innerHTML = '<div class="empty-state"><span class="muted">Loading template…</span></div>';
       el.appendChild(hostEl);
 
       try {
@@ -281,7 +316,7 @@ export function createView(app) {
           shellMod || app.loadModule("editor-shell.js"),
           previewMod || app.loadModule("payload-preview.js"),
           fieldsMod || app.loadModule("views/profile-fields.js"),
-          profileId ? api.getProvisionProfiles() : null,
+          templateId ? api.getProvisionTemplates() : null,
           api.getWireguardProfiles().catch(() => ({ profiles: [] })),
         ]);
         if (token !== mountToken) return;
@@ -290,8 +325,9 @@ export function createView(app) {
         fieldsMod = fields;
         wgProfiles = (wgRes && wgRes.profiles) || [];
 
-        // Seed only profile-scope keys — legacy process keys stored on old
-        // profiles are neither rendered nor resubmitted.
+        // `form` holds effective values (defaults backfilled) so gating and
+        // the preview always have something to render; `setKeys` records
+        // which fields the template actually sets (stored keys are sparse).
         const seedForm = (src) => {
           const form = {};
           for (const key of fieldsMod.PROFILE_KEYS) {
@@ -299,24 +335,29 @@ export function createView(app) {
           }
           return form;
         };
-        if (profileId) {
-          const profile = ((ppRes && ppRes.profiles) || []).find((p) => p && p.id === profileId);
-          if (!profile) {
-            ui.showInfo({ title: "Profile not found", message: "That provisioning profile no longer exists." });
-            app.navigate("/profiles", { replace: true });
+        if (templateId) {
+          const template = ((ppRes && ppRes.profiles) || []).find((p) => p && p.id === templateId);
+          if (!template) {
+            ui.showInfo({ title: "Template not found", message: "That provision template no longer exists." });
+            app.navigate("/templates", { replace: true });
             return;
           }
-          state = { name: profile.name || "", form: seedForm(profile.fields) };
+          const fieldsSrc = template.fields || {};
+          state = {
+            name: template.name || "",
+            form: seedForm(fieldsSrc),
+            setKeys: new Set(Object.keys(fieldsSrc).filter((k) => fieldsMod.PROFILE_KEYS.has(k))),
+          };
         } else {
-          state = { name: "", form: seedForm(null) };
+          state = { name: "", form: seedForm(null), setKeys: new Set() };
         }
       } catch (err) {
         if (token !== mountToken) return;
-        hostEl.innerHTML = `<div class="page"><div class="errbar">Failed to load profile: ${esc(String((err && err.message) || err))}</div></div>`;
+        hostEl.innerHTML = `<div class="page"><div class="errbar">Failed to load template: ${esc(ui.errMsg(err))}</div></div>`;
         return;
       }
 
-      pristineState = deepCopy(state);
+      pristineState = copyState(state);
       pristine = snapshot(state);
       loaded = true;
 
@@ -333,6 +374,7 @@ export function createView(app) {
       handle = null;
       saveBtn = null;
       discardBtn = null;
+      applyBtn = null;
       loaded = false;
     },
 
@@ -353,7 +395,7 @@ export function createView(app) {
         const modal = ui.openModal({
           title: "Discard changes?",
           bodyHtml:
-            '<p style="margin:0; font-size:14px; line-height:1.5;">This profile has unsaved changes. Discard them and leave?</p>',
+            '<p style="margin:0; font-size:14px; line-height:1.5;">This template has unsaved changes. Discard them and leave?</p>',
           buttons: [
             { label: "Keep editing", variant: "text", onClick: () => done(false) },
             { label: "Discard", variant: "danger", onClick: () => done(true) },

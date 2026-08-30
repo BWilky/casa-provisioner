@@ -132,6 +132,10 @@ export function createView(app) {
       badges.push(
         `<span class="badge badge--count" title="${Number(d.pending_updates)} pending update(s)">${Number(d.pending_updates)}</span>`
       );
+    if (d.reauth_pending)
+      badges.push(
+        `<span class="badge badge--pending" title="Reauthentication to '${ui.esc(d.reauth_pending.target_username || "")}' pending">reauth</span>`
+      );
     const icons = [];
     if (d.wireguard_connected)
       icons.push(`<ha-icon icon="mdi:shield-check" class="muted" style="--mdc-icon-size:14px;" title="WireGuard connected"></ha-icon>`);
@@ -382,13 +386,21 @@ export function createView(app) {
         },
         {
           icon: "mdi:clipboard-arrow-down-outline",
-          label: "Push provision profile",
+          label: "Apply template…",
           onSelect: async () => {
             const mod = await app.loadModule("views/device-editor.js");
             mod.openPushModal(app, d, "profile");
           },
         },
         { icon: "mdi:qrcode", label: "Re-provision user", onSelect: () => gotoProvision({ presetUsername: d.username }) },
+        {
+          icon: "mdi:account-key",
+          label: "Reauthenticate…",
+          onSelect: async () => {
+            const mod = await app.loadModule("views/device-editor.js");
+            mod.openReauthModal(app, d);
+          },
+        },
         "divider",
         { icon: "mdi:delete-outline", label: "Delete record", danger: true, onSelect: () => confirmDeviceAction(d, "delete") },
         { icon: "mdi:cellphone-remove", label: "Deprovision", danger: true, onSelect: () => confirmDeviceAction(d, "deprovision") },
@@ -444,7 +456,7 @@ export function createView(app) {
           await api.reloadDevice(d.device_id);
           ui.toast("Reload push sent.");
         } catch (err) {
-          ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+          ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }
       },
     });
@@ -487,7 +499,7 @@ export function createView(app) {
         }
       }
     } catch (err) {
-      ui.toast("Failed: " + ((err && err.message) || err), { error: true });
+      ui.toast("Failed: " + ui.errMsg(err), { error: true });
     }
   }
 
@@ -527,7 +539,7 @@ export function createView(app) {
             else if (kind === "delete") await api.deleteDevice(id);
             else await api.deprovisionDevice(id);
           } catch (err) {
-            failures.push((err && err.message) || String(err));
+            failures.push(ui.errMsg(err));
           }
         }
         const ok = n - failures.length;
@@ -715,7 +727,7 @@ export function createView(app) {
             <button class="tab tab--active">Devices</button>
             <button class="tab" id="dv-tab-accounts">Accounts</button>
             <button class="tab" id="dv-tab-sessions">Sessions</button>
-            <button class="tab" id="dv-tab-profiles">Provision Profiles</button>
+            <button class="tab" id="dv-tab-profiles">Provision Templates</button>
             <button class="tab" id="dv-tab-wireguard">WireGuard Profiles</button>
           </div>
           <div class="list-toolbar">
@@ -765,7 +777,7 @@ export function createView(app) {
 
       el.querySelector("#dv-tab-accounts").addEventListener("click", () => app.navigate("/accounts"));
       el.querySelector("#dv-tab-sessions").addEventListener("click", () => app.navigate("/sessions"));
-      el.querySelector("#dv-tab-profiles").addEventListener("click", () => app.navigate("/profiles"));
+      el.querySelector("#dv-tab-profiles").addEventListener("click", () => app.navigate("/templates"));
       el.querySelector("#dv-tab-wireguard").addEventListener("click", () => app.navigate("/wireguard"));
       refs.segmented.addEventListener("click", (e) => {
         const btn = e.target.closest("[data-mode]");

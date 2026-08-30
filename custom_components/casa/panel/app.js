@@ -14,10 +14,11 @@
 //   }
 
 export async function createApp({ host, loadModule, version }) {
-  const [stylesMod, apiMod, uiMod] = await Promise.all([
+  const [stylesMod, apiMod, uiMod, versionMod] = await Promise.all([
     loadModule("styles.js"),
     loadModule("api.js"),
     loadModule("ui.js"),
+    loadModule("version.js"),
   ]);
 
   const shadow = host.shadowRoot || host.attachShadow({ mode: "open" });
@@ -35,12 +36,16 @@ export async function createApp({ host, loadModule, version }) {
       <span class="spacer"></span>
       <button class="btn btn--icon" id="hdr-kebab" title="More"><ha-icon icon="mdi:dots-vertical"></ha-icon></button>
     </div>
+    <div id="ver-banner" class="errbar" style="display:none; margin:12px 16px 0;"></div>
     <main id="casa-main"></main>
     <div id="popover-layer"></div>
     <div id="modal-layer"></div>
   `;
 
   const api = new apiMod.CasaApi();
+  // Lets the api layer refuse writes that a version-skewed (not yet
+  // restarted) backend would silently mangle — see saveProvisionTemplate.
+  api.panelVersion = versionMod.PANEL_VERSION;
   const ui = uiMod.createUi({
     popoverLayer: shadow.getElementById("popover-layer"),
     modalLayer: shadow.getElementById("modal-layer"),
@@ -79,17 +84,22 @@ export async function createApp({ host, loadModule, version }) {
     { pattern: ["devices"], view: "views/devices.js" },
     { pattern: ["accounts"], view: "views/accounts.js" },
     { pattern: ["sessions"], view: "views/sessions.js" },
-    { pattern: ["profiles"], view: "views/profiles.js" },
+    { pattern: ["templates"], view: "views/templates.js" },
     { pattern: ["wireguard"], view: "views/wireguard-profiles.js" },
     { pattern: ["devices", ":deviceId"], view: "views/device-editor.js" },
-    { pattern: ["profiles", "new"], view: "views/profile-editor.js" },
-    { pattern: ["profiles", ":profileId"], view: "views/profile-editor.js" },
+    { pattern: ["templates", "new"], view: "views/template-editor.js" },
+    { pattern: ["templates", ":templateId"], view: "views/template-editor.js" },
     { pattern: ["settings"], view: "views/settings.js" },
     { pattern: ["settings", ":tab"], view: "views/settings.js" },
     { pattern: ["provision"], view: "views/provision.js" },
     { pattern: ["provision", "guided"], view: "views/provision-guided.js" },
     { pattern: ["provision", "user", ":username"], view: "views/provision.js" },
-    { pattern: ["provision", "profile", ":profileId"], view: "views/provision.js" },
+    { pattern: ["provision", "template", ":templateId"], view: "views/provision.js" },
+    // Legacy aliases (pre-template bookmarks) — same views as above.
+    { pattern: ["profiles"], view: "views/templates.js" },
+    { pattern: ["profiles", "new"], view: "views/template-editor.js" },
+    { pattern: ["profiles", ":templateId"], view: "views/template-editor.js" },
+    { pattern: ["provision", "profile", ":templateId"], view: "views/provision.js" },
     { pattern: [], view: "views/devices.js" }, // default = device list
   ];
 
@@ -166,7 +176,7 @@ export async function createApp({ host, loadModule, version }) {
               ui.toast("Reconcile complete.");
               api.refreshSummary();
             } catch (err) {
-              ui.toast("Reconcile failed: " + ((err && err.message) || err), { error: true });
+              ui.toast("Reconcile failed: " + ui.errMsg(err), { error: true });
             }
           },
         },
@@ -224,7 +234,7 @@ export async function createApp({ host, loadModule, version }) {
       view = await loadView(route.view);
     } catch (err) {
       console.error("casa: failed to load view", route.view, err);
-      main.innerHTML = `<div class="page"><div class="errbar">Failed to load ${uiMod.esc(route.view)}: ${uiMod.esc(String((err && err.message) || err))}</div></div>`;
+      main.innerHTML = `<div class="page"><div class="errbar">Failed to load ${uiMod.esc(route.view)}: ${uiMod.esc(uiMod.errMsg(err))}</div></div>`;
       return;
     }
     if (token !== routeToken) return;
@@ -244,7 +254,25 @@ export async function createApp({ host, loadModule, version }) {
     else api.resumePolling();
   }
 
+  // Version handshake: the backend reports the CASA_VERSION it imported at
+  // startup; the panel files on disk carry PANEL_VERSION. Any skew means HA is
+  // still running old Python under updated files — every API oddity from that
+  // state is noise, so surface the one real remedy prominently.
+  const verBanner = shadow.getElementById("ver-banner");
+  function checkVersionSkew(summary) {
+    if (!summary) return;
+    const backend = summary.version;
+    const skewed = backend !== versionMod.PANEL_VERSION;
+    verBanner.style.display = skewed ? "" : "none";
+    if (skewed) {
+      verBanner.textContent =
+        `Casa was updated on disk (panel ${versionMod.PANEL_VERSION}, backend ${backend || "pre-26.07.13"}). ` +
+        "Restart Home Assistant to finish installing the update.";
+    }
+  }
+
   api.subscribe((summary, error) => {
+    checkVersionSkew(summary);
     if (currentView) {
       renderHeader(currentView, currentParams);
       currentView.onSummary?.(summary, error);

@@ -1,14 +1,23 @@
-// Shared provisioning-field schema + renderer, used by the shared
-// provisioning-profile editor (profile-editor.js), a single device's
-// "Provisioning" section (device-editor.js), and the provision flow
-// (views/provision.js). Same fields, same markup, same coercion rules — the callers
-// differ in which field *scope* they render and what happens after: saving a
-// named profile, force-pushing an off-profile override to one device, or
-// generating a one-time provisioning payload.
+// Shared provisioning-field schema + renderer, used by the provision-template
+// editor (template-editor.js), a single device's "Provisioning" section
+// (device-editor.js), and the provision flow (views/provision.js). Same
+// fields, same markup, same coercion rules — the callers differ in which
+// field *scope* they render and what happens after: saving a named template,
+// force-pushing a per-device override, or generating a one-time provision
+// profile (the install payload).
 //
 // This module owns rendering + event wiring for a `values` object (plain
-// field-key -> value map, no `name`/`id` — those are profile-editor-only
+// field-key -> value map, no `name`/`id` — those are template-editor-only
 // concepts). Callers own the surrounding state/mount lifecycle.
+//
+// Two rendering modes:
+// - total (default): every rendered field is a concrete value (device editor,
+//   provision wizard).
+// - sparse (pass `setKeys`, a Set of field keys): templates store only the
+//   fields their author explicitly set. `values` stays *effective* (defaults
+//   backfilled) so gating logic and previews keep working; `setKeys` drives
+//   the set/unset styling, the per-field "reset to default" button, and
+//   sparse collection via collectFields(..., { setKeys }).
 
 // Mirrors the field-scope constants in const.py (LIVE/PROFILE_ONLY/
 // PROCESS_PROVISIONING_FIELDS) exactly — keys, types, and scopes.
@@ -41,7 +50,7 @@ export const DEFAULTS = {
   cache_control_hours: "",
 };
 
-// live    — ongoing device state: profiles, per-device editing, self-reports.
+// live    — ongoing device state: templates, per-device editing, self-reports.
 // profile — reusable template policy, resolved at provision time; not
 //           device-editable (expires_at_override covers post-hoc changes).
 // process — one-time provisioning-ceremony inputs / server-side actions;
@@ -113,16 +122,33 @@ const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 // `fields` (a Set of keys, e.g. LIVE_KEYS) limits which fields render —
 // omitted means render everything. `heading: false` suppresses the section
 // heading for hosts with their own headers (the wizard accordion).
-export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfiles = [], esc, fields = null, heading = true } = {}) {
+// `setKeys` (Set|null) turns on sparse mode: unset fields render dimmed with
+// the default value, set fields get a "reset to default" button.
+// `annotations` ({key: "template"|"review"}|null) badges fields the wizard
+// pre-filled from a template vs blanks the admin should review.
+export function clearButtonHtml(key, esc) {
+  return `<button type="button" class="field__clear" data-clear="${esc(key)}" title="Reset to default"><ha-icon icon="mdi:close-circle-outline"></ha-icon></button>`;
+}
+
+export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfiles = [], esc, fields = null, heading = true, setKeys = null, annotations = null } = {}) {
   const val = (key) => values[key] ?? "";
   const dis = (extra = false) => (readOnly || extra ? "disabled" : "");
   const inc = (key) => !fields || fields.has(key);
+  const stateCls = (key) => (setKeys ? (setKeys.has(key) ? " field--set" : " field--unset") : "");
+  const clearBtn = (key) => (setKeys && setKeys.has(key) && !readOnly ? clearButtonHtml(key, esc) : "");
+  const chip = (key) => {
+    const kind = annotations ? annotations[key] : null;
+    if (kind === "template") return `<span class="chip chip--app field__chip">from template</span>`;
+    if (kind === "review") return `<span class="chip chip--warn field__chip">review</span>`;
+    return "";
+  };
+  const labelRow = (key, labelHtml) => `<div class="field__labelrow">${labelHtml}${chip(key)}${clearBtn(key)}</div>`;
 
   function textField({ key, label, help, placeholder = "", type = "text", attrs = "", disabled = false }) {
     if (!inc(key)) return "";
     return `
-      <div class="field" data-field="${esc(key)}">
-        <label>${esc(label)}</label>
+      <div class="field${stateCls(key)}" data-field="${esc(key)}">
+        ${labelRow(key, `<label>${esc(label)}</label>`)}
         <input class="input" type="${esc(type)}" data-key="${esc(key)}" value="${esc(val(key))}"
           placeholder="${esc(placeholder)}" ${dis(disabled)} ${attrs}>
         ${help ? `<div class="field__help">${esc(help)}</div>` : ""}
@@ -145,8 +171,8 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
       )
       .join("");
     return `
-      <div class="field" data-field="${esc(key)}">
-        <label>${esc(label)}</label>
+      <div class="field${stateCls(key)}" data-field="${esc(key)}">
+        ${labelRow(key, `<label>${esc(label)}</label>`)}
         <select class="select" data-key="${esc(key)}" ${dis(disabled)}>${opts}</select>
         ${help ? `<div class="field__help">${esc(help)}</div>` : ""}
       </div>`;
@@ -155,11 +181,14 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
   function toggleField({ key, label, help }) {
     if (!inc(key)) return "";
     return `
-      <div data-field="${esc(key)}">
-        <label class="toggle">
-          <input type="checkbox" data-key="${esc(key)}" ${val(key) ? "checked" : ""} ${dis()}>
-          <span>${esc(label)}</span>
-        </label>
+      <div class="field--toggle${stateCls(key)}" data-field="${esc(key)}">
+        <div class="field__labelrow">
+          <label class="toggle">
+            <input type="checkbox" data-key="${esc(key)}" ${val(key) ? "checked" : ""} ${dis()}>
+            <span>${esc(label)}</span>
+          </label>
+          ${chip(key)}${clearBtn(key)}
+        </div>
         ${help ? `<div class="field__help" style="margin:-4px 0 12px 24px;">${esc(help)}</div>` : ""}
       </div>`;
   }
@@ -205,8 +234,8 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
         ],
       })}
       ${inc("custom_color") ? `
-      <div class="field" data-field="custom_color">
-        <label>Custom color</label>
+      <div class="field${stateCls("custom_color")}" data-field="custom_color">
+        ${labelRow("custom_color", `<label>Custom color</label>`)}
         <div class="field-row">
           <input type="color" data-ref="color-pick" value="${esc(pickValue)}" ${dis(colorDisabled)}
             style="flex:none; width:44px; height:36px; padding:2px; border:1px solid var(--casa-divider); border-radius:var(--casa-radius-sm); background:var(--casa-card-bg); cursor:pointer;">
@@ -223,8 +252,8 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
       ${sectionHeading("Access Control", "Restrict which pages and networks the device may use.")}
       ${toggleField({ key: "allow_all_pages", label: "Allow all pages", help: "When on, the device may open any page (payload sends /*)." })}
       ${inc("allowed_pages") ? `
-      <div class="field" data-field="allowed_pages">
-        <label>Allowed pages</label>
+      <div class="field${stateCls("allowed_pages")}" data-field="allowed_pages">
+        ${labelRow("allowed_pages", `<label>Allowed pages</label>`)}
         <input class="input" data-key="allowed_pages" value="${esc(val("allowed_pages"))}"
           placeholder="${allowAll ? "/*" : "/lovelace/home, /dashboard-1/*"}" ${dis(allowAll)}>
         <div class="field__help">Comma-separated paths the device may open. Ignored while "Allow all pages" is on.</div>
@@ -250,8 +279,8 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
            Config comes from profile '${esc(linked.alias || linked.id)}'.
          </div>`
       : `
-        <div class="field" data-field="wireguard_config">
-          <label>WireGuard config</label>
+        <div class="field${stateCls("wireguard_config")}" data-field="wireguard_config">
+          ${labelRow("wireguard_config", `<label>WireGuard config</label>`)}
           <textarea class="textarea" data-key="wireguard_config" placeholder="[Interface]&#10;PrivateKey = ..." ${dis()}>${esc(val("wireguard_config"))}</textarea>
           <div class="field__help">Full client config pushed to the device. Ignored when a WireGuard profile is linked above.</div>
         </div>
@@ -287,8 +316,8 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
       ${sectionHeading("Wi-Fi & Extras", "Optionally join the device to a Wi-Fi network during provisioning.")}
       ${textField({ key: "connect_wifi_ssid", label: "Connect Wi-Fi SSID", placeholder: "MyNetwork", help: "Network the device joins during provisioning. Blank = skip." })}
       ${inc("connect_wifi_password") ? `
-      <div class="field" data-field="connect_wifi_password">
-        <label>Connect Wi-Fi password</label>
+      <div class="field${stateCls("connect_wifi_password")}" data-field="connect_wifi_password">
+        ${labelRow("connect_wifi_password", `<label>Connect Wi-Fi password</label>`)}
         <div class="field-row">
           <input class="input" type="password" data-key="connect_wifi_password" value="${esc(val("connect_wifi_password"))}" placeholder="Password" autocomplete="off" ${dis()}>
           <button type="button" class="btn btn--icon" data-ref="reveal-pw" title="Show password" style="flex:none;" ${readOnly ? "disabled" : ""}>
@@ -316,13 +345,32 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
 // sibling visibility changes (theme_color_mode, allow_all_pages,
 // wireguard_profile_id) — the caller re-renders the current section from
 // `values` (nothing is lost; values already hold the committed change).
-export function bindFieldEvents(formEl, { values, readOnly = false, onChange = () => {}, onSectionRerender = () => {} } = {}) {
+// Sparse mode: pass the same `setKeys` given to renderSectionHtml. Editing a
+// field marks it set (touched = set, flipped in place so typing isn't
+// interrupted); the per-field [data-clear] button un-sets it, restoring
+// `defaults[key]` and re-rendering the section (clearing a gating field must
+// re-evaluate siblings).
+export function bindFieldEvents(formEl, { values, readOnly = false, onChange = () => {}, onSectionRerender = () => {}, setKeys = null, defaults = DEFAULTS, esc = null } = {}) {
   if (readOnly) return () => {}; // nothing interactive to wire up
 
   function commit(el) {
     const key = el.dataset.key;
     if (!key) return;
     values[key] = el.type === "checkbox" ? el.checked : el.value;
+    markSet(key);
+  }
+
+  function markSet(key) {
+    if (!setKeys || setKeys.has(key)) return;
+    setKeys.add(key);
+    const wrap = formEl.querySelector(`[data-field="${key}"]`);
+    if (!wrap) return;
+    wrap.classList.remove("field--unset");
+    wrap.classList.add("field--set");
+    const row = wrap.querySelector(".field__labelrow");
+    if (row && esc && !row.querySelector("[data-clear]")) {
+      row.insertAdjacentHTML("beforeend", clearButtonHtml(key, esc));
+    }
   }
 
   function clearFieldError(el) {
@@ -336,6 +384,7 @@ export function bindFieldEvents(formEl, { values, readOnly = false, onChange = (
     const t = e.target;
     if (t.dataset.ref === "color-pick") {
       values.custom_color = t.value;
+      markSet("custom_color");
       const twin = formEl.querySelector('[data-key="custom_color"]');
       if (twin) twin.value = t.value;
       onChange();
@@ -371,6 +420,15 @@ export function bindFieldEvents(formEl, { values, readOnly = false, onChange = (
   }
 
   function onClick(e) {
+    const clear = e.target.closest("[data-clear]");
+    if (clear && setKeys) {
+      const key = clear.dataset.clear;
+      setKeys.delete(key);
+      values[key] = defaults[key];
+      onSectionRerender(key);
+      onChange();
+      return;
+    }
     const btn = e.target.closest('[data-ref="reveal-pw"]');
     if (!btn) return;
     const input = formEl.querySelector('[data-key="connect_wifi_password"]');
@@ -393,13 +451,16 @@ export function bindFieldEvents(formEl, { values, readOnly = false, onChange = (
 }
 
 // Coerce a `values` object (raw form values) into the payload shape the
-// server expects — bool/int/string per DEFAULTS' types, same rule
-// profile-editor.js's save() used inline. `fieldsSet` (e.g. PROFILE_KEYS)
-// limits which keys are emitted — omitted means all.
-export function collectFields(values, fieldsSet = null) {
+// server expects — bool/int/string per DEFAULTS' types. `fieldsSet` (e.g.
+// PROFILE_KEYS) limits which keys are emitted — omitted means all. In sparse
+// mode pass `setKeys` to emit only explicitly-set fields (the server also
+// drops values equal to the defaults, so set-to-default round-trips as
+// unset).
+export function collectFields(values, fieldsSet = null, { setKeys = null } = {}) {
   const out = {};
   for (const [key, def] of Object.entries(DEFAULTS)) {
     if (fieldsSet && !fieldsSet.has(key)) continue;
+    if (setKeys && !setKeys.has(key)) continue;
     const raw = values[key];
     if (typeof def === "boolean") out[key] = !!raw;
     else if (typeof def === "number") out[key] = parseInt(raw, 10) || 0;
