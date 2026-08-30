@@ -334,6 +334,35 @@ def _enqueue_location_update_for_device(qu_data: dict, device_id: str, lz_data: 
     return _enqueue_update(qu_data, device_id, "location", "update", payload, created_by)
 
 
+def _apply_location_report(hass, device_id: str, device_info: dict, state, reason, config_version) -> bool:
+    """Validate and stamp a device's zone report onto its record. The state
+    string is opaque ('<anchor>: <label>' | 'away' | 'unknown') but bounded;
+    anything containing digits-with-dots (coordinate-ish) is rejected outright
+    per the no-location-data rule."""
+    from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+    if not isinstance(state, str) or not state.strip() or len(state) > 120:
+        return False
+    state = state.strip()
+    if reason is not None:
+        reason = str(reason)
+        if reason not in ALLOWED_REASONS:
+            return False
+    if state == "unknown" and reason is None:
+        reason = "no_fix"
+    if state != "unknown":
+        reason = None
+
+    device_info["location_state"] = state
+    device_info["location_reason"] = reason
+    device_info["location_reported_at"] = dt_util.now().isoformat()
+    if isinstance(config_version, str) and config_version:
+        device_info["location_config_version"] = config_version
+    async_dispatcher_send(hass, f"casa_device_updated_{device_id}")
+    hass.data[DOMAIN]["store"].async_delay_save(lambda: hass.data[DOMAIN]["stored_data"], 2.0)
+    return True
+
+
 def _dequeue_update(qu_data: dict, device_id: str, update_id: str) -> dict | None:
     """Remove a queued update entry by id. Returns the removed entry or None."""
     entries = qu_data.get("updates", {}).get(device_id, [])
@@ -819,6 +848,10 @@ class CasaHeartbeatView(HomeAssistantView):
         if not isinstance(alias, str):
             alias = None
 
+        location_state = data.get("location_state")
+        location_reason = data.get("location_reason")
+        location_config_version = data.get("location_config_version")
+
         if expires_at is not None:
             try:
                 expires_at = int(expires_at)
@@ -857,6 +890,22 @@ class CasaHeartbeatView(HomeAssistantView):
         # device_key is the shared secret used to decrypt encrypted pushes; device_key_id
         # lets the device detect when its stored key is stale after a rotation.
         stored_data = self.hass.data[DOMAIN]["stored_data"]
+
+        lz_data = self.hass.data[DOMAIN].get("lz_data", {})
+        server_lz_version = lz_data.get("config_version", "")
+        device_info, _uid, _uname = _find_device_record(stored_data, device_id)
+        if device_info is not None and isinstance(location_state, str):
+            _apply_location_report(self.hass, device_id, device_info,
+                                   location_state, location_reason, location_config_version)
+        # Reconciler: device confirmed a stale config version → re-enqueue.
+        if (device_info is not None and server_lz_version
+                and isinstance(location_config_version, str)
+                and location_config_version != server_lz_version):
+            qu_data = self.hass.data[DOMAIN]["qu_data"]
+            _enqueue_location_update_for_device(qu_data, device_id, lz_data, "system:lz-reconcile")
+            self.hass.data[DOMAIN]["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+            result["updates"] = True
+
         device_key = stored_data.get("device_key")
         response = {
             "status": "success",
@@ -871,6 +920,7 @@ class CasaHeartbeatView(HomeAssistantView):
             "has_alias": bool(result.get("has_alias")),
             "heartbeat_interval_seconds": result.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
             "profile_report_interval_seconds": result.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
+            "location_config_version": server_lz_version or None,
         }
         # Only emitted while an admin-set override is pending; the stored value is
         # never echoed back, so a freshly re-provisioned device keeps its own expiry.
@@ -1268,6 +1318,58 @@ class CasaLocationZonesView(HomeAssistantView):
                 ))
         _LOGGER.info("CASA: Location zones saved (version=%s); queued for %d device(s).", lz_data["config_version"], queued)
         return self.json({"status": "ok", "config_version": lz_data["config_version"], "queued": queued})
+
+
+class CasaLocationReportView(HomeAssistantView):
+    """Device-facing zone report endpoint. No HA session required — the
+    device_key encryption IS the authentication (same trust model as the
+    encrypted push path; per-device HKDF salt prevents cross-device replay).
+    The report schema deliberately has no location fields, and unknown keys
+    are rejected so none can be smuggled in later."""
+
+    url = "/api/casa/location_report"
+    name = "api:casa:location_report"
+    requires_auth = False
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def post(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = str(body.get("device_id", "")).strip()
+        payload_b64 = body.get("payload")
+        if not device_id or not isinstance(payload_b64, str):
+            return self.json({"error": "device_id and payload are required"}, status_code=400)
+
+        data = self.hass.data.get(DOMAIN, {})
+        stored_data = data.get("stored_data", {})
+        device_key = stored_data.get("device_key")
+        device_info, _uid, _uname = _find_device_record(stored_data, device_id)
+        if device_info is None or not device_key:
+            # Deliberately vague: this endpoint is unauthenticated.
+            return self.json({"error": "Rejected"}, status_code=403)
+
+        try:
+            inner = decrypt_report_payload(payload_b64, device_key, device_id)
+        except ValueError:
+            _LOGGER.warning("CASA: Rejected location report for device '%s' (decrypt failed).", device_id)
+            return self.json({"error": "Rejected"}, status_code=403)
+
+        if set(inner.keys()) - ALLOWED_REPORT_KEYS:
+            return self.json({"error": "Rejected"}, status_code=403)
+        ts = inner.get("ts")
+        if not isinstance(ts, (int, float)) or abs(time.time() - ts) > 300:
+            return self.json({"error": "Rejected"}, status_code=403)
+
+        if not _apply_location_report(self.hass, device_id, device_info,
+                                      inner.get("state"), inner.get("reason"),
+                                      inner.get("config_version")):
+            return self.json({"error": "Rejected"}, status_code=403)
+        return self.json({"status": "ok"})
 
 
 class CasaAdminDeviceView(HomeAssistantView):
@@ -2909,6 +3011,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(CasaAdminSummaryView(hass))
     hass.http.register_view(CasaWireGuardProfilesView(hass))
     hass.http.register_view(CasaLocationZonesView(hass))
+    hass.http.register_view(CasaLocationReportView(hass))
     hass.http.register_view(CasaProvisionProfilesView(hass))
     hass.http.register_view(CasaAdminDeviceView(hass))
     hass.http.register_view(CasaAdminSettingsView(hass))
