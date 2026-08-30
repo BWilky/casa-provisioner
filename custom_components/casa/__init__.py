@@ -337,8 +337,9 @@ def _enqueue_location_update_for_device(qu_data: dict, device_id: str, lz_data: 
 def _apply_location_report(hass, device_id: str, device_info: dict, state, reason, config_version) -> bool:
     """Validate and stamp a device's zone report onto its record. The state
     string is opaque ('<anchor>: <label>' | 'away' | 'unknown') but bounded;
-    anything containing digits-with-dots (coordinate-ish) is rejected outright
-    per the no-location-data rule."""
+    no-location-data is guaranteed structurally, not by content-sniffing here —
+    the report schema has no location fields and the endpoint rejects any
+    unknown keys before this function is ever called."""
     from homeassistant.helpers.dispatcher import async_dispatcher_send
 
     if not isinstance(state, str) or not state.strip() or len(state) > 120:
@@ -4909,6 +4910,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, _scheduled_reconcile, timedelta(days=1)
     )
 
+    async def _location_staleness_sweep(_now):
+        data = hass.data.get(DOMAIN, {})
+        lz = data.get("lz_data", {})
+        minutes = lz.get("stale_after_minutes", 0)
+        if not minutes:
+            return
+        from homeassistant.helpers.dispatcher import async_dispatcher_send
+        cutoff = dt_util.now() - timedelta(minutes=minutes)
+        changed = False
+        for did, dinfo in _iter_all_devices(data.get("stored_data", {})):
+            reported_at = dinfo.get("location_reported_at")
+            if not reported_at or dinfo.get("location_state") in (None, "unknown"):
+                continue
+            try:
+                reported_dt = dt_util.parse_datetime(reported_at)
+            except (ValueError, TypeError):
+                reported_dt = None
+            if reported_dt is None or reported_dt < cutoff:
+                dinfo["location_state"] = "unknown"
+                dinfo["location_reason"] = "stale"
+                async_dispatcher_send(hass, f"casa_device_updated_{did}")
+                changed = True
+        if changed:
+            data["store"].async_delay_save(lambda: data["stored_data"], 2.0)
+
+    hass.data[DOMAIN]["lz_stale_unsub"] = async_track_time_interval(
+        hass, _location_staleness_sweep, timedelta(seconds=60)
+    )
+
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "button"])
 
@@ -5145,6 +5175,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     reconcile_unsub = hass.data[DOMAIN].get("reconcile_unsub")
     if reconcile_unsub:
         reconcile_unsub()
+
+    lz_stale_unsub = hass.data[DOMAIN].get("lz_stale_unsub")
+    if lz_stale_unsub:
+        lz_stale_unsub()
 
     try:
         frontend.async_remove_panel(hass, "casa")

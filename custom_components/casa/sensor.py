@@ -29,6 +29,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
             CasaDeviceLastSeenSensor(hass, device_id, username, is_native),
             CasaDeviceExpiresSensor(hass, device_id, username, is_native),
             CasaDeviceCurrentURLSensor(hass, device_id, username, is_native),
+            CasaDeviceLocationSensor(hass, device_id, username, is_native),
         ]
 
     existing_entities = []
@@ -312,3 +313,49 @@ class CasaDeviceCurrentURLSensor(CasaDeviceSensorBase):
                     device_info = devs[self.device_id]
                     break
         return device_info.get("current_url", "unknown")
+
+
+class CasaDeviceLocationSensor(CasaDeviceSensorBase):
+    """Zone state reported by the device (label only — never coordinates)."""
+    sensor_type = "location"
+    _attr_icon = "mdi:map-marker-radius"
+
+    @property
+    def name(self):
+        return "Location"
+
+    @property
+    def native_value(self):
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_info = {}
+        if not self.is_native:
+            for u in stored_data.get("users", {}).values():
+                if self.device_id in u.get("devices", {}):
+                    device_info = u["devices"][self.device_id]
+                    break
+        else:
+            for devs in stored_data.get("native_devices", {}).values():
+                if self.device_id in devs:
+                    device_info = devs[self.device_id]
+                    break
+        return device_info.get("location_state") or "unknown"
+
+    @property
+    def extra_state_attributes(self):
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_info = {}
+        if not self.is_native:
+            for u in stored_data.get("users", {}).values():
+                if self.device_id in u.get("devices", {}):
+                    device_info = u["devices"][self.device_id]
+                    break
+        else:
+            for devs in stored_data.get("native_devices", {}).values():
+                if self.device_id in devs:
+                    device_info = devs[self.device_id]
+                    break
+        return {
+            "reason": device_info.get("location_reason"),
+            "reported_at": device_info.get("location_reported_at"),
+            "config_version": device_info.get("location_config_version"),
+        }
