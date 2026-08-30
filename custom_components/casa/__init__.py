@@ -3437,6 +3437,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         payload_decrypted = service_data.get("payload_decrypted", False)
 
+        lz_data = hass.data.get(DOMAIN, {}).get("lz_data", {})
+        lz_anchors = lz_data.get("anchors", [])
+        lz_version = lz_data.get("config_version", "")
+
         if method == "manual":
             # Manual entry: no payload is built. The resolved plaintext values are
             # returned below for an admin to read into the app's manual sheet.
@@ -3514,6 +3518,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "password": connect_wifi_password,
                 },
             }
+            if lz_anchors:
+                profile["location_zones"] = {
+                    "anchors": lz_anchors,
+                    "config_version": lz_version,
+                }
             payload_string = json.dumps(profile, separators=(",", ":"))
             if payload_decrypted:
                 final_payload = base64.urlsafe_b64encode(payload_string.encode("utf-8")).decode("utf-8").rstrip("=")
