@@ -188,6 +188,20 @@ export class CasaApi {
     return this._hass.callApi("DELETE", `casa/admin/wireguard_profiles?id=${encodeURIComponent(id)}`);
   }
 
+  getLocationZones() {
+    return this._hass.callApi("GET", "casa/admin/location_zones");
+  }
+  saveLocationZones(config) {
+    // A version-skewed backend (updated on disk, not yet restarted) may predate
+    // the location-zones route/shape and would silently mishandle the PUT —
+    // refuse instead; the skew banner tells the admin to restart Home Assistant.
+    const backend = this.summary && this.summary.version;
+    if (this.panelVersion && backend && backend !== this.panelVersion) {
+      return Promise.reject(new Error("Casa was updated on disk — restart Home Assistant before saving location zones."));
+    }
+    return this._hass.callApi("PUT", "casa/admin/location_zones", config);
+  }
+
   // Provision templates (the REST path keeps its historical
   // "provision_profiles" name for compatibility). Templates are sparse:
   // `fields` carries only explicitly-set keys, nested under a "fields" key —

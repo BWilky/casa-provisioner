@@ -1,21 +1,26 @@
 // Casa admin panel — settings view. Two-pane layout reusing the editor nav
 // classes: Site (relay identity + encryption key rotation + regenerate-site
-// danger zone) and WireGuard Profiles (stored VPN configs with an add/edit
-// modal). Mounted at /settings and /settings/{tab}.
+// danger zone), WireGuard Profiles (stored VPN configs with an add/edit
+// modal), and Location Zones (lazy-loaded map editor, views/location-zones.js).
+// Mounted at /settings and /settings/{tab}.
 
 export function createView(app) {
   const { api, ui } = app;
   const esc = ui.esc;
 
-  let tab = "site"; // "site" | "wireguard"
+  let tab = "site"; // "site" | "wireguard" | "location"
   let refs = null; // { nav, form }
   let wgProfiles = null; // null = not loaded yet
   let wgLoading = false;
+  let lzMod = null; // views/location-zones.js, loaded lazily on first visit
+  let lzModLoading = false;
+  let lzView = null; // instance from lzMod.createView(app); persists across tab switches
 
   /* ---------- shell ---------- */
 
   function setTab(next) {
-    if (next !== "site" && next !== "wireguard") next = "site";
+    if (next !== "site" && next !== "wireguard" && next !== "location") next = "site";
+    if (tab === "location" && next !== "location" && lzView) lzView.unmount();
     tab = next;
     app.navigate("/settings/" + tab, { replace: true });
     renderNav();
@@ -32,7 +37,36 @@ export function createView(app) {
   function renderForm() {
     if (!refs) return;
     if (tab === "wireguard") renderWireguard();
+    else if (tab === "location") renderLocationZones();
     else renderSite();
+  }
+
+  /* ---------- Location Zones section ---------- */
+
+  function renderLocationZones() {
+    if (!refs) return;
+    if (!lzMod) {
+      if (!lzModLoading) {
+        lzModLoading = true;
+        refs.form.innerHTML = `<div class="empty-state" style="padding:48px 16px;"><span class="muted">Loading…</span></div>`;
+        app
+          .loadModule("views/location-zones.js")
+          .then((mod) => { lzMod = mod; })
+          .catch((err) => {
+            if (refs && tab === "location") {
+              refs.form.innerHTML = `<div class="errbar">Failed to load location zones editor: ${esc(ui.errMsg(err))}</div>`;
+            }
+          })
+          .finally(() => {
+            lzModLoading = false;
+            if (refs && tab === "location" && lzMod) renderLocationZones();
+          });
+      }
+      return;
+    }
+    if (!lzView) lzView = lzMod.createView(app);
+    refs.form.innerHTML = "";
+    lzView.mount(refs.form);
   }
 
   /* ---------- Site section ---------- */
@@ -428,12 +462,14 @@ export function createView(app) {
     polling: "paused",
 
     mount(el, params) {
-      tab = params && params.tab === "wireguard" ? "wireguard" : "site";
+      const p = params && params.tab;
+      tab = p === "wireguard" || p === "location" ? p : "site";
       el.innerHTML = `
         <div class="editor" style="height:100%;">
           <nav class="editor__nav" id="st-nav">
             <button class="nav-item" data-tab="site"><ha-icon icon="mdi:earth"></ha-icon>Site</button>
             <button class="nav-item" data-tab="wireguard"><ha-icon icon="mdi:shield-key"></ha-icon>WireGuard Profiles</button>
+            <button class="nav-item" data-tab="location"><ha-icon icon="mdi:map-marker-radius"></ha-icon>Location Zones</button>
           </nav>
           <div class="editor__form" id="st-form"></div>
         </div>`;
@@ -454,6 +490,7 @@ export function createView(app) {
     },
 
     unmount() {
+      if (tab === "location" && lzView) lzView.unmount();
       refs = null;
     },
 
