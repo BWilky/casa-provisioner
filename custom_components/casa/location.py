@@ -47,10 +47,16 @@ def validate_zone_config(config: dict) -> list[str]:
         name = str(anchor.get("name", "")).strip()
         if not name:
             errors.append(f"{where}: name is required")
+        elif len(name) > 48:
+            errors.append(f"{where}: name must be 48 characters or fewer")
         elif name.casefold() in names:
             errors.append(f"{where}: anchor names must be unique ('{name}')")
         else:
             names.add(name.casefold())
+
+        anchor_id = anchor.get("id")
+        if not isinstance(anchor_id, str) or not anchor_id.strip():
+            errors.append(f"{where}: id is required")
 
         lat, lon = anchor.get("latitude"), anchor.get("longitude")
         if not isinstance(lat, (int, float)) or isinstance(lat, bool) or not -90 <= lat <= 90:
@@ -73,6 +79,8 @@ def validate_zone_config(config: dict) -> list[str]:
             label = str(ring.get("label", "")).strip()
             if not label:
                 errors.append(f"{rw}: label is required")
+            elif len(label) > 48:
+                errors.append(f"{rw}: label must be 48 characters or fewer")
             elif label.casefold() in RESERVED_LABELS:
                 errors.append(f"{rw}: '{label}' is a reserved label")
             elif label.casefold() in labels:

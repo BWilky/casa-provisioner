@@ -85,6 +85,18 @@ def test_negative_stale_minutes_rejected():
     assert any("stale_after_minutes" in e for e in validate_zone_config(cfg))
 
 
+def test_anchor_name_length_capped():
+    cfg = _valid_config()
+    cfg["anchors"][0]["name"] = "x" * 49
+    assert any("48" in e for e in validate_zone_config(cfg))
+
+
+def test_ring_label_length_capped():
+    cfg = _valid_config()
+    cfg["anchors"][0]["rings"][0]["label"] = "x" * 49
+    assert any("48" in e for e in validate_zone_config(cfg))
+
+
 def test_config_version_stable_and_content_sensitive():
     a = _valid_config()["anchors"]
     v1 = compute_config_version(a)

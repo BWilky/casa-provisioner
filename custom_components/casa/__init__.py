@@ -896,12 +896,13 @@ class CasaHeartbeatView(HomeAssistantView):
         server_lz_version = lz_data.get("config_version", "")
         device_info, _uid, _uname = _find_device_record(stored_data, device_id)
         if device_info is not None and isinstance(location_state, str):
-            _apply_location_report(self.hass, device_id, device_info,
-                                   location_state, location_reason, location_config_version)
-        # Reconciler: device confirmed a stale config version → re-enqueue.
-        if (device_info is not None and server_lz_version
-                and isinstance(location_config_version, str)
-                and location_config_version != server_lz_version):
+            if not _apply_location_report(self.hass, device_id, device_info,
+                                          location_state, location_reason, location_config_version):
+                _LOGGER.warning("CASA: Ignored invalid heartbeat location fields for device '%s'.", device_id)
+        # Reconciler: device confirmed a stale config version (or reported no
+        # version at all, which also counts as a mismatch) → re-enqueue.
+        device_lz_version = location_config_version if isinstance(location_config_version, str) else ""
+        if device_info is not None and server_lz_version and device_lz_version != server_lz_version:
             qu_data = self.hass.data[DOMAIN]["qu_data"]
             _enqueue_location_update_for_device(qu_data, device_id, lz_data, "system:lz-reconcile")
             self.hass.data[DOMAIN]["qu_store"].async_delay_save(lambda: qu_data, 2.0)
@@ -1136,6 +1137,7 @@ class CasaAdminSummaryView(HomeAssistantView):
         from .const import CASA_VERSION
         return self.json({
             "version": CASA_VERSION,
+            "location_config_version": self.hass.data.get(DOMAIN, {}).get("lz_data", {}).get("config_version", ""),
             "site_id": stored_data.get("site_id"),
             "device_key_id": _device_key_id(device_key) if device_key else None,
             "require_device_alias": bool(stored_data.get("require_device_alias", False)),
@@ -1332,9 +1334,12 @@ class CasaLocationZonesView(HomeAssistantView):
 class CasaLocationReportView(HomeAssistantView):
     """Device-facing zone report endpoint. No HA session required — the
     device_key encryption IS the authentication (same trust model as the
-    encrypted push path; per-device HKDF salt prevents cross-device replay).
-    The report schema deliberately has no location fields, and unknown keys
-    are rejected so none can be smuggled in later."""
+    encrypted push path). Note this key is site-wide, not per-device: any
+    provisioned device that holds it could encrypt a payload and forge a
+    report for a different device_id. The per-device HKDF salt only prevents
+    replay of a captured ciphertext blob across devices; it does not stop
+    forgery by a key holder. The report schema deliberately has no location
+    fields, and unknown keys are rejected so none can be smuggled in later."""
 
     url = "/api/casa/location_report"
     name = "api:casa:location_report"
@@ -1377,6 +1382,7 @@ class CasaLocationReportView(HomeAssistantView):
         if not _apply_location_report(self.hass, device_id, device_info,
                                       inner.get("state"), inner.get("reason"),
                                       inner.get("config_version")):
+            _LOGGER.warning("CASA: Rejected location report for device '%s' (invalid state/reason).", device_id)
             return self.json({"error": "Rejected"}, status_code=403)
         return self.json({"status": "ok"})
 

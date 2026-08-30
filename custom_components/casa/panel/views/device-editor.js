@@ -475,6 +475,20 @@ export function createView(app) {
     return `<span class="chip chip--warn"${title}>Unknown</span>`;
   }
 
+  // Zone config version — amber when the server has a version and the
+  // device's reported version differs (or is missing entirely), meaning the
+  // device hasn't yet confirmed the current zone config. Plain when equal.
+  function zoneVersionChip(d) {
+    const serverVersion = (app.summary() && app.summary().location_config_version) || "";
+    const deviceVersion = d.location_config_version;
+    if (!serverVersion) return deviceVersion != null ? esc(String(deviceVersion)) : "—";
+    if (deviceVersion !== serverVersion) {
+      const shown = deviceVersion != null ? esc(String(deviceVersion)) : "—";
+      return `<span class="chip chip--warn" title="Server is on ${esc(serverVersion)}">${shown}</span>`;
+    }
+    return esc(String(deviceVersion));
+  }
+
   function pendingExpiryBadge(d) {
     if (d.expires_at_override == null) return "";
     const val = d.expires_at_override === 0 ? "Never" : ui.fmtExpiry(d.expires_at_override);
@@ -693,7 +707,7 @@ export function createView(app) {
     rows.push(label("Zone"), `<span>${zoneChip(d)}</span>`);
     rows.push(
       label("Zone config version"),
-      `<span>${d.location_config_version != null ? esc(String(d.location_config_version)) : "—"}</span>`
+      `<span>${zoneVersionChip(d)}</span>`
     );
     return rows.join("");
   }
