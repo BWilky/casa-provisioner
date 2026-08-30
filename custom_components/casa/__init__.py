@@ -27,6 +27,13 @@ import qrcode
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_VERIFY_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
+from .location import (
+    ALLOWED_REASONS,
+    ALLOWED_REPORT_KEYS,
+    compute_config_version,
+    decrypt_report_payload,
+    validate_zone_config,
+)
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.components import frontend
@@ -235,6 +242,21 @@ async def _ensure_site_registration(hass: HomeAssistant, stored_data: dict, stor
         _LOGGER.warning("CASA: Could not reach relay /verify_site (%s); keeping existing credentials.", err)
 
 
+def _user_matches_username(user, target_username: str) -> bool:
+    """Match a user by display name (historic behavior) or, failing that, by the
+    homeassistant-provider credential username. Accounts whose display name
+    differs from the login username (the guided flow names the account after
+    the device) are only reachable by their login username."""
+    target = target_username.casefold()
+    if user.name and user.name.casefold() == target:
+        return True
+    return any(
+        cred.auth_provider_type == "homeassistant"
+        and str(cred.data.get("username", "")).casefold() == target
+        for cred in user.credentials
+    )
+
+
 def _find_device_record(stored_data: dict, device_id: str):
     """Locate a device across integration-managed and native users.
 
@@ -284,6 +306,323 @@ def _enqueue_update(qu_data: dict, device_id: str, update_type: str, action: str
     }
     qu_data.setdefault("updates", {}).setdefault(device_id, []).append(entry)
     return entry["id"]
+
+
+def _iter_all_devices(stored_data: dict):
+    """Yield (device_id, device_info) for every device under a non-deleted
+    owner, plus native devices."""
+    for _uid, udata in stored_data.get("users", {}).items():
+        if udata.get("deleted", False):
+            continue
+        for did, dinfo in (udata.get("devices", {}) or {}).items():
+            yield did, dinfo
+    for _uid, devices in stored_data.get("native_devices", {}).items():
+        for did, dinfo in (devices or {}).items():
+            yield did, dinfo
+
+
+def _enqueue_location_update_for_device(qu_data: dict, device_id: str, lz_data: dict, created_by: str) -> str:
+    """Enqueue the current zone config for a device, superseding any older
+    queued location entries (two configs applied in sequence is pointless)."""
+    entries = qu_data.get("updates", {}).get(device_id, [])
+    kept = [e for e in entries if e.get("type") != "location"]
+    if kept:
+        qu_data["updates"][device_id] = kept
+    elif entries:
+        qu_data.get("updates", {}).pop(device_id, None)
+    payload = {"anchors": lz_data.get("anchors", []), "config_version": lz_data.get("config_version", "")}
+    return _enqueue_update(qu_data, device_id, "location", "update", payload, created_by)
+
+
+def _dequeue_update(qu_data: dict, device_id: str, update_id: str) -> dict | None:
+    """Remove a queued update entry by id. Returns the removed entry or None."""
+    entries = qu_data.get("updates", {}).get(device_id, [])
+    removed = next((e for e in entries if e.get("id") == update_id), None)
+    if removed is None:
+        return None
+    remaining = [e for e in entries if e.get("id") != update_id]
+    if remaining:
+        qu_data["updates"][device_id] = remaining
+    else:
+        qu_data.get("updates", {}).pop(device_id, None)
+    return removed
+
+
+async def _prune_stale_queued_updates(hass) -> int:
+    """Drop queued updates that can never be consumed, and repair or drop
+    reauth_pending markers that can never complete.
+
+    Queue entries only leave the store via a device ack or a reauth
+    completion, so anything that severs those paths strands the entry
+    forever — and a stranded auth entry is a poison pill: it re-delivers on
+    every heartbeat pull, the device logs out to apply it, the login fails
+    (or succeeds without ever dequeuing it), and the device ends up in a
+    reauthenticate/self-wipe loop.
+
+    Specifically:
+      - queues for a device with no record under any non-deleted owner are
+        dropped (the pull path 404s them; nothing can ever ack);
+      - auth/reauthenticate entries whose target user no longer exists in HA
+        are dropped (the pushed credentials can never log in);
+      - reauth_pending markers stranded on device-record copies under
+        deleted owners (unreachable via _find_device_record, so completion
+        no-ops forever) are moved onto the reachable record when one exists;
+      - reauth_pending markers whose target user is gone are dropped along
+        with the queue entry they reference;
+      - device-record copies under deleted owners are removed when the same
+        device_id also has a record under a live owner (duplicates left
+        behind by register/heartbeat racing an incomplete reauth).
+
+    Returns the number of queue entries removed.
+    """
+    data = hass.data.get(DOMAIN)
+    if not data:
+        return 0
+    stored_data = data.get("stored_data", {})
+    qu_data = data.get("qu_data", {"updates": {}})
+
+    ha_users = await hass.auth.async_get_users()
+    ha_user_ids = {u.id for u in ha_users}
+    ha_usernames = set()
+    for u in ha_users:
+        for cred in u.credentials:
+            if cred.auth_provider_type == "homeassistant":
+                username = str(cred.data.get("username", "") or "")
+                if username:
+                    ha_usernames.add(username.casefold())
+
+    removed = 0
+    stored_changed = False
+
+    def _iter_records():
+        for uid, udata in stored_data.get("users", {}).items():
+            for did, dinfo in (udata.get("devices", {}) or {}).items():
+                yield did, dinfo, udata.get("deleted", False)
+        for uid, devices in stored_data.get("native_devices", {}).items():
+            for did, dinfo in (devices or {}).items():
+                yield did, dinfo, False
+
+    # 1. Repair or drop reauth_pending markers.
+    for did, dinfo, owner_deleted in list(_iter_records()):
+        pending = dinfo.get("reauth_pending")
+        if not pending:
+            continue
+        if pending.get("target_user_id") not in ha_user_ids:
+            if _dequeue_update(qu_data, did, pending.get("update_id")):
+                removed += 1
+            dinfo.pop("reauth_pending", None)
+            stored_changed = True
+            _LOGGER.info(
+                "CASA: Dropped pending reauthentication of device '%s' — target user '%s' no longer exists.",
+                did, pending.get("target_username"),
+            )
+        elif owner_deleted:
+            canonical, _uid, _username = _find_device_record(stored_data, did)
+            if canonical is not None and canonical is not dinfo and not canonical.get("reauth_pending"):
+                canonical["reauth_pending"] = pending
+                dinfo.pop("reauth_pending", None)
+                stored_changed = True
+                _LOGGER.info(
+                    "CASA: Moved stranded reauth_pending for device '%s' onto its record under a live owner.",
+                    did,
+                )
+
+    # 2. Remove duplicate device records under deleted owners.
+    for uid, udata in stored_data.get("users", {}).items():
+        if not udata.get("deleted", False):
+            continue
+        for did in list((udata.get("devices", {}) or {}).keys()):
+            canonical, _cuid, _cname = _find_device_record(stored_data, did)
+            if canonical is not None and canonical is not udata["devices"][did]:
+                udata["devices"].pop(did, None)
+                stored_changed = True
+                _LOGGER.info(
+                    "CASA: Removed duplicate record of device '%s' under deleted user '%s'.",
+                    did, udata.get("username", uid),
+                )
+
+    # 3. Drop undeliverable queue entries.
+    for device_id in list(qu_data.get("updates", {}).keys()):
+        entries = qu_data["updates"].get(device_id, [])
+        device_info, _uid, _username = _find_device_record(stored_data, device_id)
+        if device_info is None:
+            removed += len(entries)
+            qu_data["updates"].pop(device_id, None)
+            _LOGGER.info(
+                "CASA: Purged %d queued update(s) for device '%s' — no record under any active user.",
+                len(entries), device_id,
+            )
+            continue
+        kept = []
+        for e in entries:
+            if e.get("type") == "auth":
+                target = str((e.get("payload") or {}).get("username", "") or "")
+                if target and target.casefold() not in ha_usernames:
+                    removed += 1
+                    _LOGGER.info(
+                        "CASA: Purged queued reauthenticate for device '%s' — target user '%s' no longer exists.",
+                        device_id, target,
+                    )
+                    continue
+            kept.append(e)
+        if len(kept) != len(entries):
+            if kept:
+                qu_data["updates"][device_id] = kept
+            else:
+                qu_data["updates"].pop(device_id, None)
+
+    if removed or stored_changed:
+        qu_store = data.get("qu_store")
+        if qu_store:
+            qu_store.async_delay_save(lambda: qu_data, 2.0)
+        if stored_changed:
+            store = data.get("store")
+            if store:
+                store.async_delay_save(lambda: stored_data, 2.0)
+    return removed
+
+
+async def _create_casa_user(hass, name: str, username: str, password: str | None, created_by: str, local_only: bool = True, users=None):
+    """Create a local HA user with homeassistant-provider credentials and track it
+    in the casa store. Shared by the casa.create_user service and the admin
+    reauthenticate endpoint. Returns (result_dict, error_str); exactly one is set.
+    """
+    name = str(name or "").strip()
+    username = str(username or "").strip().casefold()
+    password = str(password or "").strip()
+
+    if not name or not username:
+        return None, "Missing mandatory name or username"
+
+    if users is None:
+        users = await hass.auth.async_get_users()
+    if any(u.name and u.name.casefold() == username for u in users) or any(u.name and u.name.casefold() == name.casefold() for u in users):
+        return None, "User with this name or username already exists"
+
+    provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
+    if not provider:
+        return None, "Home Assistant core auth provider not found"
+
+    if not password:
+        password = generate_random_password()
+
+    new_user = await hass.auth.async_create_user(
+        name=name,
+        group_ids=["system-users"],
+        local_only=local_only
+    )
+
+    provider.data.add_auth(username, password)
+    await provider.data.async_save()
+
+    credentials = await provider.async_get_or_create_credentials({"username": username})
+    await hass.auth.async_link_user(new_user, credentials)
+
+    _LOGGER.info("CASA: New local user '%s' created (Local Only: %s).", username, local_only)
+
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    stored_data["users"][new_user.id] = {
+        "user_id": new_user.id,
+        "username": username,
+        "name": name,
+        "created_at": dt_util.now().isoformat(),
+        "created_by": created_by,
+        "deleted": False,
+        "deleted_at": None,
+        "deleted_by": None,
+    }
+    await hass.data[DOMAIN]["store"].async_save(stored_data)
+
+    return {
+        "name": name,
+        "username": username,
+        "password": password,
+        "user_id": new_user.id,
+        "is_local_only": local_only
+    }, None
+
+
+async def _complete_pending_reauth(hass, device_id: str, user_id: str, refresh_token_id: str) -> bool:
+    """Finish an admin-initiated device reauthentication on the device's first
+    authenticated contact under its new identity (see CasaAdminReauthDeviceView).
+
+    The admin action only queues/pushes the new credentials and stamps a
+    reauth_pending marker — the old session token and the record's placement
+    are left intact so the bearer-authenticated pull/ack path keeps working
+    until the device actually re-logs-in. This helper does the deferred half:
+    move the record to the new owner, rebind refresh_token_id, revoke the old
+    session, and drop the queued entry so the device never re-pulls it.
+
+    Called from async_register_device/async_heartbeat before their user-keyed
+    lookups (and before the heartbeat computes has_updates). No-ops unless the
+    contact comes from the pending target user with a session token different
+    from the one the reauth is replacing.
+    """
+    if not refresh_token_id:
+        return False
+
+    data = hass.data[DOMAIN]
+    stored_data = data["stored_data"]
+    device_info, owner_uid, _username = _find_device_record(stored_data, device_id)
+    if not device_info:
+        return False
+    pending = device_info.get("reauth_pending")
+    if not pending or pending.get("target_user_id") != user_id:
+        return False
+    old_rtid = pending.get("old_refresh_token_id")
+    if old_rtid and refresh_token_id == old_rtid:
+        # Same-user reauth: the pre-reauth session is still heartbeating.
+        # Completion requires a fresh login (a new refresh token).
+        return False
+
+    # Move the record to the new owner (cross-user reauth only).
+    if owner_uid != user_id:
+        users_map = stored_data.get("users", {})
+        native_map = stored_data.setdefault("native_devices", {})
+        if user_id in users_map and not users_map[user_id].get("deleted", False):
+            dest = users_map[user_id].setdefault("devices", {})
+        else:
+            dest = native_map.setdefault(user_id, {})
+        if len(dest) >= 100:
+            _LOGGER.warning(
+                "CASA: Cannot complete reauthentication of device '%s' — target user already has the maximum of 100 devices.",
+                device_id,
+            )
+            return False
+        if owner_uid in users_map and device_id in users_map[owner_uid].get("devices", {}):
+            users_map[owner_uid]["devices"].pop(device_id, None)
+        elif owner_uid in native_map:
+            native_map[owner_uid].pop(device_id, None)
+            if not native_map[owner_uid]:
+                native_map.pop(owner_uid, None)
+        dest[device_id] = device_info
+
+    device_info["refresh_token_id"] = refresh_token_id
+
+    # Revoke the session the device held before the reauth.
+    old_user_id = pending.get("old_user_id")
+    if old_rtid and old_rtid != refresh_token_id and old_user_id:
+        old_user = await hass.auth.async_get_user(old_user_id)
+        token = old_user.refresh_tokens.get(old_rtid) if old_user else None
+        if token:
+            hass.auth.async_remove_refresh_token(token)
+
+    # Drop the queued credentials entry — the device consumed it (or no longer
+    # needs it), and it must not be re-delivered on the next pull.
+    qu_data = data.get("qu_data", {"updates": {}})
+    if _dequeue_update(qu_data, device_id, pending.get("update_id")):
+        data["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+
+    device_info.pop("reauth_pending", None)
+    data["store"].async_delay_save(lambda: stored_data, 2.0)
+    _LOGGER.info(
+        "CASA: Device '%s' completed reauthentication to user '%s'.",
+        device_id, pending.get("target_username"),
+    )
+
+    from homeassistant.helpers.dispatcher import async_dispatcher_send
+    async_dispatcher_send(hass, f"casa_device_updated_{device_id}")
+    return True
 
 
 class CasaRegisterDeviceView(HomeAssistantView):
@@ -631,6 +970,17 @@ class CasaAdminSummaryView(HomeAssistantView):
             except Exception:
                 return False
 
+        def _reauth(dinfo):
+            rp = dinfo.get("reauth_pending")
+            if not rp:
+                return None
+            return {
+                "target_username": rp.get("target_username"),
+                "requested_at": rp.get("requested_at"),
+                "requested_by": rp.get("requested_by"),
+                "update_id": rp.get("update_id"),
+            }
+
         devices = []
 
         # Integration-managed users + their devices.
@@ -665,10 +1015,10 @@ class CasaAdminSummaryView(HomeAssistantView):
                     "pending_update_list": _pending(did),
                     "provisioning_fields": dinfo.get("provisioning_fields", {}),
                     "provisioning_reported_at": dinfo.get("provisioning_reported_at"),
-                    "custom_provisioning": bool(dinfo.get("custom_provisioning", False)),
                     "provisioning_pending_push": bool(dinfo.get("provisioning_pending_push", False)),
                     "provisioning_profile_id": dinfo.get("provisioning_profile_id"),
                     "provisioning_profile_name": dinfo.get("provisioning_profile_name"),
+                    "reauth_pending": _reauth(dinfo),
                 })
 
         # Native devices (HA users not managed by the integration).
@@ -705,10 +1055,10 @@ class CasaAdminSummaryView(HomeAssistantView):
                         "pending_update_list": _pending(did),
                         "provisioning_fields": dinfo.get("provisioning_fields", {}),
                         "provisioning_reported_at": dinfo.get("provisioning_reported_at"),
-                        "custom_provisioning": bool(dinfo.get("custom_provisioning", False)),
                         "provisioning_pending_push": bool(dinfo.get("provisioning_pending_push", False)),
                         "provisioning_profile_id": dinfo.get("provisioning_profile_id"),
                         "provisioning_profile_name": dinfo.get("provisioning_profile_name"),
+                        "reauth_pending": _reauth(dinfo),
                     })
 
         accounts = []
@@ -724,7 +1074,9 @@ class CasaAdminSummaryView(HomeAssistantView):
             })
 
         device_key = stored_data.get("device_key")
+        from .const import CASA_VERSION
         return self.json({
+            "version": CASA_VERSION,
             "site_id": stored_data.get("site_id"),
             "device_key_id": _device_key_id(device_key) if device_key else None,
             "require_device_alias": bool(stored_data.get("require_device_alias", False)),
@@ -860,6 +1212,64 @@ class CasaWireGuardProfilesView(HomeAssistantView):
         return self.json({"status": "ok"})
 
 
+class CasaLocationZonesView(HomeAssistantView):
+    """Admin-only zone config CRUD. PUT replaces wholesale, then queues a
+    'location' update (encrypted silent push + durable queue) to every device."""
+
+    url = "/api/casa/admin/location_zones"
+    name = "api:casa:admin:location_zones"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+        return self.json(self.hass.data.get(DOMAIN, {}).get("lz_data", {"config_version": "", "stale_after_minutes": 30, "anchors": []}))
+
+    async def put(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        errors = validate_zone_config(body)
+        if errors:
+            return self.json({"error": "; ".join(errors)}, status_code=400)
+
+        lz_data = self.hass.data[DOMAIN]["lz_data"]
+        old_version = lz_data.get("config_version", "")
+        lz_data["anchors"] = body.get("anchors", [])
+        lz_data["stale_after_minutes"] = int(body.get("stale_after_minutes", 30))
+        lz_data["config_version"] = compute_config_version(lz_data["anchors"])
+        self.hass.data[DOMAIN]["lz_store"].async_delay_save(lambda: lz_data, 2.0)
+
+        queued = 0
+        jobs = []
+        if lz_data["config_version"] != old_version:
+            stored_data = self.hass.data[DOMAIN]["stored_data"]
+            qu_data = self.hass.data[DOMAIN]["qu_data"]
+            created_by = user.name or user.id
+            payload = {"anchors": lz_data["anchors"], "config_version": lz_data["config_version"]}
+            for did, dinfo in _iter_all_devices(stored_data):
+                update_id = _enqueue_location_update_for_device(qu_data, did, lz_data, created_by)
+                jobs.append((did, dinfo, update_id))
+                queued += 1
+            self.hass.data[DOMAIN]["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+            if jobs:
+                self.hass.async_create_task(_deliver_updates_in_background(
+                    self.hass, stored_data, jobs, "location", "update", payload,
+                    send_update_push=True, notify_push=False, title="", message="",
+                    created_by=created_by,
+                ))
+        _LOGGER.info("CASA: Location zones saved (version=%s); queued for %d device(s).", lz_data["config_version"], queued)
+        return self.json({"status": "ok", "config_version": lz_data["config_version"], "queued": queued})
+
+
 class CasaAdminDeviceView(HomeAssistantView):
     """Admin-only API to inspect/update registered devices."""
 
@@ -905,11 +1315,11 @@ class CasaAdminDeviceView(HomeAssistantView):
                     return self.json({"error": "expires_at_override must be >= 0"}, status_code=400)
             _set_expiry_override(stored_data, device_id, value)
 
-        # "Force Device Changes": an admin-authored off-profile edit for this
-        # device only. Pushed through the same encrypted profile-update
-        # pipeline shared profile pushes use (update_type "profile", profile_id
-        # None) — the app already knows how to apply this exact envelope, so
-        # no app-side changes are needed for the edit to take effect.
+        # "Force Device Changes": a direct per-device stamp of live settings.
+        # Pushed through the same encrypted profile-update pipeline template
+        # applies use (update_type "profile", profile_id None) — the app
+        # already knows how to apply this exact envelope, so no app-side
+        # changes are needed for the edit to take effect.
         pushed = False
         if "provisioning_fields" in body:
             fields = body.get("provisioning_fields")
@@ -922,7 +1332,6 @@ class CasaAdminDeviceView(HomeAssistantView):
             fields = {k: v for k, v in fields.items() if k in LIVE_PROVISIONING_FIELDS}
 
             device_info["provisioning_fields"] = fields
-            device_info["custom_provisioning"] = True
             device_info["provisioning_pending_push"] = True
 
             qu_data = self.hass.data[DOMAIN]["qu_data"]
@@ -935,7 +1344,11 @@ class CasaAdminDeviceView(HomeAssistantView):
             )
             qu_store = self.hass.data[DOMAIN]["qu_store"]
             qu_store.async_delay_save(lambda: qu_data, 2.0)
-            await _nudge_device_checkin(session, stored_data, device_info)
+            # Nudge only when the encrypted push did NOT go out (see the same
+            # pattern in CasaAdminQueueUpdateView — spares the relay's small
+            # per-device burst budget).
+            if not pushed:
+                await _nudge_device_checkin(session, stored_data, device_info)
 
         # Save store
         store = self.hass.data[DOMAIN]["store"]
@@ -949,7 +1362,6 @@ class CasaAdminDeviceView(HomeAssistantView):
             "expires_at_override": device_info.get("expires_at_override"),
             "expires_at_override_set_at": device_info.get("expires_at_override_set_at"),
             "provisioning_fields": device_info.get("provisioning_fields", {}),
-            "custom_provisioning": bool(device_info.get("custom_provisioning", False)),
             "provisioning_pending_push": bool(device_info.get("provisioning_pending_push", False)),
             "pushed": pushed,
         })
@@ -1096,6 +1508,7 @@ class CasaAdminSessionsView(HomeAssistantView):
                 "username": casa_record.get("username") if casa_record else None,
                 "casa_managed": casa_record is not None,
                 "is_owner": bool(getattr(ha_user, "is_owner", False)),
+                "is_admin": bool(getattr(ha_user, "is_admin", False)),
                 "is_active": bool(getattr(ha_user, "is_active", True)),
                 "session_count": len(sessions),
                 "sessions": sessions,
@@ -1185,20 +1598,69 @@ class CasaAdminCheckUsernameView(HomeAssistantView):
         })
 
 
+def _coerce_template_fields(src: dict) -> dict:
+    """Sparse-coerce provision-template fields.
+
+    Keeps only known PROFILE_PROVISIONING_FIELDS keys, coerced by the type of
+    their schema default. Keys whose coerced value equals the default are
+    dropped — a template stores a field iff it sets a non-default value, and
+    an absent key means "unset" (surfaced as a fill-in-the-blank at provision
+    time). Unparseable ints are dropped rather than defaulted.
+    """
+    fields = {}
+    for key, default in PROFILE_PROVISIONING_FIELDS.items():
+        if key not in src:
+            continue
+        val = src[key]
+        if isinstance(default, bool):
+            if isinstance(val, str):
+                val = val.strip().lower() == "true"
+            else:
+                val = bool(val)
+        elif isinstance(default, int) and not isinstance(default, bool):
+            try:
+                val = int(val)
+            except (TypeError, ValueError):
+                continue
+        else:
+            val = "" if val is None else str(val)
+        if val == default:
+            continue
+        fields[key] = val
+    return fields
+
+
+def _migrate_provision_templates(pp_data: dict) -> bool:
+    """Sparse-normalize stored provision templates; returns True if changed.
+
+    Legacy saves coerced every field to a concrete value (and could carry
+    one-time process keys), so key presence carried no authorial intent.
+    Idempotent — safe to run on every startup.
+    """
+    changed = False
+    for template in pp_data.get("profiles", []):
+        old = template.get("fields", {})
+        new = _coerce_template_fields(old)
+        if new != old:
+            template["fields"] = new
+            changed = True
+    return changed
+
+
 class CasaProvisionProfilesView(HomeAssistantView):
-    """Admin-only CRUD for static provisioning profiles stored in casa_provision_profiles."""
+    """Admin-only CRUD for provision templates stored in casa_provision_profiles.
+
+    Templates persist only template-appropriate fields (live device settings
+    + expiration_hours), sparsely: an absent key means the template does not
+    set that field. One-time process inputs (username/password/pin,
+    deauthenticate_existing, timeout_minutes, password_scramble*,
+    connect_wifi_*) belong in casa.provision service_data, never on a saved
+    template. The URL keeps its historical "provision_profiles" name for
+    compatibility with version-skewed panels.
+    """
 
     url = "/api/casa/admin/provision_profiles"
     name = "api:casa:admin:provision_profiles"
-
-    # Profiles persist only template-appropriate fields (live device settings
-    # + expiration_hours). One-time process inputs (username/password/pin,
-    # deauthenticate_existing, timeout_minutes, password_scramble*,
-    # connect_wifi_*) belong in casa.provision service_data, not in a saved
-    # profile. Legacy profiles created before this split may still carry
-    # process keys — put() merges rather than rewrites, so they persist and
-    # keep applying at provision time via get_field's profile fallback.
-    _DEFAULT_FIELDS = PROFILE_PROVISIONING_FIELDS
 
     def __init__(self, hass: HomeAssistant):
         self.hass = hass
@@ -1224,20 +1686,14 @@ class CasaProvisionProfilesView(HomeAssistantView):
         name = body.get("name", "").strip()
         if not name:
             suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-            name = f"Profile {suffix}"
+            name = f"Template {suffix}"
 
-        fields = {}
-        for key, default in self._DEFAULT_FIELDS.items():
-            val = body.get(key, default)
-            if isinstance(default, bool):
-                fields[key] = bool(val)
-            elif isinstance(default, int) and not isinstance(default, bool):
-                try:
-                    fields[key] = int(val) if val != "" else default
-                except (TypeError, ValueError):
-                    fields[key] = default
-            else:
-                fields[key] = str(val) if val is not None else ""
+        if isinstance(body.get("fields"), dict):
+            fields = _coerce_template_fields(body["fields"])
+        else:
+            # Legacy flat body from a version-skewed panel; sparse-normalizing
+            # converges it to the same shape. TODO(remove after 2 releases)
+            fields = _coerce_template_fields(body)
 
         now_iso = dt_util.now().isoformat()
         profile = {
@@ -1253,7 +1709,7 @@ class CasaProvisionProfilesView(HomeAssistantView):
         pp_store = self.hass.data[DOMAIN]["pp_store"]
         pp_store.async_delay_save(lambda: pp_data, 2.0)
 
-        _LOGGER.info("CASA: Created provision profile '%s' (id=%s).", name, profile["id"])
+        _LOGGER.info("CASA: Created provision template '%s' (id=%s).", name, profile["id"])
         return self.json(profile, status_code=201)
 
     async def put(self, request):
@@ -1277,32 +1733,30 @@ class CasaProvisionProfilesView(HomeAssistantView):
                 target = p
                 break
         if not target:
-            return self.json({"error": "Profile not found"}, status_code=404)
+            return self.json({"error": "Template not found"}, status_code=404)
 
         name = body.get("name", "").strip()
         if name:
             target["name"] = name
 
-        fields = target.get("fields", {})
-        for key, default in self._DEFAULT_FIELDS.items():
-            if key in body:
-                val = body[key]
-                if isinstance(default, bool):
-                    fields[key] = bool(val)
-                elif isinstance(default, int) and not isinstance(default, bool):
-                    try:
-                        fields[key] = int(val) if val != "" else default
-                    except (TypeError, ValueError):
-                        fields[key] = default
-                else:
-                    fields[key] = str(val) if val is not None else ""
-        target["fields"] = fields
+        if isinstance(body.get("fields"), dict):
+            # Replace wholesale: the editor always sends its full sparse dict,
+            # and replace-not-merge is what makes un-setting a field possible.
+            target["fields"] = _coerce_template_fields(body["fields"])
+        else:
+            # Legacy flat body from a version-skewed panel: merge present keys
+            # as before, then sparse-normalize. TODO(remove after 2 releases)
+            merged = dict(target.get("fields", {}))
+            for key in PROFILE_PROVISIONING_FIELDS:
+                if key in body:
+                    merged[key] = body[key]
+            target["fields"] = _coerce_template_fields(merged)
         target["updated_at"] = dt_util.now().isoformat()
 
         pp_store = self.hass.data[DOMAIN]["pp_store"]
         pp_store.async_delay_save(lambda: pp_data, 2.0)
 
-        _LOGGER.info("CASA: Updated provision profile '%s' (id=%s).", target["name"], profile_id)
+        _LOGGER.info("CASA: Updated provision template '%s' (id=%s).", target["name"], profile_id)
         return self.json(target)
 
     async def delete(self, request):
@@ -1320,12 +1774,12 @@ class CasaProvisionProfilesView(HomeAssistantView):
         pp_data["profiles"] = [p for p in profiles if p.get("id") != profile_id]
 
         if len(pp_data["profiles"]) == before_len:
-            return self.json({"error": "Profile not found"}, status_code=404)
+            return self.json({"error": "Template not found"}, status_code=404)
 
         pp_store = self.hass.data[DOMAIN]["pp_store"]
         pp_store.async_delay_save(lambda: pp_data, 2.0)
 
-        _LOGGER.info("CASA: Deleted provision profile id=%s.", profile_id)
+        _LOGGER.info("CASA: Deleted provision template id=%s.", profile_id)
         return self.json({"status": "ok"})
 
 
@@ -1382,6 +1836,13 @@ class CasaProfileUpdatesView(HomeAssistantView):
 
         qu_data = self.hass.data[DOMAIN]["qu_data"]
         updates = qu_data.get("updates", {}).get(device_id, [])
+        if any(e.get("type") == "auth" for e in updates):
+            # Never hand a device credentials for a user that no longer
+            # exists: it would log out to apply them, fail the login, and
+            # treat the failure as a revoked session (self-wipe). Prune,
+            # then serve whatever legitimately remains.
+            await _prune_stale_queued_updates(self.hass)
+            updates = qu_data.get("updates", {}).get(device_id, [])
         return self.json({"updates": updates})
 
     async def post(self, request):
@@ -1459,17 +1920,51 @@ async def _nudge_device_checkin(session, stored_data, device_info, command="requ
         "target": push_token,
         "site_id": stored_data.get("site_id"),
         "site_key": stored_data.get("site_key"),
+        "push_type": "background",
+        "priority": 5,
         "data": {"command": command},
     }
     return await _send_push_to_relay(session, payload)
 
 
+async def _send_encrypted_update_push(stored_data, session, device_id, device_info, update_id, update_type, action, payload) -> bool:
+    """Deliver an already-queued update over an encrypted silent push.
+    Returns False (without raising) when the device has no push_token /
+    device_key or encryption fails — the durable queue still delivers."""
+    device_key = stored_data.get("device_key")
+    push_token = device_info.get("push_token")
+    if not push_token or not device_key:
+        return False
+    inner = {"id": update_id, "type": update_type, "action": action, "payload": payload, "ts": int(time.time())}
+    try:
+        enc = _encrypt_push_payload(json.dumps(inner), device_key, device_id)
+    except Exception as e:
+        _LOGGER.error("CASA ERROR: Failed to encrypt queued update for device '%s': %s", device_id, e)
+        return False
+    return await _send_push_to_relay(session, {
+        "target": push_token,
+        "site_id": stored_data.get("site_id"),
+        "site_key": stored_data.get("site_key"),
+        "title": "",
+        "message": "",
+        "push_type": "background",
+        "priority": 5,
+        "data": {
+            "command": "casa_update",
+            "encrypted": True,
+            "update_payload": enc,
+            "update_id": update_id,
+            "device_key_id": _device_key_id(device_key),
+        },
+    })
+
+
 async def _enqueue_and_push_update(stored_data, qu_data, session, device_id, device_info, update_type, action, payload, created_by, send_push=True):
     """Enqueue a durable update for a device and optionally deliver it via an
-    encrypted silent push. Shared by CasaAdminQueueUpdateView (bulk/profile
-    pushes) and CasaAdminDeviceView's "Force Device Changes" (single-device
-    off-profile pushes) — both are just `profile`-shaped payloads pushed the
-    same way.
+    encrypted silent push. Used by CasaAdminDeviceView's "Force Device
+    Changes" (single-device off-profile pushes); bulk template applies go
+    through CasaAdminQueueUpdateView, which enqueues synchronously and
+    delivers in the background instead.
 
     Returns (update_id, pushed, skipped). `skipped` means the push was
     requested but couldn't be attempted (no push_token / device_key yet).
@@ -1478,35 +1973,49 @@ async def _enqueue_and_push_update(stored_data, qu_data, session, device_id, dev
     pushed = False
     skipped = False
     if send_push:
-        device_key = stored_data.get("device_key")
-        push_token = device_info.get("push_token")
-        if not push_token or not device_key:
+        if not device_info.get("push_token") or not stored_data.get("device_key"):
             skipped = True
         else:
-            inner = {"id": update_id, "type": update_type, "action": action, "payload": payload, "ts": int(time.time())}
-            try:
-                enc = _encrypt_push_payload(json.dumps(inner), device_key, device_id)
-            except Exception as e:
-                _LOGGER.error("CASA ERROR: Failed to encrypt queued update for device '%s': %s", device_id, e)
-                enc = None
-            if enc is not None:
+            pushed = await _send_encrypted_update_push(stored_data, session, device_id, device_info, update_id, update_type, action, payload)
+    return update_id, pushed, skipped
+
+
+async def _deliver_updates_in_background(hass, stored_data, jobs, update_type, action, payload, send_update_push, notify_push, title, message, created_by):
+    """Best-effort delivery accelerators for already-queued updates, run off
+    the request path so CasaAdminQueueUpdateView can respond immediately
+    (each relay POST can block up to 10s and jobs run sequentially). Every
+    update in `jobs` is already in the durable queue — devices pick it up on
+    their next heartbeat even if every push here fails."""
+    session = async_get_clientsession(hass)
+    pushed = notified = 0
+    for device_id, device_info, update_id in jobs:
+        if send_update_push:
+            ok = await _send_encrypted_update_push(stored_data, session, device_id, device_info, update_id, update_type, action, payload)
+            if ok:
+                pushed += 1
+            else:
+                # Nudge only when the encrypted push did NOT go out — it's a
+                # delivery accelerator, and the relay's per-device rate limit
+                # has a small burst budget; a redundant nudge here can starve
+                # the visible notify push below.
+                await _nudge_device_checkin(session, stored_data, device_info)
+        if notify_push and title and message:
+            push_token = device_info.get("push_token")
+            if push_token:
                 ok = await _send_push_to_relay(session, {
                     "target": push_token,
                     "site_id": stored_data.get("site_id"),
                     "site_key": stored_data.get("site_key"),
-                    "title": "",
-                    "message": "",
-                    "data": {
-                        "command": "casa_update",
-                        "encrypted": True,
-                        "update_payload": enc,
-                        "update_id": update_id,
-                        "device_key_id": _device_key_id(device_key),
-                    },
+                    "title": title,
+                    "message": message,
+                    "data": {"update_id": update_id, "type": update_type, "action": action},
                 })
                 if ok:
-                    pushed = True
-    return update_id, pushed, skipped
+                    notified += 1
+    _LOGGER.info(
+        "CASA: Background delivery finished for %s '%s' update(s) by %s: pushed=%s notified=%s.",
+        len(jobs), update_type, created_by, pushed, notified,
+    )
 
 
 class CasaAdminQueueUpdateView(HomeAssistantView):
@@ -1525,14 +2034,30 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
     def __init__(self, hass: HomeAssistant):
         self.hass = hass
 
-    async def _resolve_targets(self, device_id, username):
-        """Return a list of (device_id, device_info) for the requested target(s)."""
+    async def _resolve_targets(self, device_id, username, device_ids=None):
+        """Return (targets, not_found) for the requested target(s).
+
+        targets is a list of (device_id, device_info), or None when a single
+        requested device/user does not exist. With device_ids (bulk template
+        apply), unknown ids are skipped and counted in not_found instead of
+        failing the whole batch.
+        """
         stored_data = self.hass.data[DOMAIN]["stored_data"]
+        if device_ids:
+            targets = []
+            not_found = 0
+            for did in device_ids:
+                device_info, _uid, _name = _find_device_record(stored_data, did)
+                if device_info:
+                    targets.append((did, device_info))
+                else:
+                    not_found += 1
+            return targets, not_found
         if device_id:
             device_info, _uid, _name = _find_device_record(stored_data, device_id)
             if not device_info:
-                return None
-            return [(device_id, device_info)]
+                return None, 0
+            return [(device_id, device_info)], 0
 
         users = await self.hass.auth.async_get_users()
         target_user = next((u for u in users if u.name and u.name.casefold() == username.casefold()), None)
@@ -1545,17 +2070,14 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
                 if target_user:
                     break
         if not target_user:
-            return None
+            return None, 0
 
         uid = target_user.id
         if uid in stored_data["users"] and not stored_data["users"][uid].get("deleted", False):
             devices = stored_data["users"][uid].get("devices", {})
         else:
             devices = stored_data.get("native_devices", {}).get(uid, {})
-        return list(devices.items())
-
-    async def _send_to_relay(self, session, payload) -> bool:
-        return await _send_push_to_relay(session, payload)
+        return list(devices.items()), 0
 
     async def post(self, request):
         user = request.get("hass_user")
@@ -1569,6 +2091,12 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
 
         device_id = str(body.get("device_id", "")).strip()
         username = str(body.get("username", "")).strip()
+        device_ids_raw = body.get("device_ids")
+        device_ids = None
+        if device_ids_raw is not None:
+            if not isinstance(device_ids_raw, list) or not all(isinstance(d, str) for d in device_ids_raw):
+                return self.json({"error": "device_ids must be a list of strings"}, status_code=400)
+            device_ids = [d.strip() for d in device_ids_raw if d.strip()]
         update_type = str(body.get("update_type", "")).strip().lower()
         action = str(body.get("action", "update")).strip().lower()
         notify_push = bool(body.get("notify_push", False))
@@ -1580,8 +2108,8 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             return self.json({"error": "update_type must be 'wireguard' or 'profile'"}, status_code=400)
         if action not in ("update", "revoke"):
             return self.json({"error": "action must be 'update' or 'revoke'"}, status_code=400)
-        if not device_id and not username:
-            return self.json({"error": "Must provide device_id or username"}, status_code=400)
+        if not device_id and not username and not device_ids:
+            return self.json({"error": "Must provide device_id, device_ids, or username"}, status_code=400)
 
         # Build the type-specific payload.
         if update_type == "wireguard":
@@ -1601,67 +2129,73 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             pp_data = self.hass.data[DOMAIN].get("pp_data", {"profiles": []})
             matched = next((p for p in pp_data.get("profiles", []) if p.get("id") == profile_id), None)
             if not matched:
-                return self.json({"error": "Provision profile not found"}, status_code=404)
-            payload = {"profile_id": profile_id, "name": matched.get("name"), "fields": matched.get("fields", {})}
+                return self.json({"error": "Provision template not found"}, status_code=404)
+            # A template apply is a one-time stamp of the fields the template
+            # actually sets, and only live device settings can change
+            # post-provision (expiration_hours goes through
+            # expires_at_override instead).
+            fields = {k: v for k, v in matched.get("fields", {}).items() if k in LIVE_PROVISIONING_FIELDS}
+            if not fields:
+                return self.json({"error": "This template sets no device-live fields"}, status_code=400)
+            payload = {"profile_id": profile_id, "name": matched.get("name"), "fields": fields}
 
-        targets = await self._resolve_targets(device_id, username)
+        targets, not_found = await self._resolve_targets(device_id, username, device_ids)
         if targets is None:
             return self.json({"error": "Target device or user not found"}, status_code=404)
         if not targets:
-            return self.json({"queued": 0, "pushed": 0, "notified": 0, "skipped": 0})
+            return self.json({"queued": 0, "skipped": 0, "not_found": not_found})
 
         qu_data = self.hass.data[DOMAIN]["qu_data"]
         stored_data = self.hass.data[DOMAIN]["stored_data"]
         created_by = user.name or user.id
-        session = async_get_clientsession(self.hass)
 
-        queued = pushed = notified = skipped = 0
+        # Enqueue durably (in-memory + delayed save) and respond right away;
+        # the push/nudge/notify relay calls run as a background task so a
+        # slow or unreachable relay (10s timeout per POST, per device) can't
+        # stall the panel's Apply button.
+        queued = skipped = 0
+        pending_flagged = False
+        jobs = []
+        device_key = stored_data.get("device_key")
 
         for did, dinfo in targets:
-            update_id, ok, skip = await _enqueue_and_push_update(
-                stored_data, qu_data, session, did, dinfo,
-                update_type, action, payload, created_by, send_push=send_update_push,
-            )
+            update_id = _enqueue_update(qu_data, did, update_type, action, payload, created_by)
             queued += 1
-            if send_update_push:
-                if skip:
-                    skipped += 1
-                elif ok:
-                    pushed += 1
-                await _nudge_device_checkin(session, stored_data, dinfo)
-
-            # A real shared profile push re-hugs any device previously
-            # force-edited off-profile back onto shared management.
-            if update_type == "profile":
-                dinfo["custom_provisioning"] = False
-
             push_token = dinfo.get("push_token")
-
+            if send_update_push and (not push_token or not device_key):
+                skipped += 1
             if notify_push:
                 if not push_token:
                     skipped += 1
                 elif not title or not message:
                     _LOGGER.warning("CASA: notify_push requested without title/message; skipping notification for '%s'.", did)
-                else:
-                    ok = await self._send_to_relay(session, {
-                        "target": push_token,
-                        "site_id": stored_data.get("site_id"),
-                        "site_key": stored_data.get("site_key"),
-                        "title": title,
-                        "message": message,
-                        "data": {"update_id": update_id, "type": update_type, "action": action},
-                    })
-                    if ok:
-                        notified += 1
+
+            # A template apply is one-time: the device does not become
+            # attached to the template. Flag it pending until its next
+            # profile self-report confirms the fields landed.
+            if update_type == "profile":
+                dinfo["provisioning_pending_push"] = True
+                pending_flagged = True
+
+            jobs.append((did, dinfo, update_id))
 
         qu_store = self.hass.data[DOMAIN]["qu_store"]
         qu_store.async_delay_save(lambda: qu_data, 2.0)
+        if pending_flagged:
+            store = self.hass.data[DOMAIN]["store"]
+            store.async_delay_save(lambda: stored_data, 2.0)
+
+        if send_update_push or notify_push:
+            self.hass.async_create_task(_deliver_updates_in_background(
+                self.hass, stored_data, jobs, update_type, action, payload,
+                send_update_push, notify_push, title, message, created_by,
+            ))
 
         _LOGGER.info(
-            "CASA: Queued %s '%s' update(s) (push=%s notify=%s) by %s.",
-            queued, update_type, pushed, notified, created_by,
+            "CASA: Queued %s '%s' update(s) (push=%s notify=%s) by %s; delivery in background.",
+            queued, update_type, send_update_push, notify_push, created_by,
         )
-        return self.json({"queued": queued, "pushed": pushed, "notified": notified, "skipped": skipped})
+        return self.json({"queued": queued, "skipped": skipped, "not_found": not_found})
 
     async def delete(self, request):
         """Cancel a single queued update by device_id + id.
@@ -1679,20 +2213,213 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             return self.json({"error": "Missing device_id or id query parameter"}, status_code=400)
 
         qu_data = self.hass.data[DOMAIN]["qu_data"]
-        entries = qu_data.get("updates", {}).get(device_id, [])
-        remaining = [e for e in entries if e.get("id") != update_id]
-        if len(remaining) == len(entries):
+        removed = _dequeue_update(qu_data, device_id, update_id)
+        if removed is None:
             return self.json({"error": "Queued update not found"}, status_code=404)
 
-        if remaining:
-            qu_data["updates"][device_id] = remaining
-        else:
-            qu_data.get("updates", {}).pop(device_id, None)
+        # Cancelling a queued reauthentication also clears the pending marker
+        # so the device record stops advertising it (a push copy already
+        # delivered still can't be recalled).
+        if removed.get("type") == "auth":
+            stored_data = self.hass.data[DOMAIN]["stored_data"]
+            device_info, _uid, _name = _find_device_record(stored_data, device_id)
+            if device_info and device_info.get("reauth_pending", {}).get("update_id") == update_id:
+                device_info.pop("reauth_pending", None)
+                self.hass.data[DOMAIN]["store"].async_delay_save(lambda: stored_data, 2.0)
 
         qu_store = self.hass.data[DOMAIN]["qu_store"]
         qu_store.async_delay_save(lambda: qu_data, 2.0)
         _LOGGER.info("CASA: Admin %s cancelled queued update %s for device '%s'.", user.name or user.id, update_id, device_id)
-        return self.json({"status": "ok", "remaining": len(remaining)})
+        remaining = len(qu_data.get("updates", {}).get(device_id, []))
+        return self.json({"status": "ok", "remaining": remaining})
+
+
+class CasaAdminReauthDeviceView(HomeAssistantView):
+    """Admin-only endpoint to reauthenticate a provisioned device with new credentials.
+
+    Queues an encrypted `auth`/`reauthenticate` update carrying a username and
+    password (an existing HA user, or one created inline) and optionally
+    accelerates delivery over an encrypted silent push — the same two channels
+    profile/WireGuard updates use, so this works off-network. Nothing about the
+    device's identity changes here: the record move, refresh-token rebind, and
+    old-session revocation are deferred to _complete_pending_reauth on the
+    device's first authenticated contact as the new user, because the queue
+    pull/ack path authorizes against the *current* refresh_token_id.
+    """
+
+    url = "/api/casa/admin/reauth_device"
+    name = "api:casa:admin:reauth_device"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = str(body.get("device_id", "")).strip()
+        if not device_id:
+            return self.json({"error": "device_id is required"}, status_code=400)
+
+        hass = self.hass
+        data = hass.data[DOMAIN]
+        stored_data = data["stored_data"]
+        qu_data = data["qu_data"]
+
+        device_info, old_uid, old_username = _find_device_record(stored_data, device_id)
+        if not device_info:
+            return self.json({"error": "Device not found"}, status_code=404)
+
+        password = str(body.get("password", "") or "").strip()
+        send_update_push = bool(body.get("send_update_push", True))
+        scramble_old = bool(body.get("scramble_old", False))
+        create_user = body.get("create_user")
+        created_by = user.name or user.id
+
+        provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
+        if not provider:
+            return self.json({"error": "Home Assistant core auth provider not found"}, status_code=500)
+
+        created_user = False
+        revealed_password = None
+
+        if isinstance(create_user, dict):
+            result, err = await _create_casa_user(
+                hass,
+                create_user.get("name"),
+                create_user.get("username"),
+                password or None,
+                created_by=created_by,
+            )
+            if err:
+                return self.json({"error": err}, status_code=400)
+            target_user = await hass.auth.async_get_user(result["user_id"])
+            login_username = result["username"]
+            login_password = result["password"]
+            revealed_password = login_password
+            created_user = True
+        else:
+            users = await hass.auth.async_get_users()
+            target_user_id = str(body.get("user_id", "") or "").strip()
+            target_username = str(body.get("username", "") or "").strip()
+            target_user = None
+            if target_user_id:
+                target_user = next((u for u in users if u.id == target_user_id), None)
+            elif target_username:
+                target_user = next((u for u in users if _user_matches_username(u, target_username)), None)
+            else:
+                return self.json({"error": "Must provide user_id, username, or create_user"}, status_code=400)
+            if not target_user:
+                return self.json({"error": "Target user not found"}, status_code=404)
+            if getattr(target_user, "is_admin", False):
+                _LOGGER.error("CASA ERROR: Attempted to reauthenticate a device to an admin user. Blocked.")
+                return self.json({"error": "Cannot reauthenticate a device to an admin user"}, status_code=400)
+            if not getattr(target_user, "is_active", True):
+                return self.json({"error": "Target user is inactive"}, status_code=400)
+
+            login_username = None
+            for cred in target_user.credentials:
+                if cred.auth_provider_type == "homeassistant":
+                    login_username = cred.data.get("username")
+                    break
+            if not login_username:
+                return self.json({"error": "No local Home Assistant credentials found for this user"}, status_code=400)
+
+            if password:
+                # Provisioning semantics: a supplied password is assumed to
+                # already be the account's password and is not changed.
+                login_password = password
+            else:
+                login_password = generate_random_password()
+                provider.data.change_password(login_username, login_password)
+                await provider.data.async_save()
+                revealed_password = login_password
+
+        # Never leave two sequential reauth entries: retrying replaces any
+        # still-pending one.
+        prev = device_info.get("reauth_pending")
+        if prev and prev.get("update_id"):
+            _dequeue_update(qu_data, device_id, prev["update_id"])
+
+        switching = old_uid is not None and target_user.id != old_uid
+        scrambled_old = False
+        if scramble_old and switching:
+            # Lock the old account down now: scramble its password and revoke
+            # every session except the device's own, which must survive until
+            # the device logs in as the new user (it authorizes the queue
+            # pull/ack path). That last token dies at completion.
+            old_user = await hass.auth.async_get_user(old_uid)
+            if old_user and not getattr(old_user, "is_admin", False):
+                old_login = next(
+                    (c.data.get("username") for c in old_user.credentials if c.auth_provider_type == "homeassistant"),
+                    None,
+                )
+                if old_login:
+                    provider.data.change_password(old_login, generate_random_password())
+                    await provider.data.async_save()
+                spare = device_info.get("refresh_token_id")
+                for token in list(old_user.refresh_tokens.values()):
+                    if token.id != spare:
+                        hass.auth.async_remove_refresh_token(token)
+                scrambled_old = True
+
+        # Enqueue durably and stamp the marker BEFORE any push goes out, so a
+        # fast device can't complete the reauth against a half-written state.
+        update_id = _enqueue_update(
+            qu_data, device_id, "auth", "reauthenticate",
+            {"username": login_username, "password": login_password}, created_by,
+        )
+        device_info["reauth_pending"] = {
+            "target_user_id": target_user.id,
+            "target_username": login_username,
+            "old_user_id": old_uid,
+            "old_refresh_token_id": device_info.get("refresh_token_id"),
+            "update_id": update_id,
+            "scramble_old": scrambled_old,
+            "requested_at": dt_util.now().isoformat(),
+            "requested_by": created_by,
+        }
+        data["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+        data["store"].async_delay_save(lambda: stored_data, 2.0)
+
+        pushed = False
+        push_skipped = False
+        if send_update_push:
+            if not device_info.get("push_token") or not stored_data.get("device_key"):
+                push_skipped = True
+            else:
+                session = async_get_clientsession(hass)
+                pushed = await _send_encrypted_update_push(
+                    stored_data, session, device_id, device_info,
+                    update_id, "auth", "reauthenticate",
+                    {"username": login_username, "password": login_password},
+                )
+                if not pushed:
+                    await _nudge_device_checkin(session, stored_data, device_info)
+
+        _LOGGER.info(
+            "CASA: Queued reauthentication of device '%s' from user '%s' to '%s' by %s (pushed=%s skipped=%s scrambled_old=%s).",
+            device_id, old_username or old_uid, login_username, created_by, pushed, push_skipped, scrambled_old,
+        )
+
+        resp = {
+            "status": "ok",
+            "update_id": update_id,
+            "pushed": pushed,
+            "push_skipped": push_skipped,
+            "username": login_username,
+            "created_user": created_user,
+            "scrambled_old": scrambled_old,
+        }
+        if revealed_password:
+            resp["password"] = revealed_password
+        return self.json(resp)
 
 
 class CasaAdminRegenerateKeyView(HomeAssistantView):
@@ -1782,11 +2509,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN]["wg_store"] = wg_store
     hass.data[DOMAIN]["wg_data"] = wg_data
 
-    # Initialize provision profiles store (separate .storage file)
+    # Initialize provision templates store (separate .storage file; keeps its
+    # historical "casa_provision_profiles" name for compatibility).
     pp_store = Store(hass, 1, "casa_provision_profiles")
     pp_data = await pp_store.async_load()
     if pp_data is None:
         pp_data = {"profiles": []}
+    # Sparse-normalize legacy templates (total field dicts -> only-set keys).
+    if _migrate_provision_templates(pp_data):
+        await pp_store.async_save(pp_data)
     hass.data[DOMAIN]["pp_store"] = pp_store
     hass.data[DOMAIN]["pp_data"] = pp_data
 
@@ -1798,6 +2529,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         qu_data = {"updates": {}}
     hass.data[DOMAIN]["qu_store"] = qu_store
     hass.data[DOMAIN]["qu_data"] = qu_data
+
+    # Initialize location-zones store (separate .storage file).
+    lz_store = Store(hass, 1, "casa_location_zones")
+    lz_data = await lz_store.async_load()
+    if lz_data is None:
+        lz_data = {"config_version": "", "stale_after_minutes": 30, "anchors": []}
+    hass.data[DOMAIN]["lz_store"] = lz_store
+    hass.data[DOMAIN]["lz_data"] = lz_data
+
+    # Self-heal stranded queue state (entries for deprovisioned devices,
+    # reauthentications targeting since-deleted users, markers stuck on
+    # records under deleted owners) before any device pulls it.
+    pruned = await _prune_stale_queued_updates(hass)
+    if pruned:
+        _LOGGER.warning("CASA: Startup pruned %d stale queued update(s).", pruned)
 
     create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
     
@@ -1873,7 +2619,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 raise HomeAssistantError("Invalid push token format. Must be a 64-character hex string.")
 
         stored_data = hass.data[DOMAIN]["stored_data"]
-        
+
+        # Finish any pending admin-initiated reauthentication first, so the
+        # user-keyed lookup below finds the record under its new owner instead
+        # of duplicating it under the old one.
+        await _complete_pending_reauth(hass, device_id, user_id, refresh_token_id)
+
         # Check if user is an integration-managed user
         if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
             user_entry = stored_data["users"][user_id]
@@ -1887,7 +2638,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ha_user = next((u for u in users if u.id == user_id), None)
             if not ha_user or not ha_user.is_active:
                 raise HomeAssistantError("User not found or inactive in Home Assistant.")
-            
+
             native_devices = stored_data.setdefault("native_devices", {})
             if user_id not in native_devices:
                 native_devices[user_id] = {}
@@ -1921,8 +2672,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Merge onto the existing record — this function is called on every
         # re-registration (periodic push-registration check, relaunch,
         # etc.), not just the first one. A wholesale replacement here would
-        # silently wipe alias, expires_at, provisioning_fields,
-        # custom_provisioning, and everything else not listed below.
+        # silently wipe alias, expires_at, provisioning_fields, and
+        # everything else not listed below.
         existing_info = devices.get(device_id, {})
         devices[device_id] = {
             **existing_info,
@@ -1935,10 +2686,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "needs_reregister": final_reregister
         }
 
-        # "Originally provisioned from" bridge — consume the pending record
-        # _provision_internal stashed by user_id (device_id wasn't known
-        # then). Ignore stale entries (abandoned code, unrelated later
-        # registration) past the same 30-min TTL _login_listener caps at.
+        # "Originally provisioned from template" lineage — consume the pending
+        # record _provision_internal stashed by user_id (device_id wasn't
+        # known then). Purely informational under stamp-only semantics; it
+        # never re-syncs the device. Ignore stale entries (abandoned code,
+        # unrelated later registration) past the same 30-min TTL
+        # _login_listener caps at.
         pending_by_user = hass.data[DOMAIN].get("pending_profile_by_user", {})
         pending = pending_by_user.pop(user_id, None)
         if pending and (time.time() - pending.get("set_at", 0)) <= 1800:
@@ -1997,6 +2750,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         stored_data = hass.data[DOMAIN]["stored_data"]
 
+        # Finish any pending admin-initiated reauthentication first: it moves
+        # the record under the new owner (so the lookup below can't duplicate
+        # it) and dequeues the reauth entry before has_updates is computed at
+        # the bottom, so the device never re-pulls its own reauth.
+        await _complete_pending_reauth(hass, device_id, user_id, refresh_token_id)
+
         # Check if user is an integration-managed user
         if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
             user_entry = stored_data["users"][user_id]
@@ -2021,7 +2780,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
 
         now_iso = dt_util.now().isoformat()
-        
+
         # Get or initialize existing device info
         device_info = devices.setdefault(device_id, {
             "registered_at": now_iso
@@ -2149,6 +2908,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(CasaDeviceProfileReportView(hass))
     hass.http.register_view(CasaAdminSummaryView(hass))
     hass.http.register_view(CasaWireGuardProfilesView(hass))
+    hass.http.register_view(CasaLocationZonesView(hass))
     hass.http.register_view(CasaProvisionProfilesView(hass))
     hass.http.register_view(CasaAdminDeviceView(hass))
     hass.http.register_view(CasaAdminSettingsView(hass))
@@ -2156,6 +2916,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(CasaAdminCheckUsernameView(hass))
     hass.http.register_view(CasaProfileUpdatesView(hass))
     hass.http.register_view(CasaAdminQueueUpdateView(hass))
+    hass.http.register_view(CasaAdminReauthDeviceView(hass))
     hass.http.register_view(CasaAdminRegenerateKeyView(hass))
 
     # Serve the admin panel assets once per process; the route survives reloads.
@@ -2317,7 +3078,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return {"error": "Missing Public Key"}
 
         # 1. Resolve Profile data if present
-        profile_key = str(service_data.get("profile", "")).strip()
+        # "template" is the preferred service key; "profile" is the historical
+        # alias kept for existing automations.
+        profile_key = str(service_data.get("template") or service_data.get("profile") or "").strip()
         profile_fields = {}
         matched_profile = None
         if profile_key:
@@ -2327,11 +3090,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     matched_profile = p
                     break
             if not matched_profile:
-                _LOGGER.error("CASA ERROR: Provision profile '%s' not found.", profile_key)
-                return {"error": f"Provision profile '{profile_key}' not found"}
+                _LOGGER.error("CASA ERROR: Provision template '%s' not found.", profile_key)
+                return {"error": f"Provision template '{profile_key}' not found"}
             profile_fields = matched_profile.get("fields", {})
 
-        # Helper to resolve fields: service_data overrides profile_fields
+        # Resolve fields: service_data overrides the template's (sparse) set
+        # fields, which override the schema default — an unset template key
+        # simply falls through to the default.
         def get_field(key, default=None):
             val = service_data.get(key)
             if val is not None and val != "":
@@ -2462,19 +3227,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         if users is None:
             users = await hass.auth.async_get_users()
-        # Display-name match first (historic behavior), then fall back to the
-        # homeassistant-provider credential username — accounts created with
-        # name != username (e.g. guided flow names the user after the device)
-        # are only reachable by their login username.
-        def _matches_target(u):
-            if u.name and u.name.casefold() == target_username.casefold():
-                return True
-            return any(
-                cred.auth_provider_type == "homeassistant"
-                and str(cred.data.get("username", "")).casefold() == target_username.casefold()
-                for cred in u.credentials
-            )
-        target_user = next((u for u in users if _matches_target(u)), None)
+        # Exact user_id (sent by the guided flow right after create_user) wins;
+        # otherwise display-name with credential-username fallback.
+        target_user_id = str(get_field("user_id", "") or "").strip()
+        target_user = None
+        if target_user_id:
+            target_user = next((u for u in users if u.id == target_user_id), None)
+        if target_user is None:
+            target_user = next((u for u in users if _user_matches_username(u, target_username)), None)
         if not target_user:
             return {"error": "User not found"}
 
@@ -2907,10 +3667,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not token_id or not target_username:
             return
             
-        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
+        target_user = next((u for u in users if _user_matches_username(u, target_username)), None)
         if not target_user:
             return
-            
+
         if token_id == "*":
             for token in list(target_user.refresh_tokens.values()):
                 hass.auth.async_remove_refresh_token(token)
@@ -2966,63 +3726,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ==========================================
     async def handle_create_user(call: ServiceCall):
         users = await _check_authorization(call)
-        target_name = str(call.data.get("name", "")).strip()
-        target_username = str(call.data.get("username", "")).strip().casefold()
-        target_password = str(call.data.get("password", "")).strip()
-        
-        local_only = call.data.get("local_only", True)
-        
-        if not target_name or not target_username:
-            return {"error": "Missing mandatory name or username"}
-
-        if any(u.name and u.name.casefold() == target_username for u in users) or any(u.name and u.name.casefold() == target_name.casefold() for u in users):
-            return {"error": "User with this name or username already exists"}
-
-        provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
-        if not provider:
-            return {"error": "Home Assistant core auth provider not found"}
-
-        if not target_password:
-            target_password = generate_random_password()
-
-        group_ids = ["system-users"]
-
-        new_user = await hass.auth.async_create_user(
-            name=target_name, 
-            group_ids=group_ids, 
-            local_only=local_only
-        )
-        
-        provider.data.add_auth(target_username, target_password)
-        await provider.data.async_save()
-
-        credentials = await provider.async_get_or_create_credentials({"username": target_username})
-        await hass.auth.async_link_user(new_user, credentials)
-
-        _LOGGER.info("CASA: New local user '%s' created (Local Only: %s).", target_username, local_only)
-
-        # Track the creation in the store
         creator = await _get_context_creator(call.context)
-        stored_data = hass.data[DOMAIN]["stored_data"]
-        stored_data["users"][new_user.id] = {
-            "user_id": new_user.id,
-            "username": target_username,
-            "name": target_name,
-            "created_at": dt_util.now().isoformat(),
-            "created_by": creator,
-            "deleted": False,
-            "deleted_at": None,
-            "deleted_by": None,
-        }
-        await hass.data[DOMAIN]["store"].async_save(stored_data)
-
-        return {
-            "name": target_name,
-            "username": target_username,
-            "password": target_password,
-            "user_id": new_user.id,
-            "is_local_only": local_only
-        }
+        result, err = await _create_casa_user(
+            hass,
+            call.data.get("name"),
+            call.data.get("username"),
+            str(call.data.get("password", "")).strip() or None,
+            created_by=creator,
+            local_only=call.data.get("local_only", True),
+            users=users,
+        )
+        if err:
+            return {"error": err}
+        return result
 
     hass.services.async_register(
         DOMAIN, "create_user", handle_create_user,
@@ -3039,8 +3755,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not target_username:
             return {"error": "Missing mandatory username"}
 
-        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
-        
+        target_user = next((u for u in users if _user_matches_username(u, target_username)), None)
+
         if not target_user:
             return {"error": "User not found"}
 
@@ -3118,8 +3834,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not target_username:
             return {"error": "Missing mandatory username"}
 
-        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
-        
+        target_user = next((u for u in users if _user_matches_username(u, target_username)), None)
+
         if not target_user:
             return {"error": "User not found"}
 
@@ -3208,17 +3924,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not target_username:
             raise HomeAssistantError("Missing mandatory username.")
 
-        target_user = next((u for u in users if u.name and u.name.casefold() == target_username.casefold()), None)
-        if not target_user:
-            # Let's check credentials username too, just in case
-            for u in users:
-                for cred in u.credentials:
-                    if cred.auth_provider_type == "homeassistant" and cred.data.get("username", "").casefold() == target_username.casefold():
-                        target_user = u
-                        break
-                if target_user:
-                    break
-
+        target_user = next((u for u in users if _user_matches_username(u, target_username)), None)
         if not target_user:
             raise HomeAssistantError(f"User '{target_username}' not found.")
 
@@ -3254,6 +3960,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "deleted_by": deleter,
         })
         await hass.data[DOMAIN]["store"].async_save(stored_data)
+
+        # The user's device records are now unreachable (_find_device_record
+        # skips deleted owners), so their queued updates — and any queued
+        # reauthentication *targeting* this user from another device — can
+        # never be consumed. Left behind, an auth entry re-delivers forever
+        # and loops the device through failed logins until it wipes itself.
+        await _prune_stale_queued_updates(hass)
 
         return {
             "status": "removed",
@@ -3305,6 +4018,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         if changed:
             await store.async_save(stored_data)
+            # Users deleted outside the integration strand their devices'
+            # queued updates the same way handle_remove_user would.
+            await _prune_stale_queued_updates(hass)
 
         result_users = []
         for uid, udata in stored_data["users"].items():
@@ -3537,6 +4253,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "target": push_token,
             "site_id": stored_data.get("site_id"),
             "site_key": stored_data.get("site_key"),
+            "push_type": "background",
+            "priority": 5,
             "data": {"command": "clear_cache_and_reload"}
         }
 
@@ -3693,6 +4411,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "target": push_token,
                 "site_id": stored_data.get("site_id"),
                 "site_key": stored_data.get("site_key"),
+                "push_type": "background",
+                "priority": 5,
                 "data": {"command": "deprovision"},
             }
             _LOGGER.info(
@@ -3859,6 +4579,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "site_key": stored_data.get("site_key"),
                 "title": "" if silent else title,
                 "message": "" if silent else message,
+                "push_type": "background" if silent else "alert",
+                "priority": 5 if silent else 10,
                 "data": {
                     "command": command,
                     "encrypted": bool(encrypt_config),
