@@ -13,10 +13,11 @@ const COLUMNS = [
   { key: "user", label: "User" },
   { key: "ip", label: "IP" },
   { key: "app", label: "App" },
+  { key: "zone", label: "Zone" },
   { key: "expires", label: "Expires" },
   { key: "last_seen", label: "Last seen" },
 ];
-const DEFAULT_COLUMNS = ["status", "name", "user", "ip", "app", "expires"];
+const DEFAULT_COLUMNS = ["status", "name", "user", "ip", "app", "zone", "expires"];
 
 export function createView(app) {
   const { api, ui, store } = app;
@@ -162,6 +163,13 @@ export function createView(app) {
   function appHtml(d) {
     return d.app_version ? `<span class="chip chip--app">${ui.esc(d.app_version)}</span>` : "—";
   }
+  function zoneHtml(d) {
+    const state = d.location_state;
+    if (state && state.includes(": ")) return `<span class="chip chip--ok">${ui.esc(state)}</span>`;
+    if (state === "away") return `<span class="chip chip--neutral">Away</span>`;
+    const title = d.location_reason ? ` title="${ui.esc(d.location_reason)}"` : "";
+    return `<span class="chip chip--warn"${title}>Unknown</span>`;
+  }
   function dotHtml(d) {
     const s = statusInfo(d);
     return `<span class="status-dot ${s.cls}" title="${ui.esc(ui.fmtTime(d.last_seen))}"></span>`;
@@ -179,6 +187,8 @@ export function createView(app) {
         return `<td class="mono">${ui.esc(d.ip || "—")}</td>`;
       case "app":
         return `<td>${appHtml(d)}</td>`;
+      case "zone":
+        return `<td>${zoneHtml(d)}</td>`;
       case "expires":
         return `<td>${expiresHtml(d)}</td>`;
       case "last_seen":
@@ -240,7 +250,7 @@ export function createView(app) {
             <div style="margin-top:8px; display:flex; flex-direction:column; gap:5px; font-size:13px;">
               <span>${userHtml(d)}</span>
               <span class="mono muted">${ui.esc(d.ip || "—")}</span>
-              <span>${appHtml(d)}</span>
+              <span>${appHtml(d)} ${zoneHtml(d)}</span>
               <span class="muted">Expires: ${expiresHtml(d)}</span>
             </div>
           </div>

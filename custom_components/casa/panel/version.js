@@ -3,4 +3,4 @@
 // at import time in /api/casa/admin/summary; app.js compares it against this
 // on-disk constant and shows a "restart Home Assistant" banner on any skew —
 // the telltale of updated files under a still-running old Python process.
-export const PANEL_VERSION = "26.07.21";
+export const PANEL_VERSION = "26.08.30";

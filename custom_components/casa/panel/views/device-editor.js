@@ -11,7 +11,9 @@ const RECORD_KEYS = [
   "username", "device_id", "ip", "last_seen", "push_registered", "orphaned",
   "stale", "native", "alias", "registered_at", "push_token", "last_12_token",
   "refresh_token_id", "app_version", "wireguard_configured",
-  "wireguard_connected", "current_url", "provisioned_at", "expires_at",
+  "wireguard_connected", "location_state", "location_reason",
+  "location_reported_at", "location_config_version", "current_url",
+  "provisioned_at", "expires_at",
   "expires_at_override", "expires_at_override_set_at", "pending_updates",
   "pending_update_list", "provisioning_fields", "provisioning_reported_at",
   "provisioning_pending_push",
@@ -462,6 +464,17 @@ export function createView(app) {
         ? `<span class="chip ${noCls}">${noLabel}</span>`
         : "—";
 
+  // Location zone chip — green with the zone name when reported inside a
+  // zone ("zoneId: zoneName"), neutral for the reserved "away" state, amber
+  // for "unknown"/missing (with the reason, if any, as a tooltip).
+  function zoneChip(d) {
+    const state = d.location_state;
+    if (state && state.includes(": ")) return `<span class="chip chip--ok">${esc(state)}</span>`;
+    if (state === "away") return `<span class="chip chip--neutral">Away</span>`;
+    const title = d.location_reason ? ` title="${esc(d.location_reason)}"` : "";
+    return `<span class="chip chip--warn"${title}>Unknown</span>`;
+  }
+
   function pendingExpiryBadge(d) {
     if (d.expires_at_override == null) return "";
     const val = d.expires_at_override === 0 ? "Never" : ui.fmtExpiry(d.expires_at_override);
@@ -676,6 +689,11 @@ export function createView(app) {
     rows.push(
       label("VPN Connected"),
       `<span>${triChip(d.wireguard_connected, "Connected", "Disconnected", "chip--warn")}</span>`
+    );
+    rows.push(label("Zone"), `<span>${zoneChip(d)}</span>`);
+    rows.push(
+      label("Zone config version"),
+      `<span>${d.location_config_version != null ? esc(String(d.location_config_version)) : "—"}</span>`
     );
     return rows.join("");
   }
@@ -1098,6 +1116,7 @@ export function createView(app) {
         <div style="display:flex; align-items:center; gap:8px; font-size:13px;">
           ${triChip(d.wireguard_configured, "Installed", "Not installed", "chip--neutral")}
           ${triChip(d.wireguard_connected, "Connected", "Disconnected", "chip--warn")}
+          ${zoneChip(d)}
         </div>
       </div></div>
       <div class="card section-card"><div class="card__body">
