@@ -81,6 +81,11 @@ export function createView(app) {
   // input so typing/dragging never triggers a form re-render.
   let map = null;
   let layers = new Map(); // id -> { marker, circles: L.circle[] }
+  // L.Icon.Default's path auto-detection probes document.body CSS / a
+  // light-DOM <link href$="leaflet.css">; both miss because our leaflet.css
+  // lives in the shadow root, so the default marker PNGs 404 unless pinned
+  // explicitly. Done once, right after ensureLeaflet() resolves.
+  let iconDefaultsConfigured = false;
 
   let refs = null; // DOM refs into the static shell (map div persists across renders)
 
@@ -156,6 +161,14 @@ export function createView(app) {
   async function ensureMap() {
     if (map || !refs) return;
     const L = await ensureLeaflet();
+    if (!iconDefaultsConfigured) {
+      L.Icon.Default.mergeOptions({
+        iconUrl: "/casa_static/vendor/images/marker-icon.png",
+        iconRetinaUrl: "/casa_static/vendor/images/marker-icon-2x.png",
+        shadowUrl: "/casa_static/vendor/images/marker-shadow.png",
+      });
+      iconDefaultsConfigured = true;
+    }
     ensureLeafletCss(ui._shadowRoot);
     if (!refs || !mounted) return; // unmounted while awaiting the script load
 
@@ -194,8 +207,10 @@ export function createView(app) {
       } else {
         entry.marker.setLatLng(latlng);
       }
-      // bindTooltip is safe to call repeatedly — it replaces any existing binding.
-      entry.marker.bindTooltip(a.name || `Anchor ${i + 1}`);
+      // bindTooltip is safe to call repeatedly — it replaces any existing
+      // binding. Leaflet assigns tooltip content via innerHTML without
+      // escaping, so anchor names (user input) must be pre-escaped.
+      entry.marker.bindTooltip(esc(a.name || `Anchor ${i + 1}`));
 
       // Rebuild this anchor's circles to match its current ring count.
       for (const c of entry.circles) map.removeLayer(c);
@@ -409,7 +424,8 @@ export function createView(app) {
     } else if (field === "name") {
       a.name = t.value;
       const entry = layers.get(anchorId);
-      if (entry) entry.marker.bindTooltip(a.name || "");
+      // Tooltip content is raw innerHTML in Leaflet — escape user input.
+      if (entry) entry.marker.bindTooltip(esc(a.name || ""));
     } else if (field === "latitude" || field === "longitude") {
       const v = t.value === "" ? null : parseFloat(t.value);
       a[field] = v;
