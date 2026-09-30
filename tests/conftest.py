@@ -71,7 +71,11 @@ def _install_homeassistant_stubs() -> None:
         async_get_clientsession=lambda *a, **kw: None,
     )
     _ensure_module("homeassistant.util")
-    _ensure_module("homeassistant.util.dt")
+    import datetime as _datetime
+    _ensure_module(
+        "homeassistant.util.dt",
+        now=lambda *a, **kw: _datetime.datetime.now(_datetime.timezone.utc),
+    )
     _ensure_module("homeassistant.exceptions", HomeAssistantError=Exception)
     _ensure_module("homeassistant.components")
     _ensure_module(

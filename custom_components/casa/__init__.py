@@ -278,6 +278,73 @@ def _user_matches_username(user, target_username: str) -> bool:
     )
 
 
+async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, method, on_redeemed=None):
+    """Poll for new refresh tokens; fire casa_code_redeemed when one appears.
+
+    on_redeemed: optional coroutine function run once after the first
+    redemption event (used to scramble the password so the link is
+    single-use). When it is set the listener returns after the first
+    redemption; otherwise it keeps reporting until the TTL ends.
+    """
+    if ttl_seconds <= 0:
+        _LOGGER.warning("CASA: Listener for '%s' skipped — TTL is %s.", username, ttl_seconds)
+        return
+    try:
+        elapsed = 0
+        poll_interval = 2
+        while elapsed < ttl_seconds:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            users = await hass.auth.async_get_users()
+            user = next((u for u in users if u.id == user_id), None)
+            if not user:
+                return
+
+            current_tokens = set(user.refresh_tokens.keys())
+            new_tokens = current_tokens - known_tokens
+            if not new_tokens:
+                continue
+
+            for tid in new_tokens:
+                token = user.refresh_tokens.get(tid)
+                if token:
+                    hass.bus.async_fire("casa_code_redeemed", {
+                        "username": username,
+                        "client_name": token.client_name,
+                        "client_id": token.client_id,
+                        "token_id": token.id,
+                        "ip_address": token.last_used_ip,
+                        "redeemed_at": dt_util.now().isoformat(),
+                        "method": method,
+                    })
+                    _LOGGER.info(
+                        "CASA EVENT: Code redeemed by '%s' via %s (client: %s, IP: %s).",
+                        username, method, token.client_name, token.last_used_ip
+                    )
+            known_tokens.update(new_tokens)
+
+            if on_redeemed is not None:
+                try:
+                    await on_redeemed()
+                except Exception as err:  # never let a scramble failure kill the listener silently
+                    _LOGGER.error("CASA: on_redeemed for '%s' failed: %s", username, err)
+                return
+    except asyncio.CancelledError:
+        pass
+
+
+async def _scramble_and_close(hass, username: str, auth_provider, listener_key: str) -> None:
+    """Rotate the account password so the provisioning link is dead, and stop the listener."""
+    scrambled_password = generate_random_password()
+    auth_provider.data.change_password(username, scrambled_password)
+    await auth_provider.data.async_save()
+    _LOGGER.info("CASA: Password for %s scrambled.", username)
+    listener_task = hass.data[DOMAIN]["listeners"].get(listener_key)
+    if listener_task:
+        listener_task.cancel()
+
+
 def _find_device_record(stored_data: dict, device_id: str):
     """Locate a device across integration-managed and native users.
 
@@ -850,7 +917,9 @@ class CasaDeprovisionView(HomeAssistantView):
             body = await request.json()
         except Exception:
             body = {}
-        device_id = str((body or {}).get("device_id", "")).strip()
+        if not isinstance(body, dict):
+            body = {}
+        device_id = str(body.get("device_id", "")).strip()
         if not device_id:
             return self.json({"error": "Missing device_id"}, status_code=400)
 
@@ -3202,50 +3271,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return "system"
 
     # ==========================================
-    # SHARED: LOGIN LISTENER
-    # ==========================================
-    async def _login_listener(username, user_id, known_tokens, ttl_seconds, method):
-        """Poll for new refresh tokens and fire casa_code_redeemed when detected."""
-        if ttl_seconds <= 0:
-            _LOGGER.warning("CASA: Listener for '%s' skipped — TTL is %s.", username, ttl_seconds)
-            return
-        try:
-            elapsed = 0
-            poll_interval = 2
-            while elapsed < ttl_seconds:
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
-
-                users = await hass.auth.async_get_users()
-                user = next((u for u in users if u.id == user_id), None)
-                if not user:
-                    return
-
-                current_tokens = set(user.refresh_tokens.keys())
-                new_tokens = current_tokens - known_tokens
-
-                if new_tokens:
-                    for tid in new_tokens:
-                        token = user.refresh_tokens.get(tid)
-                        if token:
-                            hass.bus.async_fire("casa_code_redeemed", {
-                                "username": username,
-                                "client_name": token.client_name,
-                                "client_id": token.client_id,
-                                "token_id": token.id,
-                                "ip_address": token.last_used_ip,
-                                "redeemed_at": dt_util.now().isoformat(),
-                                "method": method,
-                            })
-                            _LOGGER.info(
-                                "CASA EVENT: Code redeemed by '%s' via %s (client: %s, IP: %s).",
-                                username, method, token.client_name, token.last_used_ip
-                            )
-                    known_tokens.update(new_tokens)
-        except asyncio.CancelledError:
-            pass
-
-    # ==========================================
     # UNIFIED SERVICE: PROVISION (QR & BLE)
     # ==========================================
     async def _provision_internal(service_data: dict, users: list = None) -> dict:
@@ -3710,14 +3735,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             _LOGGER.info("CASA: QR Code %s wiped from dashboard.", filename)
 
                     elif event["action"] == "scramble":
-                        scrambled_password = generate_random_password()
-                        auth_provider.data.change_password(username, scrambled_password)
-                        await auth_provider.data.async_save()
-                        _LOGGER.info("CASA: Password for %s scrambled.", username)
-                        # Cancel active listener since code can no longer be redeemed
-                        listener_task = hass.data[DOMAIN]["listeners"].get(target_username)
-                        if listener_task:
-                            listener_task.cancel()
+                        await _scramble_and_close(hass, username, auth_provider, target_username)
             except asyncio.CancelledError:
                 pass
 
@@ -3747,8 +3765,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if target_username in hass.data[DOMAIN]["listeners"]:
             hass.data[DOMAIN]["listeners"][target_username].cancel()
 
+        async def _on_redeemed():
+            # Single-use link: kill the password the moment it is used, and
+            # drop the fallback timer that would have done it later.
+            timer = hass.data[DOMAIN]["timers"].pop(target_username, None)
+            if timer:
+                timer.cancel()
+            await _scramble_and_close(hass, login_username, provider, target_username)
+
         listener_task = hass.async_create_task(
-            _login_listener(login_username, target_user.id, known_token_ids, listener_ttl, method)
+            _login_listener(
+                hass, login_username, target_user.id, known_token_ids, listener_ttl, method,
+                on_redeemed=_on_redeemed if password_scramble else None,
+            )
         )
         hass.data[DOMAIN]["listeners"][target_username] = listener_task
 
