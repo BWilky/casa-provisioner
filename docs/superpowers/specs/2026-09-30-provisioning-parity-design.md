@@ -68,7 +68,7 @@ self-deprovision (the account stays; admins decide).
   what `docs/app-integration.md` has and corrects the audit drift (see 11).
 - **Push commands.** `casa_update`, `request_heartbeat`,
   `request_profile_report`, `deprovision`, `clear_cache_and_reload`,
-  `wireguard_update`, `wireguard_revoke`, `notify_user`.
+  `wireguard_update`, `wireguard_revoke` (`notify_user` is a visible alert, not a command).
 - **Relay protocol.** Pointer to the relay README "Protocol 1" and how the
   provisioner probes it (section 8).
 

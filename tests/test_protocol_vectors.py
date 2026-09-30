@@ -43,7 +43,13 @@ def test_links_match_vectors():
     assert universal == VEC["universal_link"]
 
 
+SERVER_ORDER = [
+    "v", "server_version", "server_url", "username", "password", "site_id", "pin",
+    "default_dashboard", "welcome_url", "immersive_level", "theme_color_mode", "custom_color",
+    "session_expiration", "expiration", "cache_control_hours", "allowed_pages", "allowed_wifi",
+    "require_alias", "push_notifications", "wireguard", "connect_wifi",
+]
+
+
 def test_plaintext_key_order_matches_server():
-    keys = list(VEC["plaintext"].keys())
-    assert keys[:2] == ["v", "server_version"]
-    assert keys[-2:] == ["wireguard", "connect_wifi"]
+    assert list(VEC["plaintext"].keys()) == SERVER_ORDER

@@ -100,7 +100,8 @@ Sent through the relay as `data.command`.
 | `clear_cache_and_reload` | Clear the web cache and reload. |
 | `wireguard_update` | Push a WireGuard configuration. |
 | `wireguard_revoke` | Revoke the WireGuard configuration. |
-| `notify_user` | Visible notification (the `casa.notify_user` service). |
+
+Visible notifications from `casa.notify_user` carry no `data.command`; any `data` is caller-supplied and the app must not route them through command dispatch. `wireguard_update` / `wireguard_revoke` may be sent as visible alerts (push_type alert) when not silent.
 
 ## 10. Relay
 
