@@ -302,8 +302,15 @@ These are called by the Casa iOS app directly (authenticated via HA long-lived o
 | `DELETE` | `/api/casa/register_device?device_id=X` | Unregister push for a device (record retained — use `casa.delete_device` / `casa.deprovision_device` to remove a device) |
 | `POST` | `/api/casa/heartbeat` | Device heartbeat. Response carries `reregister`, `updates`, `device_key`/`device_key_id`, and — while an admin override is pending — `expires_at` (the app applies it; `0` = permanent) |
 | `GET`/`POST` | `/api/casa/profile_updates` | Pull / acknowledge queued profile & WireGuard updates |
+| `POST` | `/api/casa/profile_report` | Device reports its current provisioning fields (`{device_id, fields}`) |
+| `POST` | `/api/casa/location_report` | Encrypted location-state report; unauthenticated at the HTTP layer, body encrypted with the device key |
+| `POST` | `/api/casa/deprovision` | Device removes its own record and session (`{device_id}`) |
 
-Admin-only endpoints (used by the panel): `/api/casa/admin/summary`, `/api/casa/admin/device` (alias + `expires_at_override`), `/api/casa/admin/wireguard_profiles`, `/api/casa/admin/provision_profiles`, `/api/casa/admin/queue_update`, `/api/casa/admin/regenerate_device_key`.
+Admin-only endpoints (used by the panel): `/api/casa/admin/summary`, `/api/casa/admin/device` (alias + `expires_at_override`), `/api/casa/admin/wireguard_profiles`, `/api/casa/admin/provision_profiles`, `/api/casa/admin/queue_update`, `/api/casa/admin/regenerate_device_key`, `/api/casa/admin/location_zones`, `/api/casa/admin/settings`, `/api/casa/admin/sessions`, `/api/casa/admin/check_username`, `/api/casa/admin/reauth_device`.
+
+**Protocol:** see [`docs/provisioning-protocol.md`](docs/provisioning-protocol.md).
+
+**Deploying to a test HA:** `CASA_DEPLOY_PASS=... ./deploy.sh` (optional `CASA_DEPLOY_HOST`, `CASA_DEPLOY_USER`; the script refuses to run without the password variable).
 
 ---
 

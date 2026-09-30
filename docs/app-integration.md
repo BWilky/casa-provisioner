@@ -9,7 +9,7 @@ integration. Two channels deliver the same updates:
   app can apply it without waiting for the next heartbeat. If it can't be decrypted, the
   pull path is the safety net — nothing is ever lost.
 
-All endpoints are authenticated with the device's normal HA bearer token.
+All endpoints are authenticated with the device's normal HA bearer token, except `/api/casa/location_report`, which is unauthenticated at the HTTP layer and relies on the device-key-encrypted body.
 
 ---
 
@@ -26,10 +26,16 @@ Response fields:
   "device_key_id": "<8 hex chars>",
   "require_alias": false,
   "has_alias": true,
-  "heartbeat_interval_seconds": 300
+  "heartbeat_interval_seconds": 300,
+  "profile_report_interval_seconds": 3600,
+  "location_config_version": "<string>|null",
+  "expires_at": 1767225600
 }
 ```
 
+- `profile_report_interval_seconds` is the site's cadence for `POST /api/casa/profile_report` (below). Always present.
+- `location_config_version` is always present; `null` when the site has no location zones.
+- `expires_at` is present only while an admin override is pending (`0` = permanent); omitted otherwise.
 - **Persist `device_key` and `device_key_id` on every heartbeat.** `device_key` is the
   shared secret used to decrypt pushes; `device_key_id` is its fingerprint.
 - If `updates == true`, call the pull endpoint (§2).
@@ -68,7 +74,7 @@ chars) — an admin-set alias always wins and is never overwritten.
   "updates": [
     {
       "id": "<32 alphanumerics>",
-      "type": "wireguard | profile",
+      "type": "wireguard | profile | auth | location",
       "action": "update | revoke",
       "payload": { ... },
       "created_at": "<iso8601>",
@@ -77,6 +83,16 @@ chars) — an admin-set alias always wins and is never overwritten.
   ]
 }
 ```
+
+- `auth` / `reauthenticate` is never acked by the device (see the section after §4).
+- `location` / `update` carries the location-zone config and replaces any older `location` entries in the queue.
+
+### Profile report — `POST /api/casa/profile_report`
+
+Body: `{"device_id": "<id>", "fields": { ... }}`. `fields` must be an object (400 otherwise);
+only live provisioning fields are kept, unknown keys are dropped. `401` no user, `404`
+device not registered. Returns `{"status": "success"}`. Sent every
+`profile_report_interval_seconds` or immediately on a `request_profile_report` push (§5).
 
 ## 3. Acknowledge — `POST /api/casa/profile_updates`
 
@@ -176,7 +192,7 @@ command:           "wireguard_update" | "wireguard_revoke"
 encrypted:         true | false
 wireguard_payload: "<base64: nonce||ciphertext||tag>"   // or base64(plaintext) if encrypted=false
 device_key_id:     "<8 hex>"
-title / message:   present only when not silent
+title / message:   always present; "" when silent
 ```
 
 Inner JSON: `{ "action", "config", "excluded_wifi", "ts" }` (update) or
@@ -194,6 +210,14 @@ data: { "update_id": "...", "type": "...", "action": "..." }
 ```
 
 Treat as a nudge: heartbeat + pull.
+
+### Command pushes (`deprovision`, `clear_cache_and_reload`)
+
+Content-free silent pushes (`title`/`message` `""`) with `data: { "command": ... }`:
+
+- `deprovision` → wipe local provisioning state and sign out (the app may also call
+  `POST /api/casa/deprovision`; see "Self-deprovision" above).
+- `clear_cache_and_reload` → clear the web cache and reload the WebView.
 
 ### Check-in nudge pushes (`request_heartbeat` / `request_profile_report`)
 
