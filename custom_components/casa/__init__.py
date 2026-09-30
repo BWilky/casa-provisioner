@@ -26,7 +26,7 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_VERIFY_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
+from .const import CASA_VERSION, DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_VERIFY_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
 from .location import (
     ALLOWED_REASONS,
     ALLOWED_REPORT_KEYS,
@@ -126,6 +126,27 @@ def _encrypt_payload_hybrid(plaintext: str, public_key_bytes: bytes) -> str:
     )
     envelope = bytes([2]) + wrapped_key + nonce + ciphertext
     return base64.urlsafe_b64encode(envelope).decode("utf-8").rstrip("=")
+
+
+def build_links(payload: str, version: int) -> tuple[str, str]:
+    """Return (deep_link, universal_link) for an encoded provisioning payload.
+
+    v2 payloads are padding-stripped base64url and go into the URL untouched.
+    v1 payloads are standard base64 and keep their historical quoting: the
+    hascasa:// link leaves '/' raw, the https link percent-encodes it too.
+    Documented in docs/provisioning-protocol.md; the v1 rules are frozen.
+    """
+    if version == 2:
+        return (
+            f"hascasa://setup?data={payload}",
+            f"{UNIVERSAL_LINK_SETUP_URL}?d={payload}",
+        )
+    if version == 1:
+        return (
+            f"hascasa://setup?data={urllib.parse.quote(payload)}",
+            f"{UNIVERSAL_LINK_SETUP_URL}?d={urllib.parse.quote(payload, safe='')}",
+        )
+    raise ValueError(f"Unsupported payload version: {version}")
 
 
 def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
@@ -3497,14 +3518,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 except Exception as e:
                     _LOGGER.error("CASA ERROR: Failed to encrypt v1 payload. Error: %s", str(e))
                     return {"error": "Encryption failed"}
-            deep_link = f"hascasa://setup?data={urllib.parse.quote(final_payload)}"
-            # v1 payloads are standard base64 ('+', '/', '=') so must be percent-encoded.
-            universal_link = f"{UNIVERSAL_LINK_SETUP_URL}?d={urllib.parse.quote(final_payload, safe='')}"
+            deep_link, universal_link = build_links(final_payload, 1)
         else:
             # v2: JSON profile, hybrid encryption (AES-256-GCM body + RSA-wrapped key), base64url.
             # No size cap, '|' is no longer a delimiter, and fields are named instead of positional.
             profile = {
                 "v": 2,
+                "server_version": CASA_VERSION,
                 "server_url": str(final_server_url),
                 "username": str(login_username),
                 "password": str(login_password),
@@ -3548,9 +3568,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 except Exception as e:
                     _LOGGER.error("CASA ERROR: Failed to encrypt v2 payload. Error: %s", str(e))
                     return {"error": "Encryption failed"}
-            deep_link = f"hascasa://setup?data={final_payload}"
-            # v2 payloads are padding-stripped base64url — already URL-safe.
-            universal_link = f"{UNIVERSAL_LINK_SETUP_URL}?d={final_payload}"
+            deep_link, universal_link = build_links(final_payload, 2)
 
         # Setup method-specific fields
         delete_qr = False

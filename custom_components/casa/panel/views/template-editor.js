@@ -111,6 +111,7 @@ export function createView(app) {
   function currentPreview() {
     return previewMod.buildV2PayloadPreview(state.form, {
       siteId: app.summary()?.site_id,
+      serverVersion: app.summary()?.version,
       wgProfiles,
     });
   }

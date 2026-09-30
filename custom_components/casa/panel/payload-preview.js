@@ -56,7 +56,7 @@ function normalizePush(val) {
 // receives).
 //   fields: a fields object — effective values or a template's sparse fields;
 //     absent keys fall back the same way the server's get_field does
-//   ctx: { siteId?, wgProfiles? }  wgProfiles: [{ id, alias, excluded_wifi }]
+//   ctx: { siteId?, serverVersion?, locationZones?, wgProfiles? }  wgProfiles: [{ id, alias, excluded_wifi }]
 export function buildV2PayloadPreview(fields, ctx = {}) {
   const f = fields || {};
 
@@ -83,6 +83,7 @@ export function buildV2PayloadPreview(fields, ctx = {}) {
 
   return {
     v: 2,
+    server_version: ctx.serverVersion || "(this server's version)",
     server_url: trimStr(f.host_url) || "(host URL required)",
     username: trimStr(f.username) || "(entered at provision)",
     password: trimStr(f.password) || "(auto-generated at provision)",
@@ -98,6 +99,7 @@ export function buildV2PayloadPreview(fields, ctx = {}) {
     cache_control_hours: String(f.cache_control_hours ?? ""),
     allowed_pages: toBool(f.allow_all_pages) ? "/*" : normalizeCsv(f.allowed_pages),
     allowed_wifi: normalizeCsv(f.allowed_wifi),
+    require_alias: toBool(f.require_alias),
     push_notifications: normalizePush(f.push_notifications),
     wireguard: {
       allowed: toBool(f.allow_wireguard),
@@ -108,6 +110,7 @@ export function buildV2PayloadPreview(fields, ctx = {}) {
       ssid: trimStr(f.connect_wifi_ssid),
       password: trimStr(f.connect_wifi_password),
     },
+    ...(ctx.locationZones ? { location_zones: ctx.locationZones } : {}),
   };
 }
 
