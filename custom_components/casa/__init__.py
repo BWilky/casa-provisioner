@@ -26,7 +26,7 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import CASA_VERSION, DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_URLS, RELAY_REGISTER_SITE_URL, RELAY_VERIFY_SITE_URL, RELAY_UNREGISTER_URL, RELAY_RECONCILE_URL, RELAY_REMOVE_SITE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
+from .const import CASA_VERSION, DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_BASE_URL, CONF_RELAY_BASE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
 from .location import (
     ALLOWED_REASONS,
     ALLOWED_REPORT_KEYS,
@@ -178,6 +178,38 @@ def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
     return None
 
 
+def relay_url(hass, path: str) -> str:
+    """Absolute relay URL for path, honouring the per-site relay_base_url option."""
+    base = RELAY_BASE_URL
+    entry = (hass.data.get(DOMAIN) or {}).get("config_entry")
+    if entry is not None:
+        configured = str((entry.options or {}).get(CONF_RELAY_BASE_URL, "") or "").strip()
+        if configured:
+            base = configured
+    return base.rstrip("/") + "/" + path.lstrip("/")
+
+
+async def _probe_relay(hass) -> None:
+    """Record the relay's version/protocol from GET /health; never blocks setup."""
+    data = hass.data[DOMAIN]
+    data["relay_version"] = None
+    data["relay_protocol"] = None
+    try:
+        session = async_get_clientsession(hass)
+        async with session.get(relay_url(hass, "/health"), timeout=ClientTimeout(total=5)) as resp:
+            body = await resp.json(content_type=None)
+        data["relay_version"] = body.get("version")
+        data["relay_protocol"] = body.get("protocol")
+    except Exception as err:
+        _LOGGER.debug("CASA: relay /health probe failed: %s", err)
+        return
+    if data["relay_protocol"] not in (None, 1):
+        _LOGGER.warning(
+            "CASA: relay reports protocol %s; this integration knows protocol 1.",
+            data["relay_protocol"],
+        )
+
+
 async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
     """Register this HA instance's site with the relay and persist the issued site_key.
 
@@ -196,7 +228,7 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
 
         try:
             async with session.post(
-                RELAY_REGISTER_SITE_URL,
+                relay_url(hass, "/register_site"),
                 json={"site_id": site_id},
                 timeout=ClientTimeout(total=10),
             ) as resp:
@@ -250,7 +282,7 @@ async def _ensure_site_registration(hass: HomeAssistant, stored_data: dict, stor
     session = async_get_clientsession(hass)
     try:
         async with session.post(
-            RELAY_VERIFY_SITE_URL,
+            relay_url(hass, "/verify_site"),
             json={"site_id": stored_data.get("site_id"), "site_key": stored_data.get("site_key")},
             timeout=ClientTimeout(total=10),
         ) as resp:
@@ -1286,6 +1318,8 @@ class CasaAdminSummaryView(HomeAssistantView):
         from .const import CASA_VERSION
         return self.json({
             "version": CASA_VERSION,
+            "relay_version": self.hass.data[DOMAIN].get("relay_version"),
+            "relay_protocol": self.hass.data[DOMAIN].get("relay_protocol"),
             "location_config_version": self.hass.data.get(DOMAIN, {}).get("lz_data", {}).get("config_version", ""),
             "site_id": stored_data.get("site_id"),
             "device_key_id": _device_key_id(device_key) if device_key else None,
@@ -1605,6 +1639,7 @@ class CasaAdminDeviceView(HomeAssistantView):
             created_by = user.name or user.id
             payload = {"profile_id": None, "name": "Custom device settings", "fields": fields}
             _update_id, pushed, _skipped = await _enqueue_and_push_update(
+                self.hass,
                 stored_data, qu_data, session, device_id, device_info,
                 "profile", "update", payload, created_by, send_push=True,
             )
@@ -1614,7 +1649,7 @@ class CasaAdminDeviceView(HomeAssistantView):
             # pattern in CasaAdminQueueUpdateView — spares the relay's small
             # per-device burst budget).
             if not pushed:
-                await _nudge_device_checkin(session, stored_data, device_info)
+                await _nudge_device_checkin(self.hass, session, stored_data, device_info)
 
         # Save store
         store = self.hass.data[DOMAIN]["store"]
@@ -2152,22 +2187,22 @@ class CasaProfileUpdatesView(HomeAssistantView):
         return self.json({"status": "ok", "remaining": len(remaining)})
 
 
-async def _send_push_to_relay(session, payload) -> bool:
-    for url in RELAY_URLS:
-        try:
-            async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    return True
-                text = await resp.text()
-                _LOGGER.warning("CASA: Relay %s returned %s for push: %s", url, resp.status, text)
-                if resp.status < 500:
-                    return False
-        except Exception as err:
-            _LOGGER.warning("CASA: Failed to reach relay %s for push: %s", url, err)
+async def _send_push_to_relay(hass, session, payload) -> bool:
+    url = relay_url(hass, "/send")
+    try:
+        async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                return True
+            text = await resp.text()
+            _LOGGER.warning("CASA: Relay %s returned %s for push: %s", url, resp.status, text)
+            if resp.status < 500:
+                return False
+    except Exception as err:
+        _LOGGER.warning("CASA: Failed to reach relay %s for push: %s", url, err)
     return False
 
 
-async def _nudge_device_checkin(session, stored_data, device_info, command="request_heartbeat"):
+async def _nudge_device_checkin(hass, session, stored_data, device_info, command="request_heartbeat"):
     """Best-effort, content-free silent push asking a device to check in
     (heartbeat) right away instead of waiting for its next scheduled tick.
     The actual state change already lives durably (qu_data queue /
@@ -2190,10 +2225,10 @@ async def _nudge_device_checkin(session, stored_data, device_info, command="requ
         "priority": 5,
         "data": {"command": command},
     }
-    return await _send_push_to_relay(session, payload)
+    return await _send_push_to_relay(hass, session, payload)
 
 
-async def _send_encrypted_update_push(stored_data, session, device_id, device_info, update_id, update_type, action, payload) -> bool:
+async def _send_encrypted_update_push(hass, stored_data, session, device_id, device_info, update_id, update_type, action, payload) -> bool:
     """Deliver an already-queued update over an encrypted silent push.
     Returns False (without raising) when the device has no push_token /
     device_key or encryption fails — the durable queue still delivers."""
@@ -2207,7 +2242,7 @@ async def _send_encrypted_update_push(stored_data, session, device_id, device_in
     except Exception as e:
         _LOGGER.error("CASA ERROR: Failed to encrypt queued update for device '%s': %s", device_id, e)
         return False
-    return await _send_push_to_relay(session, {
+    return await _send_push_to_relay(hass, session, {
         "target": push_token,
         "site_id": stored_data.get("site_id"),
         "site_key": stored_data.get("site_key"),
@@ -2225,7 +2260,7 @@ async def _send_encrypted_update_push(stored_data, session, device_id, device_in
     })
 
 
-async def _enqueue_and_push_update(stored_data, qu_data, session, device_id, device_info, update_type, action, payload, created_by, send_push=True):
+async def _enqueue_and_push_update(hass, stored_data, qu_data, session, device_id, device_info, update_type, action, payload, created_by, send_push=True):
     """Enqueue a durable update for a device and optionally deliver it via an
     encrypted silent push. Used by CasaAdminDeviceView's "Force Device
     Changes" (single-device off-profile pushes); bulk template applies go
@@ -2242,7 +2277,7 @@ async def _enqueue_and_push_update(stored_data, qu_data, session, device_id, dev
         if not device_info.get("push_token") or not stored_data.get("device_key"):
             skipped = True
         else:
-            pushed = await _send_encrypted_update_push(stored_data, session, device_id, device_info, update_id, update_type, action, payload)
+            pushed = await _send_encrypted_update_push(hass, stored_data, session, device_id, device_info, update_id, update_type, action, payload)
     return update_id, pushed, skipped
 
 
@@ -2256,7 +2291,7 @@ async def _deliver_updates_in_background(hass, stored_data, jobs, update_type, a
     pushed = notified = 0
     for device_id, device_info, update_id in jobs:
         if send_update_push:
-            ok = await _send_encrypted_update_push(stored_data, session, device_id, device_info, update_id, update_type, action, payload)
+            ok = await _send_encrypted_update_push(hass, stored_data, session, device_id, device_info, update_id, update_type, action, payload)
             if ok:
                 pushed += 1
             else:
@@ -2264,11 +2299,11 @@ async def _deliver_updates_in_background(hass, stored_data, jobs, update_type, a
                 # delivery accelerator, and the relay's per-device rate limit
                 # has a small burst budget; a redundant nudge here can starve
                 # the visible notify push below.
-                await _nudge_device_checkin(session, stored_data, device_info)
+                await _nudge_device_checkin(hass, session, stored_data, device_info)
         if notify_push and title and message:
             push_token = device_info.get("push_token")
             if push_token:
-                ok = await _send_push_to_relay(session, {
+                ok = await _send_push_to_relay(hass, session, {
                     "target": push_token,
                     "site_id": stored_data.get("site_id"),
                     "site_key": stored_data.get("site_key"),
@@ -2662,12 +2697,13 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
             else:
                 session = async_get_clientsession(hass)
                 pushed = await _send_encrypted_update_push(
+                    hass,
                     stored_data, session, device_id, device_info,
                     update_id, "auth", "reauthenticate",
                     {"username": login_username, "password": login_password},
                 )
                 if not pushed:
-                    await _nudge_device_checkin(session, stored_data, device_info)
+                    await _nudge_device_checkin(hass, session, stored_data, device_info)
 
         _LOGGER.info(
             "CASA: Queued reauthentication of device '%s' from user '%s' to '%s' by %s (pushed=%s skipped=%s scrambled_old=%s).",
@@ -2725,7 +2761,7 @@ class CasaAdminRegenerateKeyView(HomeAssistantView):
         session = async_get_clientsession(self.hass)
         for udata in stored_data.get("users", {}).values():
             for dinfo in udata.get("devices", {}).values():
-                await _nudge_device_checkin(session, stored_data, dinfo)
+                await _nudge_device_checkin(self.hass, session, stored_data, dinfo)
 
         return self.json({"status": "ok", "device_key_id": key_id})
 
@@ -2741,6 +2777,7 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN]["config_entry"] = entry
     hass.data[DOMAIN].setdefault("timers", {})
     hass.data[DOMAIN].setdefault("listeners", {})
 
@@ -2757,6 +2794,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register the site with the relay once, verifying stored credentials against
     # the relay so a stale site_key (relay lost the site) self-heals at startup.
     await _ensure_site_registration(hass, stored_data, store)
+    await _probe_relay(hass)
 
     # Site-wide device_key: a 256-bit secret (64 hex chars) shared with provisioned
     # devices over the authenticated heartbeat and used to encrypt push payloads. It
@@ -4410,22 +4448,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             async def send_post(tok=push_token, data_payload=dict(payload)):
                 async with sem:
                     success = False
-                    for url in RELAY_URLS:
-                        try:
-                            _LOGGER.info("CASA: Posting payload to relay %s", url)
-                            async with session.post(url, json=data_payload, timeout=ClientTimeout(total=10)) as response:
-                                if response.status == 200:
-                                    _LOGGER.info("CASA: Notification successfully sent to token %s... via %s", tok[:10], url)
-                                    success = True
-                                    break
-                                
+                    url = relay_url(hass, "/send")
+                    try:
+                        _LOGGER.info("CASA: Posting payload to relay %s", url)
+                        async with session.post(url, json=data_payload, timeout=ClientTimeout(total=10)) as response:
+                            if response.status == 200:
+                                _LOGGER.info("CASA: Notification successfully sent to token %s... via %s", tok[:10], url)
+                                success = True
+                            else:
                                 text = await response.text()
                                 _LOGGER.warning("CASA: Relay %s returned status %s for token %s...: %s", url, response.status, tok[:10], text)
-                                if response.status < 500:
-                                    # Client-side error (4xx): don't attempt failover since it's a validation error
-                                    break
-                        except Exception as err:
-                            _LOGGER.warning("CASA: Failed to connect to relay %s for token %s...: %s", url, tok[:10], err)
+                    except Exception as err:
+                        _LOGGER.warning("CASA: Failed to connect to relay %s for token %s...: %s", url, tok[:10], err)
                     
                     if not success:
                         _LOGGER.error("CASA: Failed to send notification to token %s... after trying all relays", tok[:10])
@@ -4500,19 +4534,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
         success = False
-        for url in RELAY_URLS:
-            try:
-                _LOGGER.info("CASA: Posting reload payload to relay %s", url)
-                async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        _LOGGER.info("CASA: Reload command successfully sent to token %s... via %s", push_token[:10], url)
-                        success = True
-                        break
-                    
+        url = relay_url(hass, "/send")
+        try:
+            _LOGGER.info("CASA: Posting reload payload to relay %s", url)
+            async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    _LOGGER.info("CASA: Reload command successfully sent to token %s... via %s", push_token[:10], url)
+                    success = True
+                else:
                     text = await response.text()
                     _LOGGER.warning("CASA: Relay %s returned status %s: %s", url, response.status, text)
-            except Exception as err:
-                _LOGGER.warning("CASA: Failed to connect to relay %s: %s", url, err)
+        except Exception as err:
+            _LOGGER.warning("CASA: Failed to connect to relay %s: %s", url, err)
 
         if not success:
             raise HomeAssistantError("Failed to deliver reload command to any Casa push relay.")
@@ -4541,7 +4574,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
         session = async_get_clientsession(hass)
-        success = await _nudge_device_checkin(session, stored_data, device_info, command="request_profile_report")
+        success = await _nudge_device_checkin(hass, session, stored_data, device_info, command="request_profile_report")
         if not success:
             raise HomeAssistantError("Failed to deliver profile report request to any Casa push relay.")
 
@@ -4571,7 +4604,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
         session = async_get_clientsession(hass)
-        success = await _nudge_device_checkin(session, stored_data, device_info, command="request_heartbeat")
+        success = await _nudge_device_checkin(hass, session, stored_data, device_info, command="request_heartbeat")
         if not success:
             raise HomeAssistantError("Failed to deliver heartbeat request to any Casa push relay.")
 
@@ -4618,7 +4651,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             device_id, "permanent" if value == 0 else value
         )
         session = async_get_clientsession(hass)
-        await _nudge_device_checkin(session, stored_data, device_info)
+        await _nudge_device_checkin(hass, session, stored_data, device_info)
         return {"status": "success", "device_id": device_id, "expires_at_override": value}
 
     async def handle_deprovision_device(call: ServiceCall):
@@ -4655,7 +4688,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "CASA: Sending silent deprovision push to device '%s' of user '%s'. Target: %s",
                 device_id, username or "Unknown", push_token[:10] + "..."
             )
-            push_sent = await _send_push_to_relay(session, payload)
+            push_sent = await _send_push_to_relay(hass, session, payload)
             if not push_sent:
                 _LOGGER.warning(
                     "CASA: Deprovision push for device '%s' was not delivered; device will be wiped lazily on next contact.",
@@ -4825,7 +4858,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 },
             }
 
-            success = await _send_push_to_relay(session, payload)
+            success = await _send_push_to_relay(hass, session, payload)
 
             if success:
                 sent_count += 1
@@ -4921,7 +4954,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         session = async_get_clientsession(hass)
         try:
             async with session.post(
-                RELAY_RECONCILE_URL,
+                relay_url(hass, "/reconcile"),
                 json={"site_id": site_id, "site_key": site_key},
                 timeout=ClientTimeout(total=15),
             ) as resp:
@@ -4961,7 +4994,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for tok in orphaned:
             try:
                 async with session.post(
-                    RELAY_UNREGISTER_URL,
+                    relay_url(hass, "/unregister"),
                     json={"proxy_token": tok},
                     timeout=ClientTimeout(total=10),
                 ) as r:
@@ -5015,7 +5048,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if old_site_id and old_site_key:
             try:
                 async with session.post(
-                    RELAY_REMOVE_SITE_URL,
+                    relay_url(hass, "/remove_site"),
                     json={"site_id": old_site_id, "site_key": old_site_key},
                     timeout=ClientTimeout(total=15),
                 ) as resp:
@@ -5083,7 +5116,7 @@ async def _unregister_relay_token(hass: HomeAssistant, proxy_token: str, device_
     try:
         session = async_get_clientsession(hass)
         async with session.post(
-            RELAY_UNREGISTER_URL,
+            relay_url(hass, "/unregister"),
             json={"proxy_token": proxy_token},
             timeout=ClientTimeout(total=10),
         ) as resp:
@@ -5254,7 +5287,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         if site_id and site_key:
             try:
                 async with session.post(
-                    RELAY_REMOVE_SITE_URL,
+                    relay_url(hass, "/remove_site"),
                     json={"site_id": site_id, "site_key": site_key},
                     timeout=ClientTimeout(total=15),
                 ) as resp:

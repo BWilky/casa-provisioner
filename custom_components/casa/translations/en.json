@@ -8,7 +8,8 @@
         "data": {
           "admin_system_only": "Admin / System context only (restrict direct service calls by non-admins)",
           "create_devices": "Create Home Assistant device entries for provisioned devices",
-          "show_panel": "Add the Casa admin dashboard to the sidebar"
+          "show_panel": "Add the Casa admin dashboard to the sidebar",
+          "relay_base_url": "Push relay base URL"
         }
       }
     },
@@ -24,7 +25,8 @@
         "data": {
           "admin_system_only": "Admin / System context only (restrict direct service calls by non-admins)",
           "create_devices": "Create Home Assistant device entries for provisioned devices",
-          "show_panel": "Add the Casa admin dashboard to the sidebar"
+          "show_panel": "Add the Casa admin dashboard to the sidebar",
+          "relay_base_url": "Push relay base URL"
         }
       }
     }

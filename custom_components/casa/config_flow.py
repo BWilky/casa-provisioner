@@ -1,7 +1,7 @@
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, CONF_CREATE_DEVICES, CONF_SHOW_PANEL
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, CONF_RELAY_BASE_URL, RELAY_BASE_URL
 
 class CasaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Casa."""
@@ -25,6 +25,7 @@ class CasaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_ADMIN_SYSTEM_ONLY, default=True): bool,
                 vol.Required(CONF_CREATE_DEVICES, default=True): bool,
                 vol.Required(CONF_SHOW_PANEL, default=False): bool,
+                vol.Optional(CONF_RELAY_BASE_URL, default=RELAY_BASE_URL): str,
             })
         )
 
@@ -113,6 +114,10 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
                     CONF_SHOW_PANEL,
                     default=self.config_entry.options.get(CONF_SHOW_PANEL, False)
                 ): bool,
+                vol.Optional(
+                    CONF_RELAY_BASE_URL,
+                    default=self.config_entry.options.get(CONF_RELAY_BASE_URL, RELAY_BASE_URL)
+                ): str,
             }),
             description_placeholders={
                 "site_id": site_id,

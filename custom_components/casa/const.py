@@ -88,15 +88,7 @@ PROFILE_PROVISIONING_FIELDS = {
 }
 
 RELAY_BASE_URL = "https://push.bonjour.casa"
-RELAY_REGISTER_SITE_URL = f"{RELAY_BASE_URL}/register_site"
-RELAY_VERIFY_SITE_URL = f"{RELAY_BASE_URL}/verify_site"
-RELAY_UNREGISTER_URL = f"{RELAY_BASE_URL}/unregister"
-RELAY_RECONCILE_URL = f"{RELAY_BASE_URL}/reconcile"
-RELAY_REMOVE_SITE_URL = f"{RELAY_BASE_URL}/remove_site"
-
-RELAY_URLS = [
-    f"{RELAY_BASE_URL}/send",
-]
+CONF_RELAY_BASE_URL = "relay_base_url"
 
 # Universal (https) links open the app via its applinks:bonjour.casa entitlement.
 # Requires bonjour.casa to serve /.well-known/apple-app-site-association covering /setup.

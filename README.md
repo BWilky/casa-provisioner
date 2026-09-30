@@ -16,6 +16,7 @@ Home Assistant custom integration for provisioning and managing [Casa](https://b
 | Admin / System Only | `true` | Restrict service calls to admin users and automations |
 | Create Devices | `true` | Register Casa devices in the HA Device Registry |
 | Show Panel | `false` | Add the **Casa** admin panel to the sidebar (admin users only) |
+| Relay Base URL (`relay_base_url`) | `https://push.bonjour.casa` | The push relay this site talks to. Point it at a local or staging relay to test relay changes without touching production; reload the integration after changing it. |
 | Regenerate Site ID | — | Regenerates both the site ID and site key (breaks existing push registrations) |
 
 ---
