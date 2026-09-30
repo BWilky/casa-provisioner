@@ -10,11 +10,17 @@
           "create_devices": "Create Home Assistant device entries for provisioned devices",
           "show_panel": "Add the Casa admin dashboard to the sidebar",
           "relay_base_url": "Push relay base URL"
+        },
+        "data_description": {
+          "relay_base_url": "Phones still register with the production relay until the app learns this URL; use only for testing pushes from a lab relay."
         }
       }
     },
     "abort": {
       "single_instance_allowed": "Casa is already installed. Only one instance is permitted."
+    },
+    "error": {
+      "invalid_relay_url": "Enter an https:// URL, or an http:// URL only for localhost, a private LAN address (10.x, 172.16-31.x, 192.168.x) or a .local host. Leave blank for the default relay."
     }
   },
   "options": {
@@ -27,8 +33,14 @@
           "create_devices": "Create Home Assistant device entries for provisioned devices",
           "show_panel": "Add the Casa admin dashboard to the sidebar",
           "relay_base_url": "Push relay base URL"
+        },
+        "data_description": {
+          "relay_base_url": "Phones still register with the production relay until the app learns this URL; use only for testing pushes from a lab relay."
         }
       }
+    },
+    "error": {
+      "invalid_relay_url": "Enter an https:// URL, or an http:// URL only for localhost, a private LAN address (10.x, 172.16-31.x, 192.168.x) or a .local host. Leave blank for the default relay."
     }
   }
 }

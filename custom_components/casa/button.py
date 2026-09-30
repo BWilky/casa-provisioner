@@ -109,8 +109,7 @@ class CasaDeviceReloadButton(ButtonEntity):
 
         # Trigger reload via push relay
         from homeassistant.helpers.aiohttp_client import async_get_clientsession
-        from aiohttp import ClientTimeout
-        from .const import RELAY_URLS
+        from . import _send_push_to_relay
 
         session = async_get_clientsession(self.hass)
         
@@ -128,21 +127,10 @@ class CasaDeviceReloadButton(ButtonEntity):
             self.device_id, self.username, push_token[:10] + "..."
         )
 
-        success = False
-        for url in RELAY_URLS:
-            try:
-                _LOGGER.info("CASA: Posting reload payload to relay %s", url)
-                async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        _LOGGER.info("CASA: Reload command successfully sent to token %s... via %s", push_token[:10], url)
-                        success = True
-                        break
-                    
-                    text = await response.text()
-                    _LOGGER.warning("CASA: Relay %s returned status %s: %s", url, response.status, text)
-            except Exception as err:
-                _LOGGER.warning("CASA: Failed to connect to relay %s: %s", url, err)
+        success = await _send_push_to_relay(self.hass, session, payload)
+        if success:
+            _LOGGER.info("CASA: Reload command successfully sent to token %s...", push_token[:10])
 
         if not success:
             from homeassistant.exceptions import HomeAssistantError
-            raise HomeAssistantError("Failed to deliver reload command to any Casa push relay.")
+            raise HomeAssistantError("Failed to deliver reload command via the Casa push relay.")

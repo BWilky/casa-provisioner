@@ -19,3 +19,14 @@ def test_option_overrides():
 def test_trailing_slash_and_blank_are_normalised():
     assert relay_url(_hass("http://relay.local/"), "/send") == "http://relay.local/send"
     assert relay_url(_hass("   "), "/send") == "https://push.bonjour.casa/send"
+
+
+def test_explicit_entry_wins_without_hass_data():
+    entry = SimpleNamespace(options={"relay_base_url": "http://relay.local:9000"})
+    hass = SimpleNamespace(data={})
+    assert relay_url(hass, "/remove_site", entry) == "http://relay.local:9000/remove_site"
+
+
+def test_explicit_entry_wins_over_stored_entry():
+    entry = SimpleNamespace(options={"relay_base_url": "http://relay.local:9000"})
+    assert relay_url(_hass("http://10.0.0.1"), "/send", entry=entry) == "http://relay.local:9000/send"

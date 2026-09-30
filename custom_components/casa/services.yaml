@@ -199,7 +199,7 @@ provision:
           multiple: true
     password_scramble:
       name: "Scramble Password"
-      description: "If enabled, the password will be scrambled after the allotted time."
+      description: "If enabled, the password is scrambled on first redemption (the link works once), with the Scramble Password In timer as the fallback for links nobody uses. With method ble the timer alone scrambles it."
       default: true
       selector:
         boolean: {}
@@ -423,7 +423,7 @@ generate_qr:
         text: {}
     password_scramble:
       name: "Scramble Password"
-      description: "If enabled, the password will be scrambled after the allotted time."
+      description: "If enabled, the password is scrambled on first redemption (the link works once), with the Scramble Password In timer as the fallback for links nobody uses."
       default: true
       selector:
         boolean: {}
@@ -699,7 +699,7 @@ provision_ble_beacon:
           multiple: true
     password_scramble:
       name: "Scramble Password"
-      description: "If enabled, the password will be scrambled after the allotted time."
+      description: "If enabled, the password is scrambled when the Scramble Password In timer fires. BLE beacons are not scrambled on first redemption (that applies to QR, deep-link and manual provisioning), so the beacon is not stranded."
       default: true
       selector:
         boolean: {}

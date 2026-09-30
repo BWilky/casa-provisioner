@@ -95,3 +95,20 @@ def test_on_redeemed_error_is_logged_and_listener_returns(monkeypatch, caplog):
 
 async def _fast_sleep(_seconds):
     await _real_sleep(0)
+
+
+def test_poll_interval_rises_after_1800s(monkeypatch):
+    import custom_components.casa as casa
+    delays = []
+
+    async def recording_sleep(seconds):
+        delays.append(seconds)
+        await _real_sleep(0)
+
+    monkeypatch.setattr(casa.asyncio, "sleep", recording_sleep)
+    user = SimpleNamespace(id="u1", refresh_tokens={"t1": _Token("t1")})
+    hass = _FakeHass(user)
+    _run(_login_listener(hass, "alice", "u1", {"t1"}, 2000, "deep_link", on_redeemed=None))
+    assert delays[:900] == [2] * 900  # 2 s polls for the first 30 minutes
+    assert set(delays[900:]) == {10}  # then 10 s
+    assert sum(delays) >= 2000

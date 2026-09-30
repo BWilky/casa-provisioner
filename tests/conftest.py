@@ -84,6 +84,16 @@ def _install_homeassistant_stubs() -> None:
         StaticPathConfig=_Stub,
     )
     _ensure_module("homeassistant.components.frontend")
+    # button.py (entity platform) — imported by tests/test_no_stale_relay_constants.py
+    _ensure_module("homeassistant.components.button", ButtonEntity=_Stub)
+    _ensure_module(
+        "homeassistant.helpers.entity",
+        EntityCategory=types.SimpleNamespace(CONFIG="config", DIAGNOSTIC="diagnostic"),
+    )
+    _ensure_module(
+        "homeassistant.helpers.dispatcher",
+        async_dispatcher_connect=lambda *a, **kw: (lambda: None),
+    )
 
     try:
         import aiohttp  # noqa: F401

@@ -68,7 +68,11 @@ Keys are emitted in this order (the `profile` dict in `_provision_internal`).
 
 ## 6. Single use (26.09.30)
 
-When `password_scramble` is on, the login password in a link is scrambled on first redemption: the login listener fires `casa_code_redeemed`, then scrambles the password and stops listening, and the pending cleanup timer for that user is cancelled. A link is usable exactly once. The cleanup timer remains the fallback for links nobody redeems. With `password_scramble` off, the link stays multi-use until its window ends.
+When `password_scramble` is on, the login password in a link is scrambled on first redemption: the login listener fires `casa_code_redeemed`, then scrambles the password and stops listening. The pending cleanup timer for that user is NOT cancelled; it stays as the fallback for links nobody redeems, and when it fires it rotates the password a second time (harmless) and still wipes the QR file.
+
+Listener TTL: while single use is armed, the listener runs for the scramble window plus 30 s (`password_scramble_in`, or the scanning window when that is 0), capped at 24 h. It polls every 2 s for the first 30 minutes, then every 10 s. Without single use the listener keeps its 30-minute cap.
+
+BLE is excluded: for `method: ble` the password is not scrambled on redemption (a scrambled password would strand the beacon still broadcasting it); the timer alone scrambles it. With `password_scramble` off, the link stays multi-use until its window ends.
 
 ## 7. QR delivery (26.09.30)
 

@@ -1,7 +1,15 @@
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, CONF_RELAY_BASE_URL, RELAY_BASE_URL
+from .const import DOMAIN, CONF_ADMIN_SYSTEM_ONLY, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, CONF_RELAY_BASE_URL
+
+
+def _relay_url_errors(user_input) -> dict:
+    """Form errors for the relay_base_url field (blank = default relay)."""
+    from . import _validate_relay_base_url
+
+    error = _validate_relay_base_url((user_input or {}).get(CONF_RELAY_BASE_URL, ""))
+    return {CONF_RELAY_BASE_URL: error} if error else {}
 
 class CasaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Casa."""
@@ -14,9 +22,12 @@ class CasaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._async_current_entries():
             return self.async_abort(reason="single_instance_allowed")
 
+        errors = {}
         if user_input is not None:
-            # Create the config entry with the options saved
-            return self.async_create_entry(title="Casa", data={}, options=user_input)
+            errors = _relay_url_errors(user_input)
+            if not errors:
+                # Create the config entry with the options saved
+                return self.async_create_entry(title="Casa", data={}, options=user_input)
 
         # Show confirmation form with Admin / System Only option
         return self.async_show_form(
@@ -25,8 +36,9 @@ class CasaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_ADMIN_SYSTEM_ONLY, default=True): bool,
                 vol.Required(CONF_CREATE_DEVICES, default=True): bool,
                 vol.Required(CONF_SHOW_PANEL, default=False): bool,
-                vol.Optional(CONF_RELAY_BASE_URL, default=RELAY_BASE_URL): str,
-            })
+                vol.Optional(CONF_RELAY_BASE_URL, default=""): str,
+            }),
+            errors=errors,
         )
 
     @staticmethod
@@ -41,8 +53,11 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input=None):
         """Manage the options."""
+        errors = {}
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            errors = _relay_url_errors(user_input)
+            if not errors:
+                return self.async_create_entry(title="", data=user_input)
 
         stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data", {})
         site_id = stored_data.get("site_id", "Not Generated")
@@ -116,9 +131,10 @@ class CasaOptionsFlowHandler(config_entries.OptionsFlow):
                 ): bool,
                 vol.Optional(
                     CONF_RELAY_BASE_URL,
-                    default=self.config_entry.options.get(CONF_RELAY_BASE_URL, RELAY_BASE_URL)
+                    default=self.config_entry.options.get(CONF_RELAY_BASE_URL, "")
                 ): str,
             }),
+            errors=errors,
             description_placeholders={
                 "site_id": site_id,
                 "devices": devices_str

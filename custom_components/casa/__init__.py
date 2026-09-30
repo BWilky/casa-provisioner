@@ -178,15 +178,96 @@ def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
     return None
 
 
-def relay_url(hass, path: str) -> str:
-    """Absolute relay URL for path, honouring the per-site relay_base_url option."""
+def relay_base(hass, entry=None) -> str:
+    """Normalised relay base URL (no trailing slash) for this site.
+
+    entry: an explicit ConfigEntry whose options win (needed in
+    async_remove_entry, which runs after hass.data[DOMAIN] is gone); else the
+    stored config_entry; else the default RELAY_BASE_URL.
+    """
     base = RELAY_BASE_URL
-    entry = (hass.data.get(DOMAIN) or {}).get("config_entry")
+    if entry is None:
+        entry = (getattr(hass, "data", None) or {}).get(DOMAIN, {}).get("config_entry")
     if entry is not None:
         configured = str((entry.options or {}).get(CONF_RELAY_BASE_URL, "") or "").strip()
         if configured:
             base = configured
-    return base.rstrip("/") + "/" + path.lstrip("/")
+    return base.rstrip("/")
+
+
+def relay_url(hass, path: str, entry=None) -> str:
+    """Absolute relay URL for path, honouring the per-site relay_base_url option."""
+    return relay_base(hass, entry) + "/" + path.lstrip("/")
+
+
+_LAN_HOST_RE = re.compile(
+    r"^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|.+\.local)$"
+)
+
+
+def _validate_relay_base_url(value) -> str | None:
+    """Return the form error key for a relay_base_url option value, or None.
+
+    Blank means "use the default relay". https is always accepted; http only
+    for localhost, 127.x, RFC1918 (10.x, 172.16-31.x, 192.168.x) or *.local.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(text)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return "invalid_relay_url"
+    if not host:
+        return "invalid_relay_url"
+    if parsed.scheme == "https":
+        return None
+    if parsed.scheme == "http" and _LAN_HOST_RE.match(host):
+        return None
+    return "invalid_relay_url"
+
+
+def _relay_site_credentials(stored_data: dict, base: str) -> dict | None:
+    """The {site_id, site_key} issued by the relay at base, or None."""
+    entry = (stored_data.get("relay_sites") or {}).get(base)
+    return dict(entry) if entry else None
+
+
+def _set_relay_site_credentials(stored_data: dict, base: str, site_id, site_key) -> None:
+    stored_data.setdefault("relay_sites", {})[base] = {"site_id": site_id, "site_key": site_key}
+
+
+def _delete_relay_site_credentials(stored_data: dict, base: str) -> None:
+    (stored_data.get("relay_sites") or {}).pop(base, None)
+
+
+def _migrate_legacy_site_credentials(stored_data: dict, default_base: str) -> bool:
+    """Pre-26.09.30 stores hold one top-level site_id/site_key, issued by the
+    default relay. Move them under relay_sites[default_base] once.
+    Returns True when the store changed."""
+    if "relay_sites" in stored_data:
+        return False
+    stored_data["relay_sites"] = {}
+    if stored_data.get("site_id") and stored_data.get("site_key"):
+        _set_relay_site_credentials(
+            stored_data, default_base.rstrip("/"), stored_data["site_id"], stored_data["site_key"]
+        )
+    return True
+
+
+def _activate_relay_site(stored_data: dict, base: str) -> None:
+    """Mirror relay_sites[base] into the top-level site_id/site_key that the
+    rest of the integration reads. No entry for base -> no active credentials
+    (the site registers afresh with that relay; other bases are untouched)."""
+    creds = _relay_site_credentials(stored_data, base)
+    if creds:
+        stored_data["site_id"] = creds.get("site_id")
+        stored_data["site_key"] = creds.get("site_key")
+    else:
+        stored_data.pop("site_id", None)
+        stored_data.pop("site_key", None)
 
 
 async def _probe_relay(hass) -> None:
@@ -235,6 +316,9 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
                 if resp.status == 201:
                     data = await resp.json()
                     stored_data["site_key"] = data["site_key"]
+                    _set_relay_site_credentials(
+                        stored_data, relay_base(hass), site_id, data["site_key"]
+                    )
                     await store.async_save(stored_data)
                     _LOGGER.info("CASA: Registered site with relay; site_key persisted.")
                     return True
@@ -292,7 +376,10 @@ async def _ensure_site_registration(hass: HomeAssistant, stored_data: dict, stor
                 _LOGGER.warning(
                     "CASA: Relay does not recognize our site credentials (403); re-registering site."
                 )
+                # Only this relay's credentials are dropped; a key issued by
+                # another relay base (e.g. production) is never touched.
                 stored_data.pop("site_key", None)
+                _delete_relay_site_credentials(stored_data, relay_base(hass))
                 await store.async_save(stored_data)
                 await _register_site(hass, stored_data, store)
                 return
@@ -333,6 +420,8 @@ async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, me
         elapsed = 0
         poll_interval = 2
         while elapsed < ttl_seconds:
+            if elapsed >= 1800:
+                poll_interval = 10  # long single-use windows: back off after 30 min
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
 
@@ -968,7 +1057,7 @@ class CasaDeprovisionView(HomeAssistantView):
             return self.json({"error": "Device not found"}, status_code=404)
 
         # _purge_device persists the store itself.
-        result = await _purge_device(self.hass, device_id)
+        result = await _purge_device(self.hass, device_id, owner_user_id=user.id)
         _remove_registry_device(self.hass, device_id)
         _LOGGER.info(
             "CASA: Device '%s' self-deprovisioned by user '%s'.",
@@ -2791,10 +2880,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if stored_data is None:
         stored_data = {"users": {}}
 
+    # Site credentials are kept per relay base (relay_sites[base]); the
+    # top-level site_id/site_key mirror the active base's entry.
+    migrated = _migrate_legacy_site_credentials(stored_data, RELAY_BASE_URL)
+    _activate_relay_site(stored_data, relay_base(hass, entry))
+    if migrated:
+        await store.async_save(stored_data)
+
     # Register the site with the relay once, verifying stored credentials against
     # the relay so a stale site_key (relay lost the site) self-heals at startup.
     await _ensure_site_registration(hass, stored_data, store)
-    await _probe_relay(hass)
+    hass.async_create_task(_probe_relay(hass))
 
     # Site-wide device_key: a 256-bit secret (64 hex chars) shared with provisioned
     # devices over the authenticated heartbeat and used to encrypt push payloads. It
@@ -3800,15 +3896,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Start login listener to detect code redemption
         known_token_ids = set(target_user.refresh_tokens.keys())
-        if password_scramble and scramble_timeout_secs > 0:
-            listener_ttl = scramble_timeout_secs + 30
-        elif expiration_hours > 0:
-            listener_ttl = min(expiration_hours * 3600, 86400)
+        # Single use (scramble on first redemption) applies to every method but
+        # BLE: a scrambled password would strand a beacon still broadcasting it.
+        single_use = password_scramble and method != "ble"
+        if single_use and scramble_timeout_secs > 0:
+            # The listener must outlive the scramble window or a late first
+            # redemption would go unscrambled until the fallback timer.
+            listener_ttl = min(scramble_timeout_secs + 30, 86400)
         else:
-            listener_ttl = 300
-
-        # E4: Hard cap listener TTL to 30 minutes (1800 seconds)
-        listener_ttl = min(listener_ttl, 1800)
+            if password_scramble and scramble_timeout_secs > 0:
+                listener_ttl = scramble_timeout_secs + 30
+            elif expiration_hours > 0:
+                listener_ttl = min(expiration_hours * 3600, 86400)
+            else:
+                listener_ttl = 300
+            # E4: Hard cap listener TTL to 30 minutes (1800 seconds)
+            listener_ttl = min(listener_ttl, 1800)
 
         if target_username in hass.data[DOMAIN]["listeners"]:
             hass.data[DOMAIN]["listeners"][target_username].cancel()
@@ -3822,7 +3925,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         listener_task = hass.async_create_task(
             _login_listener(
                 hass, login_username, target_user.id, known_token_ids, listener_ttl, method,
-                on_redeemed=_on_redeemed if password_scramble else None,
+                on_redeemed=_on_redeemed if single_use else None,
             )
         )
         hass.data[DOMAIN]["listeners"][target_username] = listener_task
@@ -4321,7 +4424,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "is_active": ha_user.is_active,
                         "is_admin": getattr(ha_user, "is_admin", False),
                         "local_only": getattr(ha_user, "local_only", False),
-                        "group_ids": ha_user.groups,
+                        "group_ids": [g.id for g in ha_user.groups],
                     })
 
             result_users.append(user_info)
@@ -5060,6 +5163,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         stored_data.pop("site_id", None)
         stored_data.pop("site_key", None)
+        _delete_relay_site_credentials(stored_data, relay_base(hass))
         ok = await _register_site(hass, stored_data, store)
         return {"success": bool(ok), "site_id": stored_data.get("site_id")}
 
@@ -5147,42 +5251,51 @@ def _remove_registry_device(hass: HomeAssistant, device_id: str) -> None:
         _LOGGER.warning("CASA: Failed to remove device '%s' from the HA device registry: %s", device_id, err)
 
 
-async def _purge_device(hass: HomeAssistant, device_id: str) -> dict:
+def _pop_device_record(stored_data: dict, device_id: str, owner_user_id=None):
+    """Locate and pop a device record from storage.
+
+    With owner_user_id, only that user's managed devices and native devices are
+    searched (so a stale duplicate under another, e.g. deleted, user is never
+    popped in its place). Without it, the first match wins (managed users, then
+    native) — the legacy behaviour admin services rely on.
+    Returns (owner_user_id | None, device_info | None, username).
+    """
+    users = stored_data.get("users", {})
+    natives = stored_data.get("native_devices", {})
+    if owner_user_id is not None:
+        managed = [(owner_user_id, users[owner_user_id])] if owner_user_id in users else []
+        native = [(owner_user_id, natives[owner_user_id])] if owner_user_id in natives else []
+    else:
+        managed = list(users.items())
+        native = list(natives.items())
+
+    for uid, udata in managed:
+        devices = udata.get("devices", {})
+        if device_id in devices:
+            return uid, devices.pop(device_id), udata.get("username", uid)
+    for uid, devices in native:
+        if device_id in devices:
+            return uid, devices.pop(device_id), uid
+    return None, None, "Unknown"
+
+
+async def _purge_device(hass: HomeAssistant, device_id: str, owner_user_id=None) -> dict:
     """Remove a device's server-side footprint.
 
     Pops the record from storage (managed and native maps), unregisters the proxy
     token from the relay, revokes the device's HA refresh token, and drops any
     queued updates. Network/auth steps are best-effort.
+    owner_user_id: when given, only that user's record is purged (the device
+    self-deprovision path); None keeps first-match behaviour (admin services).
     Returns {"found", "username", "push_token", "access_revoked"}.
     """
     stored_data = hass.data[DOMAIN]["stored_data"]
     store = hass.data[DOMAIN]["store"]
 
-    owner_user_id = None
-    refresh_token_id = None
-    proxy_token = None
-    username = "Unknown"
     access_revoked = False
-
-    for uid, udata in stored_data.get("users", {}).items():
-        devices = udata.get("devices", {})
-        if device_id in devices:
-            owner_user_id = uid
-            refresh_token_id = devices[device_id].get("refresh_token_id")
-            proxy_token = devices[device_id].get("push_token")
-            username = udata.get("username", uid)
-            devices.pop(device_id, None)
-            break
-
-    if owner_user_id is None:
-        for uid, devices in stored_data.get("native_devices", {}).items():
-            if device_id in devices:
-                owner_user_id = uid
-                refresh_token_id = devices[device_id].get("refresh_token_id")
-                proxy_token = devices[device_id].get("push_token")
-                username = uid
-                devices.pop(device_id, None)
-                break
+    owner_user_id, device_info, username = _pop_device_record(stored_data, device_id, owner_user_id)
+    refresh_token_id = (device_info or {}).get("refresh_token_id")
+    proxy_token = (device_info or {}).get("push_token")
 
     if owner_user_id is None:
         return {"found": False, "username": username, "push_token": None, "access_revoked": False}
@@ -5287,7 +5400,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
         if site_id and site_key:
             try:
                 async with session.post(
-                    relay_url(hass, "/remove_site"),
+                    relay_url(hass, "/remove_site", entry),
                     json={"site_id": site_id, "site_key": site_key},
                     timeout=ClientTimeout(total=15),
                 ) as resp:

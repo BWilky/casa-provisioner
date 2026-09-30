@@ -16,7 +16,7 @@ Home Assistant custom integration for provisioning and managing [Casa](https://b
 | Admin / System Only | `true` | Restrict service calls to admin users and automations |
 | Create Devices | `true` | Register Casa devices in the HA Device Registry |
 | Show Panel | `false` | Add the **Casa** admin panel to the sidebar (admin users only) |
-| Relay Base URL (`relay_base_url`) | `https://push.bonjour.casa` | The push relay this site talks to. Point it at a local or staging relay to test relay changes without touching production; reload the integration after changing it. |
+| Relay Base URL (`relay_base_url`) | blank (`https://push.bonjour.casa`) | The push relay this site talks to; blank uses the default. Must be `https://`, or `http://` only for localhost, private LAN addresses or `.local` hosts. Site credentials are kept per relay, so switching to a lab relay and back never discards the production site key. Phones still register with the production relay until the app learns this URL; use only for testing pushes from a lab relay. Reload the integration after changing it. |
 | Regenerate Site ID | — | Regenerates both the site ID and site key (breaks existing push registrations) |
 
 ---
@@ -89,7 +89,7 @@ Generates an encrypted provisioning payload. Supports four methods: `qr`, `ble`,
 |-------|---------|-------------|
 | `timeout_minutes` | `5` | QR/BLE scanning window in minutes. `0` = permanent |
 | `expiration_hours` | `336` | App session duration in hours (14 days). `0` = permanent |
-| `password_scramble` | `true` | Scramble the user's password after the window closes |
+| `password_scramble` | `true` | Scramble the user's password on first redemption (the link works once), with the `password_scramble_in` timer as the fallback for links nobody uses. BLE beacons scramble on the timer only |
 | `password_scramble_in` | `0` | Minutes until scramble. `0` = inherit from timeout |
 | `delete_qr_after_window` | `true` | Delete QR image file after timeout (QR only) |
 | `cache_control_hours` | — | Custom app asset cache duration (app defaults to 48h) |
