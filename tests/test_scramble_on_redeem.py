@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 
 from custom_components.casa import _login_listener
@@ -67,6 +68,29 @@ def test_without_callback_only_fires_event(monkeypatch):
 
     _run(scenario())
     assert len(hass.fired) == 1
+
+
+def test_on_redeemed_error_is_logged_and_listener_returns(monkeypatch, caplog):
+    import custom_components.casa as casa
+    monkeypatch.setattr(casa.asyncio, "sleep", _fast_sleep)
+    user = SimpleNamespace(id="u1", refresh_tokens={"t1": _Token("t1")})
+    hass = _FakeHass(user)
+
+    async def on_redeemed():
+        raise RuntimeError("boom")
+
+    async def scenario():
+        task = asyncio.ensure_future(
+            _login_listener(hass, "alice", "u1", {"t1"}, 10, "deep_link", on_redeemed=on_redeemed)
+        )
+        await _real_sleep(0)
+        user.refresh_tokens["t2"] = _Token("t2")
+        await task
+
+    with caplog.at_level(logging.ERROR):
+        _run(scenario())
+    assert [n for n, _ in hass.fired] == ["casa_code_redeemed"]
+    assert "on_redeemed for 'alice' failed" in caplog.text
 
 
 async def _fast_sleep(_seconds):

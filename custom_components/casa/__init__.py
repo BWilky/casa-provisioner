@@ -3766,11 +3766,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.data[DOMAIN]["listeners"][target_username].cancel()
 
         async def _on_redeemed():
-            # Single-use link: kill the password the moment it is used, and
-            # drop the fallback timer that would have done it later.
-            timer = hass.data[DOMAIN]["timers"].pop(target_username, None)
-            if timer:
-                timer.cancel()
+            # Single-use link: rotate the password the moment it is used. The
+            # fallback cleanup timer is left running: its later scramble is a
+            # harmless second rotation, and its QR-wipe step must still fire.
             await _scramble_and_close(hass, login_username, provider, target_username)
 
         listener_task = hass.async_create_task(
