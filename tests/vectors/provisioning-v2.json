@@ -1,0 +1,38 @@
+{
+  "note": "Throwaway test key pair. Regenerate with generate_vectors.py.",
+  "plaintext": {
+    "v": 2,
+    "server_version": "26.09.30",
+    "server_url": "http://192.0.2.10:8123",
+    "username": "vector-user",
+    "password": "vector-pass",
+    "site_id": "0123456789abcdef0123456789abcdef",
+    "pin": "1234",
+    "default_dashboard": "/lovelace/0",
+    "welcome_url": "",
+    "immersive_level": "1",
+    "theme_color_mode": "inherit",
+    "custom_color": "#000000",
+    "session_expiration": 0,
+    "expiration": 0,
+    "cache_control_hours": "48",
+    "allowed_pages": "/*",
+    "allowed_wifi": "",
+    "require_alias": false,
+    "push_notifications": "false",
+    "wireguard": {
+      "allowed": false,
+      "config": "",
+      "excluded_wifi": ""
+    },
+    "connect_wifi": {
+      "ssid": "",
+      "password": ""
+    }
+  },
+  "test_public_key_pem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnfSnXUK3mCWLjjCr3eaS\nzc4XaWTmSmuJixhJS3wwHafmccKY7l1NioPTwr+bQjnhDZmlP9kezcdG54jOfDbx\nGFdXyTjELB+/AU0JXnMNTGcUWuVRXkG0U8yczyIIyS6wYMxG4mCFQv3B+mzxeXS4\n97Reo91t6rYoGWB3qT1m9TNWgSsYIppRMocYXsZl+upZ0W7gOpnOGxEv1dwhCc+r\nlDwpRKNyScWoXiwy5LAGqL2lUqqSGW3zyCYHvPvCkVJbl9dmKNiikCcrHQd7hWiS\nwi6hbvs31xo3LeX+rHPodLmAcgSOLCnKFP7iIYkQYxCSHGAi9ZRpzkstoFQbHJYe\n4wIDAQAB\n-----END PUBLIC KEY-----\n",
+  "test_private_key_pem": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCd9KddQreYJYuO\nMKvd5pLNzhdpZOZKa4mLGElLfDAdp+ZxwpjuXU2Kg9PCv5tCOeENmaU/2R7Nx0bn\niM58NvEYV1fJOMQsH78BTQlecw1MZxRa5VFeQbRTzJzPIgjJLrBgzEbiYIVC/cH6\nbPF5dLj3tF6j3W3qtigZYHepPWb1M1aBKxgimlEyhxhexmX66lnRbuA6mc4bES/V\n3CEJz6uUPClEo3JJxaheLDLksAaovaVSqpIZbfPIJge8+8KRUluX12Yo2KKQJysd\nB3uFaJLCLqFu+zfXGjct5f6sc+h0uYByBI4sKcoU/uIhiRBjEJIcYCL1lGnOSy2g\nVBsclh7jAgMBAAECggEAFTqUY8xbsG8bWnjgIGqkwFQ6gUe2S7o4OiGBeEuwi8vN\nBO0KcL7JdRxSkZH+49+zh4hm1TXxFeb6eJPCbJ9Vt9fFTJ38f5GksiAQakk8OFCC\nQ9UeInTiL4EIci440BEeU2QhArvGLUK9l1KdAZ3WXjQ3o/5Wj3z71q1IZ86Az+No\nG2kCGEOaUPTRFgtcz+z+RlbV/PNfvJEmy/n5/C8tR+EFfESr+Iil1mIx2tvQSRkY\nfF063wMa53TGdytbLI19H6noyv+wKwAGaFDL9tKOaYLcJx6yNB2ui1Mf4W9kGs72\nl9Fo/bu1Zf6AA+MpHvtPVDK8uPUURa+3tMrr4YX8wQKBgQDfTtdiCaecMMBfXSx1\nQXPGRlWv1l1gY3HTaC/vkdY9Dv6HlUG78ciSKDe2ToBnem+qKsXmiveOElTnwN2S\n2V5lNYgtlcL8rOH2MQrDfEZhlbCF0GAL2etvpAoeSQNgA7MrLSUZeFcjGIentyFF\n1pST4i86WqrtYt/QEKUeQROqNwKBgQC1FIhVGfHvPGU9OYIkA9DYRW13bm1aa5Bh\n3BhfU+aOK4n5MJkLSxDl4CfdoaWmA3tGkJd/QVN214qAIbuIE8cJw/6GUyDzAUJg\nKO3yLPvoRzHpGybgG2nC2+N01WS/BNDQTixlJhWGnfNzFIPHskFyu2jrDjAE03h2\nTzNFCmxqtQKBgHkfD24KpJHwU3emVwXmkYBbCAEO+ajdZ5DucwmzhYuqxV4PFA94\nDn1QOR+2Jql53HVlK+BnQe0aflkR4FzVcADfb1SiZZedwhZB9X+guaAWjB+YrW/g\nLHZqeF6C5cS/XQAvRW8yObk8hd/vUanKwN4RkeJJ6WpG9fSqApWNYLgzAoGAJs0W\nhX3AvK2pV9wpycPTjXQbB7tuzTA9SOrbghm9Tnt/3hiOwr+8CDXm9PO9Rfx6/tze\nyZLa6p02/Uu9HmR2gt4vfOL1LXz4lxhOHFWNSPFwfW2m/+B/4hQyAgfzxYano+sM\nUkQ92pGf5+nebv0ATzBfQ/bPTUlvB5Li/olEP/0CgYAwNMdg2aYeQ0RQfaaG7Hja\nnl4CAdb7JpF1tXVjv6Xgjh1Krcv5mspObm1yBgvGKEao40WINqgQrujN/g1QcWFw\ndrAG4FjSpVRIWnGzqN+rWjQAGFtRyUF+xJNKsnD/gXlCnLneghrZCcUhnqUY9Z7A\n+m5hot9qg0X6H/8R+k9NTg==\n-----END PRIVATE KEY-----\n",
+  "envelope_b64url": "AgVCB8Gk4v_Z_E-Zo0dAWqx6N7sl8V7KVmPfPSzaDftOY3N11b9ihP4bcFqtrygjy9yMjxBHiMkLqyvEb3CqqAPfqObejaGwcBxBi7Db9NhQ8hP8NQMP80C4gcy6eaHhnZge0hiQ_nwAzmkqhScfB07bCNVOCXc5BnMoDeYP9dZW0E7I8w1kczyL4pGWLC0XBWxnecScLe7YBg1D5fmgWqRbLbuA5rq66WUDT5TXthM7mzfR2mMrtEITcIpFMQhK8UfB3QJW6WCbajDm6_3Ci-GrizOVzwuU3k2kIehxejS-A0DyLuQlRs9JLGeF0y8Ivc3CFjvXSxYgdKXkbYIP4dbKkwjPzGWEuE567lq3C0TifTlO9aCgKX1MtFFPRJDOuimEyxaEmrc59BDytUAURzJLd30ZcUuc_mp4XUAOtOAa7O_YhTOpYyv-yOV7odAZdI41OOzl5SEFM7CEYGbOmMMJ4_Qwqi2A-W5Ota76rkpURUaOKnanHUWbA2WQwma9uNo5XV-6llS0wLKeQXY2qyNDPomczry6lv-Qw_ogBMb4QRACaVVdXulMwJHPpixYwCc9ihqu_pS6ZMdtCxR06s6lTk5wdbMFyGOonbTpWRI9oP3BLo5Iy4FUWMEK4vcwj_hTyWc5n3xk-fz7Tav1WQCpEsjjxUiNYlXlKVitXQdf31Y0en-3DiLfCVh_RE8zFSXzVVSfOOkbJkUl0TtyQ5tgKkMBxwvN7Gsw39hI-w90WcdQUOlscDvxHjsGlvUXV0pcawc2f_9OjVVznVEfjWqpS5c",
+  "deep_link": "hascasa://setup?data=AgVCB8Gk4v_Z_E-Zo0dAWqx6N7sl8V7KVmPfPSzaDftOY3N11b9ihP4bcFqtrygjy9yMjxBHiMkLqyvEb3CqqAPfqObejaGwcBxBi7Db9NhQ8hP8NQMP80C4gcy6eaHhnZge0hiQ_nwAzmkqhScfB07bCNVOCXc5BnMoDeYP9dZW0E7I8w1kczyL4pGWLC0XBWxnecScLe7YBg1D5fmgWqRbLbuA5rq66WUDT5TXthM7mzfR2mMrtEITcIpFMQhK8UfB3QJW6WCbajDm6_3Ci-GrizOVzwuU3k2kIehxejS-A0DyLuQlRs9JLGeF0y8Ivc3CFjvXSxYgdKXkbYIP4dbKkwjPzGWEuE567lq3C0TifTlO9aCgKX1MtFFPRJDOuimEyxaEmrc59BDytUAURzJLd30ZcUuc_mp4XUAOtOAa7O_YhTOpYyv-yOV7odAZdI41OOzl5SEFM7CEYGbOmMMJ4_Qwqi2A-W5Ota76rkpURUaOKnanHUWbA2WQwma9uNo5XV-6llS0wLKeQXY2qyNDPomczry6lv-Qw_ogBMb4QRACaVVdXulMwJHPpixYwCc9ihqu_pS6ZMdtCxR06s6lTk5wdbMFyGOonbTpWRI9oP3BLo5Iy4FUWMEK4vcwj_hTyWc5n3xk-fz7Tav1WQCpEsjjxUiNYlXlKVitXQdf31Y0en-3DiLfCVh_RE8zFSXzVVSfOOkbJkUl0TtyQ5tgKkMBxwvN7Gsw39hI-w90WcdQUOlscDvxHjsGlvUXV0pcawc2f_9OjVVznVEfjWqpS5c",
+  "universal_link": "https://bonjour.casa/setup?d=AgVCB8Gk4v_Z_E-Zo0dAWqx6N7sl8V7KVmPfPSzaDftOY3N11b9ihP4bcFqtrygjy9yMjxBHiMkLqyvEb3CqqAPfqObejaGwcBxBi7Db9NhQ8hP8NQMP80C4gcy6eaHhnZge0hiQ_nwAzmkqhScfB07bCNVOCXc5BnMoDeYP9dZW0E7I8w1kczyL4pGWLC0XBWxnecScLe7YBg1D5fmgWqRbLbuA5rq66WUDT5TXthM7mzfR2mMrtEITcIpFMQhK8UfB3QJW6WCbajDm6_3Ci-GrizOVzwuU3k2kIehxejS-A0DyLuQlRs9JLGeF0y8Ivc3CFjvXSxYgdKXkbYIP4dbKkwjPzGWEuE567lq3C0TifTlO9aCgKX1MtFFPRJDOuimEyxaEmrc59BDytUAURzJLd30ZcUuc_mp4XUAOtOAa7O_YhTOpYyv-yOV7odAZdI41OOzl5SEFM7CEYGbOmMMJ4_Qwqi2A-W5Ota76rkpURUaOKnanHUWbA2WQwma9uNo5XV-6llS0wLKeQXY2qyNDPomczry6lv-Qw_ogBMb4QRACaVVdXulMwJHPpixYwCc9ihqu_pS6ZMdtCxR06s6lTk5wdbMFyGOonbTpWRI9oP3BLo5Iy4FUWMEK4vcwj_hTyWc5n3xk-fz7Tav1WQCpEsjjxUiNYlXlKVitXQdf31Y0en-3DiLfCVh_RE8zFSXzVVSfOOkbJkUl0TtyQ5tgKkMBxwvN7Gsw39hI-w90WcdQUOlscDvxHjsGlvUXV0pcawc2f_9OjVVznVEfjWqpS5c"
+}
