@@ -741,7 +741,7 @@ export function createView(app) {
     return `
       <div style="text-align:center; margin-bottom:16px;">
         <div class="muted" style="font-size:13px; margin-bottom:12px;">Scan with the Casa app, or send a setup link.</div>
-        <img src="${esc(r.url_path)}" alt="Provisioning QR code"
+        <img src="${esc(r.qr_data_uri || r.url_path)}" alt="Provisioning QR code"
           style="width:220px; height:220px; border:1px solid var(--casa-divider); border-radius:var(--casa-radius-sm); padding:12px; background:#fff;">
       </div>
       ${linkRow("Setup Deep Link", r.deep_link)}

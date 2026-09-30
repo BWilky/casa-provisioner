@@ -149,6 +149,14 @@ def build_links(payload: str, version: int) -> tuple[str, str]:
     raise ValueError(f"Unsupported payload version: {version}")
 
 
+def _qr_png_data_uri(text: str) -> str:
+    """Render text as a PNG QR and return it as a data: URI (no file on disk)."""
+    import io
+    buf = io.BytesIO()
+    qrcode.make(text).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 def _get_refresh_token_id_from_jwt(jwt_str: str) -> str:
     """Extract the refresh token id from a Home Assistant access token JWT.
 
@@ -3665,6 +3673,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             img.save(dashboard_path)
             return final_filename
 
+        qr_data_uri = None
         if method == "qr":
             delete_qr = service_data.get("delete_qr_after_window", True) if timeout_mins > 0 else False
             qr_filename_input = str(service_data.get("qr_filename", "")).strip()
@@ -3674,6 +3683,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 final_filename = f"qr_{login_username}_{int(time.time())}.png"
 
             await hass.async_add_executor_job(create_qr_images, deep_link)
+            qr_data_uri = await hass.async_add_executor_job(_qr_png_data_uri, deep_link)
             _LOGGER.info("CASA: QR Code saved as %s.", final_filename)
 
         if esphome_targets:
@@ -3815,6 +3825,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "method": "qr",
                 "filename": final_filename,
                 "url_path": f"/local/{final_filename}",
+                "url_path_deprecated": True,
+                "qr_data_uri": qr_data_uri,
                 "expires_at": expiration_unix,
                 "deep_link": deep_link,
                 "universal_link": universal_link
