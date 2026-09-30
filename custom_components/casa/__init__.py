@@ -295,6 +295,16 @@ def _find_device_record(stored_data: dict, device_id: str):
     return None, None, None
 
 
+def _device_owned_by(stored_data: dict, user_id: str, device_id: str) -> bool:
+    """True when device_id belongs to user_id (managed, not deleted; or native)."""
+    users = stored_data.get("users", {}) if stored_data else {}
+    entry = users.get(user_id)
+    if entry and not entry.get("deleted", False) and device_id in entry.get("devices", {}):
+        return True
+    native = stored_data.get("native_devices", {}) if stored_data else {}
+    return device_id in native.get(user_id, {})
+
+
 def _set_expiry_override(stored_data: dict, device_id: str, value):
     """Set or cancel a device's pending expiration override.
 
@@ -815,6 +825,47 @@ class CasaRegisterDeviceView(HomeAssistantView):
             return self.json({"status": "success"})
             
         return self.json({"error": "Device not found"}, status_code=404)
+
+
+class CasaDeprovisionView(HomeAssistantView):
+    """Device-initiated removal of its own record: POST /api/casa/deprovision.
+
+    Auth is the device's own HA session. The caller must own device_id;
+    anything else is 404 so other users' device ids are never confirmed.
+    Purges the record, unregisters the relay proxy token, revokes this
+    device's refresh token and queued updates. The HA user account stays.
+    """
+
+    url = "/api/casa/deprovision"
+    name = "api:casa:deprovision"
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user:
+            return self.json({"error": "Unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = str((body or {}).get("device_id", "")).strip()
+        if not device_id:
+            return self.json({"error": "Missing device_id"}, status_code=400)
+
+        stored_data = self.hass.data[DOMAIN]["stored_data"]
+        if not _device_owned_by(stored_data, user.id, device_id):
+            return self.json({"error": "Device not found"}, status_code=404)
+
+        # _purge_device persists the store itself.
+        result = await _purge_device(self.hass, device_id)
+        _remove_registry_device(self.hass, device_id)
+        _LOGGER.info(
+            "CASA: Device '%s' self-deprovisioned by user '%s'.",
+            device_id, result.get("username") or user.name or user.id,
+        )
+        return self.json({"status": "success", "access_revoked": bool(result.get("access_revoked"))})
 
 
 class CasaHeartbeatView(HomeAssistantView):
@@ -3042,6 +3093,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register the HTTP views
     hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
+    hass.http.register_view(CasaDeprovisionView(hass))
     hass.http.register_view(CasaHeartbeatView(hass, async_heartbeat))
     hass.http.register_view(CasaDeviceProfileReportView(hass))
     hass.http.register_view(CasaAdminSummaryView(hass))

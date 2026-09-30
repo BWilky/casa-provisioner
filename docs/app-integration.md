@@ -89,6 +89,23 @@ Removes the entries from the queue. Returns `{ "status": "ok", "remaining": <n> 
 
 ---
 
+## Self-deprovision — `POST /api/casa/deprovision` (26.09.30)
+
+Lets a device remove its own server-side record when the user signs out or resets the app.
+
+Auth: the device's own HA session (Bearer access token).
+
+Request body: `{"device_id": "<id>"}`
+
+| Status | Meaning |
+|---|---|
+| 200 | `{"status": "success", "access_revoked": bool}`. The record is removed, the relay proxy token unregistered, queued updates dropped, and this device's refresh token revoked (`access_revoked` is true when a token was found and revoked). |
+| 400 | `device_id` missing or empty. |
+| 401 | No authenticated user. |
+| 404 | `{"error": "Device not found"}`. Returned when the device does not exist, belongs to another user, or the caller is a deleted managed user. It is never 403, so other users' device ids are not confirmed. |
+
+The HA user account is never deleted; only this device's record and session are removed. Treat any 2xx, 4xx, or timeout as done and continue the local wipe, since the access token may already be revoked.
+
 ## 4. Update schema & how to apply
 
 | `type`      | `action`         | `payload`                                                      | Apply                              |
