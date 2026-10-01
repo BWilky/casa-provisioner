@@ -1467,7 +1467,11 @@ class CasaHeartbeatView(HomeAssistantView):
 
         lz_data = self.hass.data[DOMAIN].get("lz_data", {})
         server_lz_version = lz_data.get("config_version", "")
-        device_info, _uid, _uname = _find_device_record(stored_data, device_id)
+        # Location fields and the zone reconciler only apply to the caller's
+        # own device (the heartbeat refuses to touch anyone else's record).
+        device_info = None
+        if result.get("owned", True):
+            device_info, _uid, _uname = _find_device_record(stored_data, device_id)
         if device_info is not None and isinstance(location_state, str):
             if not _apply_location_report(self.hass, device_id, device_info,
                                           location_state, location_reason, location_config_version):
@@ -1542,6 +1546,13 @@ class CasaDeviceProfileReportView(HomeAssistantView):
         stored_data = self.hass.data[DOMAIN]["stored_data"]
         device_info, _uid, _username = _find_device_record(stored_data, device_id)
         if device_info is None:
+            return self.json({"error": "Device not found"}, status_code=404)
+        # Only the device itself may report: its pinned session token, or its
+        # owning user. Others get the same 404 so device ids aren't confirmed.
+        auth_header = request.headers.get("Authorization") or ""
+        bearer_rtid = _get_refresh_token_id_from_jwt(auth_header[7:].strip()) if auth_header.startswith("Bearer ") else None
+        pinned = bool(bearer_rtid) and bearer_rtid == device_info.get("refresh_token_id")
+        if not pinned and not _device_owned_by(stored_data, user.id, device_id):
             return self.json({"error": "Device not found"}, status_code=404)
 
         device_info["provisioning_fields"] = fields
@@ -3265,6 +3276,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN]["lz_store"] = lz_store
     hass.data[DOMAIN]["lz_data"] = lz_data
 
+    # One record per device_id: collapse duplicates older versions could
+    # leave under two live owners (idempotent, so safe on every startup).
+    if _collapse_duplicate_device_records(stored_data, await hass.auth.async_get_users()):
+        await store.async_save(stored_data)
+
     # Self-heal stranded queue state (entries for deprovisioned devices,
     # reauthentications targeting since-deleted users, markers stuck on
     # records under deleted owners) before any device pulls it.
@@ -3374,7 +3390,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         if device_id not in devices and len(devices) >= 100:
             raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
-            
+
+        # One owner per device_id: registering as a different live user
+        # (re-provisioned without a deprovision) moves the record here.
+        await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id)
+
         now_iso = dt_util.now().isoformat()
         
         # Keep existing push token if not provided in the update
@@ -3506,6 +3526,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if device_id not in devices and len(devices) >= 100:
             raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
 
+        # One owner per device_id; a heartbeat from a non-owner changes
+        # nothing and is told to re-register (register_device moves it).
+        if not await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id, heartbeat=True):
+            _LOGGER.info(
+                "CASA: Heartbeat for device '%s' from a user that does not own it; asking it to re-register.",
+                device_id,
+            )
+            return {
+                "owned": False,
+                "reregister": True,
+                "updates": False,
+                "require_alias": bool(stored_data.get("require_device_alias", False)),
+                "has_alias": False,
+                "heartbeat_interval_seconds": stored_data.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
+                "profile_report_interval_seconds": stored_data.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
+            }
+
         now_iso = dt_util.now().isoformat()
 
         # Get or initialize existing device info
@@ -3618,6 +3655,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         has_updates = bool(qu_data.get("updates", {}).get(device_id))
 
         result = {
+            "owned": True,
             "reregister": bool(device_info.get("needs_reregister", False)),
             "updates": has_updates,
             "require_alias": bool(stored_data.get("require_device_alias", False)),
@@ -5540,8 +5578,11 @@ def _pop_device_record(stored_data: dict, device_id: str, owner_user_id=None):
 
     With owner_user_id, only that user's managed devices and native devices are
     searched (so a stale duplicate under another, e.g. deleted, user is never
-    popped in its place). Without it, the first match wins (managed users, then
-    native) — the legacy behaviour admin services rely on.
+    popped in its place). Without it, the record _find_device_record would
+    return (live managed owner, then native) is popped, and any dead copies
+    under deleted owners go with it; only when no live record exists is a
+    dead copy popped instead — so admin deprovision/delete can never pop a
+    dead copy while the live one stays behind.
     Returns (owner_user_id | None, device_info | None, username).
     """
     users = stored_data.get("users", {})
@@ -5549,18 +5590,143 @@ def _pop_device_record(stored_data: dict, device_id: str, owner_user_id=None):
     if owner_user_id is not None:
         managed = [(owner_user_id, users[owner_user_id])] if owner_user_id in users else []
         native = [(owner_user_id, natives[owner_user_id])] if owner_user_id in natives else []
-    else:
-        managed = list(users.items())
-        native = list(natives.items())
+        for uid, udata in managed:
+            devices = udata.get("devices", {})
+            if device_id in devices:
+                return uid, devices.pop(device_id), udata.get("username", uid)
+        for uid, devices in native:
+            if device_id in devices:
+                return uid, devices.pop(device_id), uid
+        return None, None, "Unknown"
 
-    for uid, udata in managed:
-        devices = udata.get("devices", {})
-        if device_id in devices:
-            return uid, devices.pop(device_id), udata.get("username", uid)
-    for uid, devices in native:
-        if device_id in devices:
-            return uid, devices.pop(device_id), uid
-    return None, None, "Unknown"
+    found = None
+    for uid, udata in users.items():
+        if not udata.get("deleted", False) and device_id in udata.get("devices", {}):
+            found = (uid, udata["devices"].pop(device_id), udata.get("username", uid))
+            break
+    if found is None:
+        for uid, devices in natives.items():
+            if device_id in devices:
+                found = (uid, devices.pop(device_id), uid)
+                break
+    for uid, udata in users.items():
+        if udata.get("deleted", False) and device_id in udata.get("devices", {}):
+            dead = udata["devices"].pop(device_id)
+            if found is None:
+                found = (uid, dead, udata.get("username", uid))
+    return found if found is not None else (None, None, "Unknown")
+
+
+def _move_device_record(stored_data: dict, qu_data: dict, device_id: str, from_uid: str, dest: dict) -> dict | None:
+    """Move device_id's record from from_uid (managed or native) into dest,
+    the new owner's devices dict. A device lives under exactly one owner, and
+    its queued updates and reauth markers were addressed to the old owner
+    (they may carry that owner's credentials), so both are dropped."""
+    users = stored_data.get("users", {})
+    natives = stored_data.get("native_devices", {})
+    info = None
+    if from_uid in users and device_id in users[from_uid].get("devices", {}):
+        info = users[from_uid]["devices"].pop(device_id)
+    elif from_uid in natives and device_id in natives[from_uid]:
+        info = natives[from_uid].pop(device_id)
+        if not natives[from_uid]:
+            natives.pop(from_uid, None)
+    if info is None:
+        return None
+    info.pop("reauth_pending", None)
+    dropped = (qu_data.get("updates") or {}).pop(device_id, None)
+    dest[device_id] = info
+    _LOGGER.info(
+        "CASA: Moved device '%s' to a new owner%s.",
+        device_id, f"; dropped {len(dropped)} queued update(s) addressed to the old owner" if dropped else "",
+    )
+    return info
+
+
+async def _claim_device_for_caller(hass, device_id: str, user_id: str, devices: dict, refresh_token_id=None, heartbeat: bool = False) -> bool:
+    """Enforce one owner per device_id before user_id's register/heartbeat
+    touches devices (user_id's own devices dict). Returns False only for a
+    heartbeat that must not touch the record.
+
+    If another live owner holds device_id, register_device moves the record
+    to the caller. A heartbeat moves it only when it is clearly the same
+    device session — the caller's token is the one pinned on the record, or
+    the record's own session no longer exists — so knowing a device_id is
+    not enough to take a device over by heartbeating."""
+    if device_id in devices:
+        return True
+    data = hass.data[DOMAIN]
+    stored_data = data["stored_data"]
+    other, other_uid, _name = _find_device_record(stored_data, device_id)
+    if other is None or other_uid == user_id:
+        return True
+    if heartbeat:
+        pinned = bool(refresh_token_id) and other.get("refresh_token_id") == refresh_token_id
+        if not pinned:
+            other_user = await hass.auth.async_get_user(other_uid)
+            other_rtid = other.get("refresh_token_id")
+            if other_user is not None and other_rtid and other_rtid in other_user.refresh_tokens:
+                return False
+            # Re-check after the await: the record may have moved meanwhile.
+            if device_id in devices:
+                return True
+            other, other_uid, _name = _find_device_record(stored_data, device_id)
+            if other is None or other_uid == user_id:
+                return True
+    qu_data = data["qu_data"]
+    _move_device_record(stored_data, qu_data, device_id, other_uid, devices)
+    if data.get("qu_store"):
+        data["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+    return True
+
+
+def _collapse_duplicate_device_records(stored_data: dict, ha_users) -> int:
+    """Startup migration: keep one record per device_id across live owners.
+
+    Older versions let register/heartbeat create a second record under the
+    caller while another owner still held one. The copy kept is the one
+    whose refresh_token_id is a live token of its owner, then the most
+    recently seen. A stranded reauth_pending marker moves onto the keeper.
+    Returns the number of copies removed."""
+    live_tokens = {u.id: set(u.refresh_tokens.keys()) for u in ha_users}
+    copies = {}
+    for uid, udata in stored_data.get("users", {}).items():
+        if udata.get("deleted", False):
+            continue
+        for did, dinfo in (udata.get("devices", {}) or {}).items():
+            copies.setdefault(did, []).append((uid, udata["devices"], dinfo))
+    for uid, devices in stored_data.get("native_devices", {}).items():
+        for did, dinfo in (devices or {}).items():
+            copies.setdefault(did, []).append((uid, devices, dinfo))
+
+    removed = 0
+    emptied = set()
+    for did, entries in copies.items():
+        if len(entries) < 2:
+            continue
+        keeper = max(
+            entries,
+            key=lambda c: (
+                c[2].get("refresh_token_id") in live_tokens.get(c[0], ()),
+                c[2].get("last_seen_at") or "",
+            ),
+        )
+        for uid, devices, dinfo in entries:
+            if dinfo is keeper[2]:
+                continue
+            if dinfo.get("reauth_pending") and not keeper[2].get("reauth_pending"):
+                keeper[2]["reauth_pending"] = dinfo["reauth_pending"]
+            devices.pop(did, None)
+            emptied.add(uid)
+            removed += 1
+            _LOGGER.warning(
+                "CASA: Removed duplicate record of device '%s' under user '%s' (kept the one under '%s').",
+                did, uid, keeper[0],
+            )
+    natives = stored_data.get("native_devices", {})
+    for uid in [u for u, devs in natives.items() if not devs and u in emptied]:
+        natives.pop(uid, None)
+    return removed
 
 
 async def _purge_device(hass: HomeAssistant, device_id: str, owner_user_id=None) -> dict:
@@ -5570,7 +5736,8 @@ async def _purge_device(hass: HomeAssistant, device_id: str, owner_user_id=None)
     token from the relay, revokes the device's HA refresh token, and drops any
     queued updates. Network/auth steps are best-effort.
     owner_user_id: when given, only that user's record is purged (the device
-    self-deprovision path); None keeps first-match behaviour (admin services).
+    self-deprovision path); None purges the live record plus any dead copies
+    under deleted owners (admin services, see _pop_device_record).
     Returns {"found", "username", "push_token", "access_revoked"}.
     """
     stored_data = hass.data[DOMAIN]["stored_data"]

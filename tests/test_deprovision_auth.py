@@ -55,11 +55,19 @@ def test_pop_with_owner_removes_only_owners_record():
     assert "PHONE" in data["users"]["A"]["devices"]
 
 
-def test_pop_without_owner_keeps_legacy_first_match():
+def test_pop_without_owner_pops_live_record_and_dead_copies():
     data = _dup()
     owner, info, _ = _pop_device_record(data, "PHONE")
+    assert owner == "B" and info == {"refresh_token_id": "rB"}
+    assert "PHONE" not in data["users"]["A"]["devices"]
+    assert "PHONE" not in data["users"]["B"]["devices"]
+
+
+def test_pop_without_owner_falls_back_to_dead_copy():
+    data = _dup()
+    data["users"]["B"]["devices"] = {}
+    owner, info, _ = _pop_device_record(data, "PHONE")
     assert owner == "A" and info == {"refresh_token_id": "rA"}
-    assert "PHONE" in data["users"]["B"]["devices"]
 
 
 def test_pop_with_owner_lacking_device_returns_none():
