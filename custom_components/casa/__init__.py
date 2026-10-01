@@ -4977,6 +4977,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Silently ask a device to report its provisioning state right now,
         instead of waiting for its next periodic self-report. Purely a nudge —
         no cache-clear/reload side effects, unlike reload_device."""
+        await _check_authorization(call)
         device_id = str(call.data.get("device_id", "")).strip()
         if not device_id:
             raise HomeAssistantError("Missing device_id parameter.")
@@ -5007,6 +5008,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         sendHeartbeat already pulls any durably-queued profile_updates when
         the response says they're pending, so this is sufficient to make any
         queued admin change land immediately."""
+        await _check_authorization(call)
         device_id = str(call.data.get("device_id", "")).strip()
         if not device_id:
             raise HomeAssistantError("Missing device_id parameter.")
