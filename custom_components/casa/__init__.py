@@ -856,6 +856,20 @@ async def _create_casa_user(hass, name: str, username: str, password: str | None
     if not provider:
         return None, "Home Assistant core auth provider not found"
 
+    # The login username must be free in the auth provider itself — linked to
+    # some user's credentials or an orphaned provider entry. add_auth would
+    # raise only after the HA user already exists.
+    login_taken = any(
+        cred.auth_provider_type == "homeassistant"
+        and str(cred.data.get("username", "")).strip().casefold() == username
+        for u in users for cred in u.credentials
+    ) or any(
+        str(entry.get("username", "")).strip().casefold() == username
+        for entry in (getattr(provider.data, "users", None) or [])
+    )
+    if login_taken:
+        return None, "A login with this username already exists"
+
     if not password:
         password = generate_random_password()
 
@@ -865,11 +879,29 @@ async def _create_casa_user(hass, name: str, username: str, password: str | None
         local_only=local_only
     )
 
-    provider.data.add_auth(username, password)
-    await provider.data.async_save()
+    auth_added = False
+    try:
+        provider.data.add_auth(username, password)
+        auth_added = True
+        await provider.data.async_save()
 
-    credentials = await provider.async_get_or_create_credentials({"username": username})
-    await hass.auth.async_link_user(new_user, credentials)
+        credentials = await provider.async_get_or_create_credentials({"username": username})
+        await hass.auth.async_link_user(new_user, credentials)
+    except Exception as err:
+        # Roll back so a failed credential step never leaves an orphan HA
+        # user (or an unlinked login) behind.
+        _LOGGER.error("CASA ERROR: Could not create login '%s': %s — rolling back.", username, err)
+        if auth_added:
+            try:
+                await provider.data.async_remove_auth(username)
+                await provider.data.async_save()
+            except Exception as rm_err:
+                _LOGGER.warning("CASA: Could not remove login '%s' during rollback: %s", username, rm_err)
+        try:
+            await hass.auth.async_remove_user(new_user)
+        except Exception as rm_err:
+            _LOGGER.warning("CASA: Could not remove user '%s' during rollback: %s", name, rm_err)
+        return None, f"Could not create login credentials: {err}"
 
     _LOGGER.info("CASA: New local user '%s' created (Local Only: %s).", username, local_only)
 
