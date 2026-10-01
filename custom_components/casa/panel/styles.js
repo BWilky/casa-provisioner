@@ -374,7 +374,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--casa-primary);
 }
 
 /* ---------- Editor (three-pane) ---------- */
-.editor { display: flex; height: 100%; min-height: 0; }
+/* height:100% alone collapses to content height when HA's panel container
+   doesn't hand us a definite height, cutting the nav's divider short. The
+   min-height (viewport minus the 64px app header) keeps the panes full-height. */
+.editor { display: flex; height: 100%; min-height: calc(100vh - 64px); min-height: calc(100dvh - 64px); }
 .editor__nav {
   width: 270px; flex: none; border-right: 1px solid var(--casa-divider);
   background: var(--casa-card-bg); overflow-y: auto; padding: 14px 12px;

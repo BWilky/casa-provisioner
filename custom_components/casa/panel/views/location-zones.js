@@ -12,10 +12,27 @@
 const MAX_TOTAL_RINGS = 18;
 const RESERVED_LABELS = new Set(["away", "unknown"]);
 
+// crypto.randomUUID only exists in secure contexts (HTTPS / localhost); HA is
+// commonly served over plain http on the LAN, where it's undefined.
+// getRandomValues has no such restriction.
+function newAnchorId() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
 const VENDOR_JS = "/casa_static/vendor/leaflet.js";
 const VENDOR_CSS = "/casa_static/vendor/leaflet.css";
+// HA's page sets <meta name="referrer" content="same-origin">, so <img> tile
+// requests go out with no Referer — which OSM's tile usage policy now 403s.
+// Tiles override that per-image via TILE_REFERRER_POLICY below.
 const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
-const TILE_ATTRIBUTION = "&copy; OpenStreetMap contributors";
+const TILE_ATTRIBUTION =
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const TILE_REFERRER_POLICY = "strict-origin-when-cross-origin";
 
 // Leaflet is a classic script exposing global `L`. Load it once per document
 // (module-scope promise) regardless of how many times this view mounts —
@@ -173,7 +190,11 @@ export function createView(app) {
     if (!refs || !mounted) return; // unmounted while awaiting the script load
 
     map = L.map(refs.mapEl, { center: [39.5, -98.35], zoom: 4 });
-    L.tileLayer(TILE_URL, { attribution: TILE_ATTRIBUTION, maxZoom: 19 }).addTo(map);
+    L.tileLayer(TILE_URL, {
+      attribution: TILE_ATTRIBUTION,
+      maxZoom: 19,
+      referrerPolicy: TILE_REFERRER_POLICY,
+    }).addTo(map);
     // Leaflet-in-shadow-DOM: the container has no real size until after first
     // layout; force a recalculation once it settles.
     requestAnimationFrame(() => map && map.invalidateSize());
@@ -330,7 +351,7 @@ export function createView(app) {
 
   function addAnchor(seed) {
     const anchor = {
-      id: crypto.randomUUID(),
+      id: newAnchorId(),
       name: "",
       latitude: seed && Number.isFinite(seed.latitude) ? round6(seed.latitude) : 0,
       longitude: seed && Number.isFinite(seed.longitude) ? round6(seed.longitude) : 0,
@@ -518,7 +539,7 @@ export function createView(app) {
       configVersion = (res && res.config_version) || "";
       staleAfterMinutes = Number.isFinite(res && res.stale_after_minutes) ? res.stale_after_minutes : 30;
       anchors = ((res && res.anchors) || []).map((a) => ({
-        id: a.id || crypto.randomUUID(),
+        id: a.id || newAnchorId(),
         name: a.name || "",
         latitude: typeof a.latitude === "number" ? a.latitude : num(a.latitude, 0),
         longitude: typeof a.longitude === "number" ? a.longitude : num(a.longitude, 0),
