@@ -432,6 +432,7 @@ export function createView(app) {
   let ppLoading = false;
   let provisioningEditing = false; // "Force Device Changes" active?
   let provisioningDraft = null; // editable copy of provisioning fields while editing
+  let provisioningBaseline = null; // the reported values the draft started from
   let provisioningSubSection = "connection"; // sub-nav within the Provisioning section
   let msgs = freshMsgs();
 
@@ -883,6 +884,7 @@ export function createView(app) {
       shell.formEl.querySelector("#dev-prov-cancel").addEventListener("click", () => {
         provisioningEditing = false;
         provisioningDraft = null;
+        provisioningBaseline = null;
         msgs.provisioning = {};
         renderSection();
       });
@@ -890,6 +892,7 @@ export function createView(app) {
       shell.formEl.querySelector("#dev-prov-refresh").addEventListener("click", requestProvisioningRefresh);
       shell.formEl.querySelector("#dev-prov-force").addEventListener("click", () => {
         provisioningDraft = { ...baseline };
+        provisioningBaseline = { ...baseline };
         provisioningEditing = true;
         msgs.provisioning = {};
         renderSection();
@@ -897,14 +900,72 @@ export function createView(app) {
     }
   }
 
+  // Fields the device applies together: if one changes, push the group so
+  // the device never combines a new value with a stale sibling.
+  const COUPLED_FIELDS = [
+    ["immersive_level", "theme_color_mode", "custom_color"],
+    ["allow_all_pages", "allowed_pages"],
+    ["allow_wireguard", "wireguard_profile_id", "wireguard_config", "wireguard_excluded_wifi"],
+  ];
+
+  // Only what the admin changed (plus coupled siblings) is pushed — the
+  // server merges it into the stored view — so untouched reported values are
+  // never echoed back to the device.
+  function changedProvisioningFields() {
+    const draft = fieldsMod.collectFields(provisioningDraft, fieldsMod.LIVE_KEYS);
+    const base = fieldsMod.collectFields(provisioningBaseline || {}, fieldsMod.LIVE_KEYS);
+    const keys = new Set(Object.keys(draft).filter((k) => draft[k] !== base[k]));
+    for (const group of COUPLED_FIELDS) {
+      if (group.some((k) => keys.has(k))) {
+        group.forEach((k) => {
+          if (k in draft) keys.add(k);
+        });
+      }
+    }
+    const out = {};
+    for (const k of keys) out[k] = draft[k];
+    return out;
+  }
+
+  function originOf(url) {
+    try {
+      return new URL(String(url || "").trim()).origin;
+    } catch (_e) {
+      return null;
+    }
+  }
+
   async function saveProvisioning() {
     msgs.provisioning = {};
+    const fields = changedProvisioningFields();
+    if (!Object.keys(fields).length) {
+      msgs.provisioning = { error: "Nothing changed — no settings to push." };
+      renderSection();
+      return;
+    }
+    const oldOrigin = originOf(provisioningBaseline && provisioningBaseline.host_url);
+    if ("host_url" in fields && oldOrigin && originOf(fields.host_url) !== oldOrigin) {
+      ui.showConfirm({
+        title: "Host change needs re-provisioning",
+        message:
+          `The new host URL is on a different origin than ${oldOrigin}. The device has no credentials for it, ` +
+          "so it will refuse this change and keep its current server. To move it to the new host, " +
+          "re-provision the device. Push the other changes anyway?",
+        confirmLabel: "Push anyway",
+        onConfirm: () => pushProvisioning(fields),
+      });
+      return;
+    }
+    await pushProvisioning(fields);
+  }
+
+  async function pushProvisioning(fields) {
     try {
-      const fields = fieldsMod.collectFields(provisioningDraft, fieldsMod.LIVE_KEYS);
       await api.updateDeviceProvisioning(device.device_id, fields);
       ui.toast("Device settings pushed.");
       provisioningEditing = false;
       provisioningDraft = null;
+      provisioningBaseline = null;
       await app.refresh();
     } catch (err) {
       msgs.provisioning = { error: "Failed to save: " + ui.errMsg(err) };
@@ -1386,6 +1447,7 @@ export function createView(app) {
       active = "overview";
       provisioningEditing = false;
       provisioningDraft = null;
+      provisioningBaseline = null;
       provisioningSubSection = "connection";
       msgs = freshMsgs();
       host = document.createElement("div");

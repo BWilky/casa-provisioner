@@ -1542,6 +1542,7 @@ class CasaDeviceProfileReportView(HomeAssistantView):
         # Devices only ever report live settings; filtering here makes device
         # records self-cleaning by construction and keeps a buggy client from
         # injecting arbitrary keys into admin-panel-rendered state.
+        fields = _normalize_reported_fields(fields)
         fields = {k: v for k, v in fields.items() if k in LIVE_PROVISIONING_FIELDS}
 
         stored_data = self.hass.data[DOMAIN]["stored_data"]
@@ -2037,19 +2038,32 @@ class CasaAdminDeviceView(HomeAssistantView):
             # process-scope keys (password, pin, timeout_minutes, ...) are
             # dropped even if an older panel or manual API client sends them.
             fields = {k: v for k, v in fields.items() if k in LIVE_PROVISIONING_FIELDS}
+            if not fields:
+                return self.json({"error": "No device-live fields to push"}, status_code=400)
 
-            device_info["provisioning_fields"] = fields
+            # Merge: the panel sends only the fields the admin changed (older
+            # panels send all of them), so the stored view stays complete.
+            device_info["provisioning_fields"] = {**(device_info.get("provisioning_fields") or {}), **fields}
             device_info["provisioning_pending_push"] = True
 
             qu_data = self.hass.data[DOMAIN]["qu_data"]
             session = async_get_clientsession(self.hass)
             created_by = user.name or user.id
-            payload = {"profile_id": None, "name": "Custom device settings", "fields": fields}
-            _update_id, pushed, _skipped = await _enqueue_and_push_update(
-                self.hass,
-                stored_data, qu_data, session, device_id, device_info,
-                "profile", "update", payload, created_by, send_push=True,
-            )
+            profile_fields, wg_payload = _split_wireguard_from_profile(fields, self.hass.data[DOMAIN].get("wg_data"))
+            if profile_fields:
+                payload = {"profile_id": None, "name": "Custom device settings", "fields": profile_fields}
+                _update_id, pushed, _skipped = await _enqueue_and_push_update(
+                    self.hass,
+                    stored_data, qu_data, session, device_id, device_info,
+                    "profile", "update", payload, created_by, send_push=True,
+                )
+            if wg_payload:
+                _wg_id, wg_pushed, _skipped = await _enqueue_and_push_update(
+                    self.hass,
+                    stored_data, qu_data, session, device_id, device_info,
+                    "wireguard", "update", wg_payload, created_by, send_push=True,
+                )
+                pushed = pushed or wg_pushed
             qu_store = self.hass.data[DOMAIN]["qu_store"]
             qu_store.async_delay_save(lambda: qu_data, 2.0)
             # Nudge only when the encrypted push did NOT go out (see the same
@@ -2304,6 +2318,71 @@ class CasaAdminCheckUsernameView(HomeAssistantView):
             "username_conflict": username_conflict,
             "name_conflict": name_conflict,
         })
+
+
+def _normalize_reported_fields(fields: dict) -> dict:
+    """Normalize a device's self-reported live fields so the device editor's
+    reported -> form -> pushed round trip is lossless.
+
+    - Older apps report immersive_level as the full "level,mode,color"
+      triple; it is split into immersive_level / theme_color_mode /
+      custom_color (explicit keys, when also reported, win).
+    - Values are coerced to the LIVE_PROVISIONING_FIELDS default's type
+      (bools also from "true"/"false" strings; strings from numbers), so a
+      bool reported as "false" can't turn truthy in the form.
+    - allowed_pages "/*" with no allow_all_pages reported means allow-all.
+    """
+    out = dict(fields)
+    level = out.get("immersive_level")
+    if isinstance(level, str) and "," in level:
+        parts = [p.strip() for p in level.split(",", 2)]
+        out["immersive_level"] = parts[0]
+        if len(parts) > 1 and parts[1] and not out.get("theme_color_mode"):
+            out["theme_color_mode"] = parts[1]
+        if len(parts) > 2 and parts[2] and not out.get("custom_color"):
+            out["custom_color"] = parts[2]
+    for key, default in LIVE_PROVISIONING_FIELDS.items():
+        if key not in out:
+            continue
+        val = out[key]
+        if isinstance(default, bool):
+            out[key] = val.strip().lower() == "true" if isinstance(val, str) else bool(val)
+        elif isinstance(default, str):
+            if val is None:
+                out[key] = ""
+            elif isinstance(val, bool):
+                out[key] = "true" if val else "false"
+            elif isinstance(val, float) and val.is_integer():
+                out[key] = str(int(val))
+            else:
+                out[key] = str(val)
+    if "allow_all_pages" not in out and out.get("allowed_pages") == "/*":
+        out["allow_all_pages"] = True
+    return out
+
+
+def _split_wireguard_from_profile(fields: dict, wg_data: dict):
+    """Translate WireGuard keys in a profile push into a separate update.
+
+    The app applies WireGuard only through wireguard/update entries and
+    ignores wireguard_config / wireguard_profile_id inside profile/update.
+    Returns (profile_fields_without_those_keys, wireguard_payload | None);
+    the payload is {config, excluded_wifi} for a linked profile (by id) or
+    a pasted config. Nothing resolvable -> None (no revoke is implied)."""
+    profile_fields = {k: v for k, v in fields.items() if k not in ("wireguard_config", "wireguard_profile_id")}
+    config = ""
+    excluded = str(fields.get("wireguard_excluded_wifi", "") or "").strip()
+    wg_id = str(fields.get("wireguard_profile_id", "") or "").strip()
+    if wg_id:
+        wg_profile = next((p for p in (wg_data or {}).get("profiles", []) if p.get("id") == wg_id), None)
+        if wg_profile:
+            config = str(wg_profile.get("config", "") or "").strip()
+            excluded = str(wg_profile.get("excluded_wifi", "") or "").strip()
+    if not config:
+        config = str(fields.get("wireguard_config", "") or "").strip()
+    if not config:
+        return profile_fields, None
+    return profile_fields, {"config": config, "excluded_wifi": excluded}
 
 
 def _coerce_template_fields(src: dict) -> dict:
@@ -2820,6 +2899,7 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             return self.json({"error": "Must provide device_id, device_ids, or username"}, status_code=400)
 
         # Build the type-specific payload.
+        wg_payload = None
         if update_type == "wireguard":
             if action == "update":
                 config = str(body.get("wireguard_config", "")).strip()
@@ -2845,7 +2925,10 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             fields = {k: v for k, v in matched.get("fields", {}).items() if k in LIVE_PROVISIONING_FIELDS}
             if not fields:
                 return self.json({"error": "This template sets no device-live fields"}, status_code=400)
-            payload = {"profile_id": profile_id, "name": matched.get("name"), "fields": fields}
+            # WireGuard settings travel as their own wireguard/update entry —
+            # the app ignores them inside profile/update.
+            fields, wg_payload = _split_wireguard_from_profile(fields, self.hass.data[DOMAIN].get("wg_data"))
+            payload = {"profile_id": profile_id, "name": matched.get("name"), "fields": fields} if fields else None
 
         targets, not_found = await self._resolve_targets(device_id, username, device_ids)
         if targets is None:
@@ -2866,7 +2949,13 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
         jobs = []
         device_key = stored_data.get("device_key")
 
+        wg_jobs = []
         for did, dinfo in targets:
+            if wg_payload is not None:
+                wg_jobs.append((did, dinfo, _enqueue_update(qu_data, did, "wireguard", "update", wg_payload, created_by)))
+            if payload is None:
+                queued += 1
+                continue
             update_id = _enqueue_update(qu_data, did, update_type, action, payload, created_by)
             queued += 1
             push_token = dinfo.get("push_token")
@@ -2893,10 +2982,15 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             store = self.hass.data[DOMAIN]["store"]
             store.async_delay_save(lambda: stored_data, 2.0)
 
-        if send_update_push or notify_push:
+        if (send_update_push or notify_push) and jobs:
             self.hass.async_create_task(_deliver_updates_in_background(
                 self.hass, stored_data, jobs, update_type, action, payload,
                 send_update_push, notify_push, title, message, created_by,
+            ))
+        if send_update_push and wg_jobs:
+            self.hass.async_create_task(_deliver_updates_in_background(
+                self.hass, stored_data, wg_jobs, "wireguard", "update", wg_payload,
+                True, False, "", "", created_by,
             ))
 
         _LOGGER.info(
@@ -3287,7 +3381,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # One record per device_id: collapse duplicates older versions could
     # leave under two live owners (idempotent, so safe on every startup).
-    if _collapse_duplicate_device_records(stored_data, await hass.auth.async_get_users()):
+    records_migrated = bool(_collapse_duplicate_device_records(stored_data, await hass.auth.async_get_users()))
+    # Normalize stored self-reports from older apps (immersive triple, string
+    # bools) so the device editor starts from correct values.
+    for _did, dinfo in _iter_all_devices(stored_data):
+        reported = dinfo.get("provisioning_fields")
+        if isinstance(reported, dict) and reported:
+            normalized = {k: v for k, v in _normalize_reported_fields(reported).items() if k in LIVE_PROVISIONING_FIELDS}
+            if normalized != reported:
+                dinfo["provisioning_fields"] = normalized
+                records_migrated = True
+    if records_migrated:
         await store.async_save(stored_data)
 
     # Self-heal stranded queue state (entries for deprovisioned devices,
