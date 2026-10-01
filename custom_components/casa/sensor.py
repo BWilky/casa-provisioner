@@ -7,6 +7,11 @@ from .const import DOMAIN, CONF_CREATE_DEVICES
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _mask_token(token: str) -> str:
+    """Last 6 characters only — enough to tell registrations apart."""
+    return "…" + str(token)[-6:]
+
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up Casa sensors from a config entry."""
     if not entry.options.get(CONF_CREATE_DEVICES, True):
@@ -177,7 +182,11 @@ class CasaDevicePushTokenSensor(CasaDeviceSensorBase):
                     device_info = devs[self.device_id]
                     break
         token = device_info.get("push_token")
-        return token if token else "Not Registered"
+        # Masked: entity state is readable by every HA user, and the full
+        # relay proxy token is a bearer credential (anyone holding it can
+        # call the relay's /unregister). The admin panel gets the full value
+        # from the admin-only summary endpoint instead.
+        return _mask_token(token) if token else "Not Registered"
 
 
 class CasaDevicePushStatusSensor(CasaDeviceSensorBase):
