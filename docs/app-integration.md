@@ -62,10 +62,10 @@ Response fields:
 - `expires_at` is present only while an admin override is pending (`0` = permanent); omitted otherwise.
 - `reregister: true` means: re-register with the relay and POST `register_device`. Sent
   when `/reconcile` found the relay lost the proxy token, and (26.10.01) when the
-  heartbeat's device_id is recorded under a different HA user — a heartbeat never takes
-  a device record over from another user (unless it presents the session token pinned
-  on that record, or that record's own session is gone); `register_device` moves it.
-  Such a heartbeat also answers `updates: false` and applies no location fields.
+  heartbeat's device_id is recorded under a different HA user and the caller has no
+  proof of possession (see "Device ownership" below). Such a heartbeat changes nothing,
+  answers `updates: false`, applies no location fields, and reports the record's real
+  `has_alias`.
 - **Persist `device_key` and `device_key_id` on every heartbeat.** `device_key` is the
   shared secret used to decrypt pushes; `device_key_id` is its fingerprint.
 - If `updates == true`, call the pull endpoint (§2).
@@ -82,9 +82,24 @@ Response fields:
 
 - `POST {"device_id": "<id>", "push_token": "<64 hex>"?}` → `{"status": "success"}`. The
   push token is the relay proxy token (64 hex chars, else 400). Re-posting merges onto
-  the existing record. A device_id lives under exactly one HA user: registering one
-  that is recorded under another user moves the record to the caller and drops its
-  queued updates and pending reauthentication (they were addressed to the old user).
+  the existing record. A device_id recorded under another HA user is moved to the caller
+  only with proof of possession (below); otherwise `400 {"error": "Device is registered
+  to another user."}`.
+
+### Device ownership (26.10.01)
+
+A device_id lives under exactly one HA user. Register or heartbeat from another user
+moves the record only when the caller's session is:
+
+1. the refresh token pinned on the record; or
+2. a fresh provisioning claim for the caller's user — the session that redeemed that
+   user's provisioning link (recorded server-side), or a session under 30 minutes old
+   created at/after a provisioning window for that user opened in the last 24 h; or
+3. the target of the record's pending reauthentication.
+
+A move drops the record's queued updates and reauth marker and revokes the previous
+owner's pinned session. The app needs to send nothing new: a device re-provisioned to
+another user is moved by its first heartbeat or registration with the new session.
 - `GET ?device_id=<id>` → `{"registered": bool, "push_token", "registered_at", "last_seen_at"}`
   (`registered` means push-registered).
 - `DELETE ?device_id=<id>` clears only the push registration; the record stays.
@@ -139,7 +154,8 @@ chars) — an admin-set alias always wins and is never overwritten.
   WireGuard config the parser rejects, a `profile` entry with no `fields`) and log why;
   only `auth/reauthenticate` stays unacked. (26.10.01) The server also drops non-auth
   entries unacknowledged for 30 days and caps a device's queue at 50 entries (oldest
-  non-auth first), so a device that never acks can't grow its queue forever.
+  non-auth first), so a device that never acks can't grow its queue forever. WireGuard
+  revokes and the newest WireGuard entry are never dropped this way.
 
 ### Profile report — `POST /api/casa/profile_report`
 
