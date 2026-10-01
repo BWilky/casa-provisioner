@@ -103,7 +103,12 @@ def validate_zone_config(config: dict) -> list[str]:
 
 
 def compute_config_version(anchors: list) -> str:
-    """Short stable content hash of the anchors list (canonical JSON)."""
+    """Short stable content hash of the anchors list (canonical JSON).
+
+    No anchors means no zone config at all: "" (heartbeats then report
+    location_config_version null and the reconciler never re-enqueues)."""
+    if not anchors:
+        return ""
     canonical = json.dumps(anchors, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
 

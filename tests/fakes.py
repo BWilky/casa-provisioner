@@ -149,6 +149,7 @@ class FakeHass:
                 "pp_data": {"profiles": []},
                 "store": FakeStore(),
                 "qu_store": FakeStore(),
+                "lz_store": FakeStore(),
                 "listeners": {},
                 "timers": {},
             }

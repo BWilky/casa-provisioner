@@ -106,6 +106,11 @@ def test_config_version_stable_and_content_sensitive():
     assert compute_config_version(a) != v1
 
 
+def test_empty_anchors_have_no_config_version():
+    assert compute_config_version([]) == ""
+    assert compute_config_version(None) == ""
+
+
 def test_report_roundtrip():
     inner = {"state": "House: home", "reason": None, "config_version": "abcd1234", "ts": int(time.time())}
     blob = encrypt_report_payload(json.dumps(inner), "deadbeef" * 8, "DEV-1")

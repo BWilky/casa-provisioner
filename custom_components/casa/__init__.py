@@ -1478,6 +1478,7 @@ class CasaHeartbeatView(HomeAssistantView):
                 _LOGGER.warning("CASA: Ignored invalid heartbeat location fields for device '%s'.", device_id)
         # Reconciler: device confirmed a stale config version (or reported no
         # version at all, which also counts as a mismatch) → re-enqueue.
+        # Server version "" means no zones: nothing to reconcile.
         device_lz_version = location_config_version if isinstance(location_config_version, str) else ""
         if device_info is not None and server_lz_version and device_lz_version != server_lz_version:
             qu_data = self.hass.data[DOMAIN]["qu_data"]
@@ -1895,6 +1896,9 @@ class CasaLocationZonesView(HomeAssistantView):
         lz_data["config_version"] = compute_config_version(lz_data["anchors"])
         self.hass.data[DOMAIN]["lz_store"].async_delay_save(lambda: lz_data, 2.0)
 
+        # Saving an empty list after zones existed still pushes once
+        # ({anchors: [], config_version: ""}) so devices tear their regions
+        # down; with version "" the heartbeat reconciler never re-enqueues it.
         queued = 0
         jobs = []
         if lz_data["config_version"] != old_version:
@@ -3273,6 +3277,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     lz_data = await lz_store.async_load()
     if lz_data is None:
         lz_data = {"config_version": "", "stale_after_minutes": 30, "anchors": []}
+    # Pre-26.10 stores hashed an empty anchor list to a non-empty version,
+    # which kept the reconciler re-enqueueing "no zones" forever.
+    if not lz_data.get("anchors") and lz_data.get("config_version"):
+        lz_data["config_version"] = ""
+        await lz_store.async_save(lz_data)
     hass.data[DOMAIN]["lz_store"] = lz_store
     hass.data[DOMAIN]["lz_data"] = lz_data
 
