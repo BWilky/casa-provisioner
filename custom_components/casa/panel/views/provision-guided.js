@@ -561,11 +561,12 @@ export function createView(app) {
           <div style="margin-left:28px;">
             <label class="toggle">
               <input type="checkbox" data-field="deleteQr" ${state.deleteQr ? "checked" : ""}>
-              Delete QR image after the entry window
+              Delete the QR file after the entry window (otherwise it is overwritten with EXPIRED)
             </label>
             <div class="field" style="margin-top:8px;">
               <label>QR filename</label>
-              <input class="input" data-field="qrFilename" value="${esc(state.qrFilename)}" placeholder="Optional — e.g. casa_qr.png">
+              <input class="input" data-field="qrFilename" value="${esc(state.qrFilename)}" placeholder="Optional — leave blank to write no file">
+        <div class="field__help">Only if a dashboard needs it: also saves the QR as a public file at /local/&lt;name&gt;.png until the window ends.</div>
             </div>
           </div>` : ""}
       </div></div>

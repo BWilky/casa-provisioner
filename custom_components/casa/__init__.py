@@ -405,13 +405,15 @@ def _user_matches_username(user, target_username: str) -> bool:
     )
 
 
-async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, method, on_redeemed=None):
+async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, method, on_redeemed=None, provision_id=None):
     """Poll for new refresh tokens; fire casa_code_redeemed when one appears.
 
     on_redeemed: optional coroutine function run once after the first
     redemption event (used to scramble the password so the link is
     single-use). When it is set the listener returns after the first
     redemption; otherwise it keeps reporting until the TTL ends.
+    provision_id: echoed in the event (with user_id) so a card can tell its
+    own code's redemption from any other.
     """
     if ttl_seconds <= 0:
         _LOGGER.warning("CASA: Listener for '%s' skipped — TTL is %s.", username, ttl_seconds)
@@ -446,6 +448,8 @@ async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, me
                         "ip_address": token.last_used_ip,
                         "redeemed_at": dt_util.now().isoformat(),
                         "method": method,
+                        "user_id": user_id,
+                        "provision_id": provision_id,
                     })
                     _LOGGER.info(
                         "CASA EVENT: Code redeemed by '%s' via %s (client: %s, IP: %s).",
@@ -561,13 +565,184 @@ async def _set_account_password(hass, auth_provider, login_username: str, passwo
     return password
 
 
-async def _scramble_and_close(hass, username: str, auth_provider, listener_key: str) -> None:
-    """Rotate the account password so the provisioning link is dead, and stop the listener."""
-    await _set_account_password(hass, auth_provider, username)
-    _LOGGER.info("CASA: Password for %s scrambled.", username)
-    listener_task = hass.data[DOMAIN]["listeners"].get(listener_key)
-    if listener_task and listener_task is not asyncio.current_task():
-        listener_task.cancel()
+_QR_EXPIRED_TEXT = "EXPIRED - Request a new Casa code."
+_QR_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
+
+def _safe_qr_filename(raw) -> str | None:
+    """An explicit qr_filename reduced to a safe www/ basename ending in .png,
+    or None when it is unusable (empty, a path, '..', or nothing left)."""
+    name = str(raw or "").strip()
+    if not name or "/" in name or "\\" in name or ".." in name or "\x00" in name:
+        return None
+    if name.lower().endswith(".png"):
+        name = name[:-4]
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    if not _QR_FILENAME_RE.match(name):
+        return None
+    return name + ".png"
+
+
+def _write_qr_file(hass, filename: str, text: str) -> None:
+    """Executor job: render text as a QR into www/<filename> (served at /local/)."""
+    www_dir = hass.config.path("www")
+    os.makedirs(www_dir, exist_ok=True)
+    qrcode.make(text).save(os.path.join(www_dir, filename))
+
+
+def _retire_qr_file(hass, filename: str, mode: str) -> None:
+    """Executor job: remove a provisioning QR file from www/, or (mode
+    "expire") overwrite it with an EXPIRED placeholder so a dashboard image
+    that points at it doesn't break. Only ever touches that one file."""
+    path = os.path.join(hass.config.path("www"), filename)
+    if mode == "expire":
+        if os.path.exists(path):
+            qrcode.make(_QR_EXPIRED_TEXT).save(path)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def _pending_provision(hass, user_id: str, provision_id: str | None = None) -> dict | None:
+    """The persisted open provisioning window for user_id (optionally only if
+    it is still the one identified by provision_id)."""
+    data = hass.data.get(DOMAIN) or {}
+    rec = (data.get("stored_data") or {}).get("pending_provisions", {}).get(user_id)
+    if rec is None or (provision_id is not None and rec.get("provision_id") != provision_id):
+        return None
+    return rec
+
+
+def _save_stored_data(hass) -> None:
+    data = hass.data.get(DOMAIN) or {}
+    if data.get("store") is not None:
+        data["store"].async_delay_save(lambda: data["stored_data"], 2.0)
+
+
+async def _retire_provision_qr(hass, rec: dict) -> None:
+    filename = rec.get("qr_file")
+    if not filename:
+        return
+    rec["qr_file"] = None
+    _save_stored_data(hass)
+    try:
+        await hass.async_add_executor_job(_retire_qr_file, hass, filename, rec.get("qr_expire_mode", "delete"))
+        _LOGGER.info("CASA: Provisioning QR file %s retired.", filename)
+    except Exception as err:
+        _LOGGER.warning("CASA: Could not retire provisioning QR file %s: %s", filename, err)
+
+
+def _cancel_provision_tasks(hass, user_id: str) -> None:
+    """Cancel user_id's provisioning timer/listener (never the calling task)."""
+    data = hass.data.get(DOMAIN) or {}
+    current = asyncio.current_task()
+    for key in ("timers", "listeners"):
+        task = (data.get(key) or {}).pop(user_id, None)
+        if task is not None and task is not current:
+            task.cancel()
+
+
+async def _end_provision_window(hass, user_id: str, provision_id: str, reason: str) -> None:
+    """Close a provisioning window: scramble the password (the link dies),
+    retire its QR file, forget the persisted record and stop its tasks.
+    Safe when the user or its login is gone (deleted since provisioning)."""
+    rec = _pending_provision(hass, user_id, provision_id)
+    if rec is None:
+        return
+    login_username = rec.get("login_username")
+    user = await hass.auth.async_get_user(user_id)
+    provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
+    if user is None or provider is None:
+        _LOGGER.info("CASA: Provisioning window for '%s' closed (%s); user no longer exists.", login_username, reason)
+    else:
+        try:
+            async with _lock_for(hass, "user", user_id):
+                await _set_account_password(hass, provider, login_username)
+            _LOGGER.info("CASA: Password for %s scrambled (%s).", login_username, reason)
+        except Exception as err:  # InvalidUser: login removed since provisioning
+            _LOGGER.warning("CASA: Could not scramble password for '%s' (%s): %s", login_username, reason, err)
+    await _retire_provision_qr(hass, rec)
+    if _pending_provision(hass, user_id, provision_id) is not None:
+        hass.data[DOMAIN]["stored_data"]["pending_provisions"].pop(user_id, None)
+        _save_stored_data(hass)
+    _cancel_provision_tasks(hass, user_id)
+
+
+async def _provision_timer(hass, user_id: str, provision_id: str) -> None:
+    """Drive one persisted provisioning window: retire the QR file when the
+    scanning window ends, scramble at scramble_at, and forget the record once
+    the redemption listener's time is up too. Each step re-reads the record,
+    so a redemption that already closed the window simply ends this task."""
+    try:
+        while True:
+            rec = _pending_provision(hass, user_id, provision_id)
+            if rec is None:
+                return
+            steps = []
+            if rec.get("qr_file") and rec.get("window_ends_at"):
+                steps.append((rec["window_ends_at"], "qr"))
+            if rec.get("scramble_at"):
+                steps.append((rec["scramble_at"], "scramble"))
+            if not steps:
+                steps.append((rec.get("listen_until") or 0, "end"))
+            when, action = min(steps)
+            wait = when - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            if action == "qr":
+                await _retire_provision_qr(hass, rec)
+            elif action == "scramble":
+                await _end_provision_window(hass, user_id, provision_id, "timer")
+                return
+            else:
+                hass.data[DOMAIN]["stored_data"].get("pending_provisions", {}).pop(user_id, None)
+                _save_stored_data(hass)
+                listener = hass.data[DOMAIN]["listeners"].pop(user_id, None)
+                if listener is not None:
+                    listener.cancel()
+                hass.data[DOMAIN]["timers"].pop(user_id, None)
+                return
+    except asyncio.CancelledError:
+        pass
+
+
+def _arm_pending_provision(hass, user_id: str) -> None:
+    """(Re)start the timer and redemption listener for user_id's persisted
+    provisioning window. Used right after provisioning and again at setup,
+    so single-use and expiry survive reloads and restarts; a window whose
+    deadlines passed while HA was down is closed immediately by the timer."""
+    _cancel_provision_tasks(hass, user_id)
+    rec = _pending_provision(hass, user_id)
+    if rec is None:
+        return
+    data = hass.data[DOMAIN]
+    provision_id = rec.get("provision_id")
+    data["timers"][user_id] = hass.async_create_task(_provision_timer(hass, user_id, provision_id))
+    ttl = int((rec.get("listen_until") or 0) - time.time())
+    if ttl <= 0:
+        return
+
+    async def _on_redeemed():
+        # Single-use link: rotate the password the moment it is used.
+        await _end_provision_window(hass, user_id, provision_id, "redeemed")
+
+    data["listeners"][user_id] = hass.async_create_task(
+        _login_listener(
+            hass, rec.get("login_username"), user_id, set(rec.get("known_token_ids") or []), ttl,
+            rec.get("method"), on_redeemed=_on_redeemed if rec.get("single_use") else None,
+            provision_id=provision_id,
+        )
+    )
+
+
+def _rearm_pending_provisions(hass) -> None:
+    """Setup-time: re-arm every persisted provisioning window."""
+    pending = hass.data[DOMAIN]["stored_data"].get("pending_provisions") or {}
+    for user_id in list(pending.keys()):
+        if not isinstance(pending.get(user_id), dict) or not pending[user_id].get("provision_id"):
+            pending.pop(user_id, None)
+            continue
+        _arm_pending_provision(hass, user_id)
 
 
 def _find_device_record(stored_data: dict, device_id: str):
@@ -2792,11 +2967,9 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
 
     async def _reauth(self, request, user, body, device_id):
         hass = self.hass
-        data = hass.data[DOMAIN]
-        stored_data = data["stored_data"]
-        qu_data = data["qu_data"]
+        stored_data = hass.data[DOMAIN]["stored_data"]
 
-        device_info, old_uid, old_username = _find_device_record(stored_data, device_id)
+        device_info, _old_uid, _old_username = _find_device_record(stored_data, device_id)
         if not device_info:
             return self.json({"error": "Device not found"}, status_code=404)
 
@@ -3574,6 +3747,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if method not in ("qr", "ble", "deep_link", "manual"):
             return {"error": f"Invalid method: {method}"}
 
+        # Optional QR file under www/ (validated before anything is changed).
+        qr_file = None
+        qr_expire_mode = "delete"
+        if method == "qr" and str(service_data.get("qr_filename", "") or "").strip():
+            qr_file = _safe_qr_filename(service_data.get("qr_filename"))
+            if not qr_file:
+                return {"error": "Invalid qr_filename: use letters, digits, '.', '_' or '-' (no paths)"}
+            if not service_data.get("delete_qr_after_window", True):
+                qr_expire_mode = "expire"
+
         _LOGGER.debug("CASA: Internal provision function triggered (method: %s).", method)
 
         current_dir = os.path.dirname(__file__)
@@ -3758,8 +3941,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # The device_id doesn't exist yet at provision time (see
         # async_register_device below) — stash which profile (if any) was
         # used, keyed by the one thing both moments share: the HA user_id.
-        # In-memory only (like timers/listeners below); self-heals on the
-        # next provision if lost to a reload.
+        # In-memory only; self-heals on the next provision if lost to a
+        # reload.
         hass.data[DOMAIN].setdefault("pending_profile_by_user", {})[target_user.id] = {
             "profile_id": profile_key or None,
             "profile_name": matched_profile.get("name") if matched_profile else None,
@@ -3942,38 +4125,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     return {"error": "Encryption failed"}
             deep_link, universal_link = build_links(final_payload, 2)
 
-        # Setup method-specific fields
-        delete_qr = False
-        final_filename = None
+        # QR delivery: the image is returned inline (qr_data_uri). A file under
+        # www/ — served unauthenticated at /local/ — is written only when the
+        # caller names one, and it is retired when the window closes.
         successful_targets = []
-
-        # Filename & QR creation helper
-        def create_qr_images(text):
-            www_dir = hass.config.path("www")
-            os.makedirs(www_dir, exist_ok=True)
-            custom_path = os.path.join(www_dir, final_filename) if final_filename else None
-            dashboard_path = os.path.join(www_dir, "casa_qr.png")
-
-            img = qrcode.make(text)
-            if custom_path:
-                img.save(custom_path)
-            img.save(dashboard_path)
-            return final_filename
-
         qr_data_uri = None
         if method == "qr":
-            delete_qr = service_data.get("delete_qr_after_window", True) if timeout_mins > 0 else False
-            qr_filename_input = str(service_data.get("qr_filename", "")).strip()
-            if qr_filename_input:
-                final_filename = qr_filename_input if qr_filename_input.endswith(".png") else f"{qr_filename_input}.png"
-            else:
-                final_filename = f"qr_{login_username}_{int(time.time())}.png"
-
-            await hass.async_add_executor_job(create_qr_images, deep_link)
+            if qr_file:
+                await hass.async_add_executor_job(_write_qr_file, hass, qr_file, deep_link)
+                _LOGGER.info("CASA: QR Code saved as %s.", qr_file)
             qr_data_uri = await hass.async_add_executor_job(_qr_png_data_uri, deep_link)
-            _LOGGER.info("CASA: QR Code saved as %s.", final_filename)
 
         if esphome_targets:
+            # Remembered so casa.clear_ble_beacon can default to them.
+            hass.data[DOMAIN]["last_ble_targets"] = list(esphome_targets)
             for target in esphome_targets:
                 try:
                     domain, service = target.split(".")
@@ -3992,63 +4157,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 except Exception as e:
                     _LOGGER.error("CASA ERROR: Failed to call ESPHome service %s. Error: %s", target, str(e))
 
-        # Detach Cleanup/Auto-Destruct Timer
-        async def _cleanup_sequence(username, auth_provider, trans_time, scramble_time, do_scramble, do_delete, filename):
-            try:
-                current_time = 0
-                events = []
-
-                # Only add QR actions if a timeout exists and method is qr
-                if method == "qr" and trans_time > 0:
-                    events.append({"time": trans_time, "action": "qr"})
-                if do_scramble:
-                    events.append({"time": scramble_time, "action": "scramble"})
-
-                events.sort(key=lambda x: x["time"])
-
-                for event in events:
-                    wait_time = event["time"] - current_time
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
-                        current_time += wait_time
-
-                    if event["action"] == "qr":
-                        if do_delete:
-                            def delete_and_overwrite():
-                                www_dir = hass.config.path("www")
-                                custom_path = os.path.join(www_dir, filename)
-                                dashboard_path = os.path.join(www_dir, "casa_qr.png")
-
-                                if os.path.exists(custom_path):
-                                    os.remove(custom_path)
-
-                                img = qrcode.make("EXPIRED - Request a new Casa code.")
-                                img.save(dashboard_path)
-
-                            await hass.async_add_executor_job(delete_and_overwrite)
-                            _LOGGER.info("CASA: QR Code file %s physically deleted.", filename)
-                        else:
-                            await hass.async_add_executor_job(create_qr_images, "EXPIRED - Request a new Casa code.")
-                            _LOGGER.info("CASA: QR Code %s wiped from dashboard.", filename)
-
-                    elif event["action"] == "scramble":
-                        await _scramble_and_close(hass, username, auth_provider, target_username)
-            except asyncio.CancelledError:
-                pass
-
-        if target_username in hass.data[DOMAIN]["timers"]:
-            hass.data[DOMAIN]["timers"][target_username].cancel()
-
-        if (method in ("qr", "deep_link", "manual") and timeout_mins > 0) or password_scramble:
-            countdown_task = hass.async_create_task(
-                _cleanup_sequence(login_username, provider, timeout_secs, scramble_timeout_secs, password_scramble, delete_qr, final_filename)
-            )
-            hass.data[DOMAIN]["timers"][target_username] = countdown_task
-        else:
+        if not ((method in ("qr", "deep_link", "manual") and timeout_mins > 0) or password_scramble):
             _LOGGER.warning("CASA: No timeout or password scramble configured. Code is permanent.")
 
-        # Start login listener to detect code redemption
-        known_token_ids = set(target_user.refresh_tokens.keys())
+        # Redemption listener lifetime.
         # Single use (scramble on first redemption) applies to every method but
         # BLE: a scrambled password would strand a beacon still broadcasting it.
         single_use = password_scramble and method != "ble"
@@ -4066,28 +4178,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # E4: Hard cap listener TTL to 30 minutes (1800 seconds)
             listener_ttl = min(listener_ttl, 1800)
 
-        if target_username in hass.data[DOMAIN]["listeners"]:
-            hass.data[DOMAIN]["listeners"][target_username].cancel()
-
-        async def _on_redeemed():
-            # Single-use link: rotate the password the moment it is used. The
-            # fallback cleanup timer is left running: its later scramble is a
-            # harmless second rotation, and its QR-wipe step must still fire.
-            await _scramble_and_close(hass, login_username, provider, target_username)
-
-        listener_task = hass.async_create_task(
-            _login_listener(
-                hass, login_username, target_user.id, known_token_ids, listener_ttl, method,
-                on_redeemed=_on_redeemed if single_use else None,
-            )
-        )
-        hass.data[DOMAIN]["listeners"][target_username] = listener_task
+        # Persist the window (keyed by HA user id, not the typed username) so
+        # single-use and expiry survive reloads and restarts; setup re-arms
+        # it. A new provision for the same user replaces the old window — its
+        # password was just rotated, so its QR file is dead too.
+        now_ts = time.time()
+        provision_id = secrets.token_hex(8)
+        pending_provisions = stored_data.setdefault("pending_provisions", {})
+        previous = pending_provisions.get(target_user.id)
+        if previous and previous.get("qr_file") and previous.get("qr_file") != qr_file:
+            await _retire_provision_qr(hass, previous)
+        pending_provisions[target_user.id] = {
+            "provision_id": provision_id,
+            "login_username": login_username,
+            "method": method,
+            "single_use": single_use,
+            "scramble_at": now_ts + scramble_timeout_secs if password_scramble else None,
+            "window_ends_at": now_ts + timeout_secs if (method == "qr" and timeout_secs > 0) else None,
+            "listen_until": now_ts + listener_ttl,
+            "known_token_ids": sorted(target_user.refresh_tokens.keys()),
+            "qr_file": qr_file,
+            "qr_expire_mode": qr_expire_mode,
+            "created_at": now_ts,
+        }
+        _save_stored_data(hass)
+        _arm_pending_provision(hass, target_user.id)
 
         if method == "manual":
             # Plaintext values for the iOS app's manual provisioning sheet,
             # field-for-field. The password/window expiry still applies.
             return {
                 "method": "manual",
+                "provision_id": provision_id,
                 "expires_at": expiration_unix,
                 "fields": {
                     "server_url": final_server_url,
@@ -4117,8 +4239,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         elif method == "qr":
             result = {
                 "method": "qr",
-                "filename": final_filename,
-                "url_path": f"/local/{final_filename}",
+                "provision_id": provision_id,
+                # Only set when the caller asked for a qr_filename file.
+                "filename": qr_file,
+                "url_path": f"/local/{qr_file}" if qr_file else None,
                 "url_path_deprecated": True,
                 "qr_data_uri": qr_data_uri,
                 "expires_at": expiration_unix,
@@ -4132,6 +4256,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         elif method == "deep_link":
             result = {
                 "method": "deep_link",
+                "provision_id": provision_id,
                 "deep_link": deep_link,
                 "universal_link": universal_link,
                 "expires_at": expiration_unix
@@ -4143,6 +4268,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             return {
                 "method": "ble",
+                "provision_id": provision_id,
                 "status": "success",
                 "successful_targets": successful_targets,
                 "expires_at": expiration_unix,
@@ -4418,9 +4544,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             esphome_targets = [str(s).strip() for s in esphome_services_input if str(s).strip()]
         else:
             esphome_targets = [str(esphome_services_input).strip()] if str(esphome_services_input).strip() else []
-        
+
         if not esphome_targets:
-            return {"error": "Missing ESPHome target services"}
+            # Default to the beacons the most recent provision broadcast to.
+            esphome_targets = list(hass.data[DOMAIN].get("last_ble_targets") or [])
+        if not esphome_targets:
+            return {"error": "Missing ESPHome target services (none given and no recent BLE provision)"}
 
         successful_targets = []
         for target in esphome_targets:
@@ -5359,6 +5488,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, _location_staleness_sweep, timedelta(seconds=60)
     )
 
+    # Re-arm provisioning windows persisted before a reload/restart (and
+    # close the ones whose deadlines passed meanwhile).
+    _rearm_pending_provisions(hass)
+
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "button"])
 
@@ -5614,9 +5747,25 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception:
         pass
 
+    # Provisioning windows are persisted (stored_data["pending_provisions"])
+    # and re-armed by the next setup, so cancelling their tasks here no
+    # longer loses single-use/expiry.
     for task in hass.data[DOMAIN].get("timers", {}).values():
         task.cancel()
     for task in hass.data[DOMAIN].get("listeners", {}).values():
         task.cancel()
+
+    # Flush pending delayed saves with the current data: a reload within the
+    # 2 s delay would otherwise load the stale file and drop those writes.
+    data = hass.data[DOMAIN]
+    for store_key, data_key in (
+        ("store", "stored_data"), ("qu_store", "qu_data"), ("wg_store", "wg_data"),
+        ("pp_store", "pp_data"), ("lz_store", "lz_data"),
+    ):
+        if data.get(store_key) is not None and data.get(data_key) is not None:
+            try:
+                await data[store_key].async_save(data[data_key])
+            except Exception as err:
+                _LOGGER.warning("CASA: Could not flush %s on unload: %s", store_key, err)
     hass.data.pop(DOMAIN, None)
     return unload_ok

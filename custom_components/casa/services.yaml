@@ -182,13 +182,13 @@ provision:
           mode: box
     delete_qr_after_window:
       name: "Delete QR Code After Window"
-      description: "QR Method only. If enabled, the custom QR code image file will be physically deleted after the window closes."
+      description: "QR Method only, and only with a QR Filename. When the window closes (or a single-use code is redeemed, or the password scrambles) the file is deleted; if disabled, it is overwritten with an EXPIRED placeholder instead so a dashboard image pointing at it keeps loading."
       default: true
       selector:
         boolean: {}
     qr_filename:
       name: "QR Filename"
-      description: "QR Method only. Custom filename (without .png). If left blank, defaults to qr_[username]_[timestamp].png"
+      description: "QR Method only. Optional: also write the QR to www/<name>.png (served WITHOUT authentication at /local/<name>.png) for the window's lifetime. Letters, digits, '.', '_' and '-' only. Leave blank (recommended) to write no file — the QR is returned inline as qr_data_uri."
       selector:
         text: {}
     esphome_service:
@@ -412,13 +412,13 @@ generate_qr:
           mode: box
     delete_qr_after_window:
       name: "Delete QR Code After Window"
-      description: "If enabled, the custom QR code image file will be physically deleted after the window closes."
+      description: "Only with a QR Filename. When the window closes the file is deleted; if disabled, it is overwritten with an EXPIRED placeholder instead."
       default: true
       selector:
         boolean: {}
     qr_filename:
       name: "QR Filename"
-      description: "Optional. Custom filename (without .png). If left blank, defaults to qr_[username]_[timestamp].png"
+      description: "Optional: also write the QR to www/<name>.png (served WITHOUT authentication at /local/). Leave blank to write no file — the QR is returned inline as qr_data_uri. No shared casa_qr.png is written any more."
       selector:
         text: {}
     password_scramble:
@@ -739,8 +739,8 @@ clear_ble_beacon:
   fields:
     esphome_service:
       name: "ESPHome Target Services"
-      description: "Add ESPHome API services one by one (e.g., esphome.lobby_beacon_update_payload)."
-      required: true
+      description: "Add ESPHome API services one by one (e.g., esphome.lobby_beacon_update_payload). Optional: when omitted, the beacons targeted by the most recent provision since Home Assistant started are cleared."
+      required: false
       selector:
         text:
           multiple: true
