@@ -1,6 +1,6 @@
 # Casa provisioning protocol
 
-Status: contract for release 26.09.30; items marked (26.09.30) land in that release.
+Status: contract for release 26.10.01; items marked (26.09.30) or (26.10.01) landed in that release.
 
 ## 1. Overview
 
@@ -61,14 +61,21 @@ Keys are emitted in this order (the `profile` dict in `_provision_internal`).
 | `wireguard` | object | `allowed` (bool), `config` (string), `excluded_wifi` (string). |
 | `connect_wifi` | object | `ssid` (string), `password` (string). |
 | `location_zones` | object, optional | `anchors` (list), `config_version`; present only when zones are configured. |
+| `relay_url` | string, optional (26.10.01) | Push relay base URL without trailing slash, e.g. `https://relay.example`. Present only when the site uses a non-default relay; absent means `https://push.bonjour.casa`. `site_id` is only valid at this relay. |
+
+`pin` (26.10.01): when non-empty, the app prompts for it before provisioning for every
+method (QR, deep link, manual, BLE) and for v1 and v2 payloads alike; a wrong PIN allows
+a retry, cancel aborts, and five wrong attempts abort.
 
 ## 5. Version policy
 
-`v` is the payload format version. Adding an optional key never bumps it; removing, renaming, retyping a key, or changing the envelope does. `server_version` is `CASA_VERSION` for display only. The app supports a set of `v` values and shows an "Update Casa" alert naming both versions when it sees one it does not support. The server never emits a `v` the current app cannot parse without also bumping the app first.
+`v` is the payload format version. Adding an optional key never bumps it (apps ignore keys they don't know, such as `relay_url` on older builds); removing, renaming, retyping a key, or changing the envelope does. `server_version` is `CASA_VERSION` for display only. The app supports a set of `v` values and shows an "Update Casa" alert naming both versions when it sees one it does not support — it does not attempt a partial parse. The server never emits a `v` the current app cannot parse without also bumping the app first; `payload_version: 1` stays available for app builds that predate v2.
 
 ## 6. Single use (26.09.30)
 
-When `password_scramble` is on, the login password in a link is scrambled on first redemption: the login listener fires `casa_code_redeemed`, then scrambles the password and stops listening. The pending cleanup timer for that user is NOT cancelled; it stays as the fallback for links nobody redeems, and when it fires it rotates the password a second time (harmless) and still wipes the QR file.
+When `password_scramble` is on, the login password in a link is scrambled on first redemption: the login listener fires `casa_code_redeemed`, then the window closes — the password is scrambled, any QR file is retired, and the listener and fallback timer stop. Unredeemed links are scrambled by the timer at the scramble deadline.
+
+(26.10.01) The window (user id, login, scramble deadline, scanning-window end, listener deadline, known session tokens, QR file) is persisted in the integration store, keyed by HA user id, and re-armed when the integration loads. A reload or restart no longer cancels single use or expiry; a window whose deadline passed while HA was down is closed immediately, and a phone that redeemed the link meanwhile is detected by its new session token. A deleted user or login closes the window without error. `casa_code_redeemed` carries `user_id` and `provision_id` (also returned by `casa.provision`) so a client can match its own code.
 
 Listener TTL: while single use is armed, the listener runs for the scramble window plus 30 s (`password_scramble_in`, or the scanning window when that is 0), capped at 24 h. It polls every 2 s for the first 30 minutes, then every 10 s. Without single use the listener keeps its 30-minute cap.
 
@@ -76,7 +83,9 @@ BLE is excluded: for `method: ble` the password is not scrambled on redemption (
 
 ## 7. QR delivery (26.09.30)
 
-For `method: qr` the response carries `qr_data_uri` (`data:image/png;base64,...`), the PNG of the deep link rendered in memory. Clients prefer it. `url_path` (a `/local/<file>.png` path) is deprecated this release: it is still returned, with `url_path_deprecated: true`, and will be removed in the next release.
+For `method: qr` the response carries `qr_data_uri` (`data:image/png;base64,...`), the PNG of the deep link rendered in memory. Clients use it.
+
+(26.10.01) No file is written by default: `/local/` is served without authentication, so a QR image there exposes live credentials. `filename`/`url_path` are `null` unless the caller passes `qr_filename`, which is reduced to a safe basename (`[A-Za-z0-9._-]`, `.png`; paths and `..` are rejected) and written to `www/` for the window only — it is deleted when the window closes (or overwritten with an EXPIRED image when `delete_qr_after_window: false`). The shared `www/casa_qr.png` is no longer written. `url_path` remains deprecated.
 
 ## 8. Device endpoints
 
@@ -84,8 +93,8 @@ All use the device's HA bearer token unless noted. Queue and update mechanics ar
 
 | Endpoint | Methods | Notes |
 |---|---|---|
-| `/api/casa/register_device` | POST, GET, DELETE | Register, read, and remove the device record. |
-| `/api/casa/heartbeat` | POST | Check-in; flags pending updates. |
+| `/api/casa/register_device` | POST, GET, DELETE | Register, read, and remove the device record. (26.10.01) One HA user owns a device_id; registering it as another user moves the record. Also callable as the `casa.register_device` service with a response. |
+| `/api/casa/heartbeat` | POST | Check-in; flags pending updates. (26.10.01) Response adds `site_id` and `relay_url`. |
 | `/api/casa/profile_updates` | GET, POST | Pull queued updates; acknowledge by id. |
 | `/api/casa/profile_report` | POST | Device reports its current profile fields. |
 | `/api/casa/location_report` | POST | No bearer token. The body is encrypted with the device key, and that encryption is the authentication. |

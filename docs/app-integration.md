@@ -15,6 +15,20 @@ All endpoints are authenticated with the device's normal HA bearer token, except
 
 ## 1. Heartbeat — `POST /api/casa/heartbeat`
 
+Request body (only `device_id` is required; omitted fields leave the stored value alone):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `device_id` | string | Required. |
+| `app_version` | string | |
+| `current_url` | string | Page the WebView is showing. |
+| `provisioned_at` | string (ISO 8601) | When the current profile was installed; a value newer than a pending expiry override drops that override. |
+| `expires_at` | int (unix s) | The device's session expiry; omit when it never expires. |
+| `wireguard_configured` / `wireguard_connected` | bool | |
+| `alias` | string | See "Device alias flow". |
+| `ip_address`, `last_12_token` | string | Optional overrides of what the server derives from the request. |
+| `location_state`, `location_reason`, `location_config_version` | string | Zone report piggy-backed on the heartbeat (same rules as `/api/casa/location_report`). |
+
 Response fields:
 
 ```json
@@ -29,13 +43,29 @@ Response fields:
   "heartbeat_interval_seconds": 300,
   "profile_report_interval_seconds": 3600,
   "location_config_version": "<string>|null",
+  "site_id": "<32 chars>",
+  "relay_url": "https://push.bonjour.casa",
   "expires_at": 1767225600
 }
 ```
 
 - `profile_report_interval_seconds` is the site's cadence for `POST /api/casa/profile_report` (below). Always present.
-- `location_config_version` is always present; `null` when the site has no location zones.
+- `location_config_version` is always present; `null` when the site has no location
+  zones (an empty anchor list has no config version). The server only re-enqueues the
+  zone config when it has a non-null version and the heartbeat's
+  `location_config_version` differs from it (or is missing), so a site without zones
+  never re-sends anything.
+- `site_id` / `relay_url` (26.10.01): the relay this site is registered with and its
+  site_id there. If either differs from what the app stored at provisioning, the app
+  re-registers with that relay and re-POSTs `register_device` with the new proxy token.
+  Older servers omit both.
 - `expires_at` is present only while an admin override is pending (`0` = permanent); omitted otherwise.
+- `reregister: true` means: re-register with the relay and POST `register_device`. Sent
+  when `/reconcile` found the relay lost the proxy token, and (26.10.01) when the
+  heartbeat's device_id is recorded under a different HA user — a heartbeat never takes
+  a device record over from another user (unless it presents the session token pinned
+  on that record, or that record's own session is gone); `register_device` moves it.
+  Such a heartbeat also answers `updates: false` and applies no location fields.
 - **Persist `device_key` and `device_key_id` on every heartbeat.** `device_key` is the
   shared secret used to decrypt pushes; `device_key_id` is its fingerprint.
 - If `updates == true`, call the pull endpoint (§2).
@@ -45,6 +75,23 @@ Response fields:
   range 60–3600). Always present. The app should apply it as its new heartbeat
   interval going forward, and reset to the 300s default on reprovision — a custom
   interval must never carry over from a previous site/session.
+- `400 {"error": "Device is being removed."}` while an admin purge of this device is in
+  flight; the session is about to be revoked anyway.
+
+### Register — `/api/casa/register_device`
+
+- `POST {"device_id": "<id>", "push_token": "<64 hex>"?}` → `{"status": "success"}`. The
+  push token is the relay proxy token (64 hex chars, else 400). Re-posting merges onto
+  the existing record. A device_id lives under exactly one HA user: registering one
+  that is recorded under another user moves the record to the caller and drops its
+  queued updates and pending reauthentication (they were addressed to the old user).
+- `GET ?device_id=<id>` → `{"registered": bool, "push_token", "registered_at", "last_seen_at"}`
+  (`registered` means push-registered).
+- `DELETE ?device_id=<id>` clears only the push registration; the record stays.
+- WebSocket fallback: the `casa.register_device` service (`device_id`, `push_token`,
+  both required) supports a response —
+  `hass.callService("casa", "register_device", data, undefined, false, true)` resolves
+  with `res.response.status == "success"`.
 
 ### Device alias flow
 
@@ -84,15 +131,28 @@ chars) — an admin-set alias always wins and is never overwritten.
 }
 ```
 
+- `(type, action)` pairs: `wireguard/update`, `wireguard/revoke`, `profile/update`,
+  `auth/reauthenticate`, `location/update` (schemas in §4).
 - `auth` / `reauthenticate` is never acked by the device (see the section after §4).
 - `location` / `update` carries the location-zone config and replaces any older `location` entries in the queue.
+- Ack every entry you cannot apply too (unknown type/action, malformed payload, a
+  WireGuard config the parser rejects, a `profile` entry with no `fields`) and log why;
+  only `auth/reauthenticate` stays unacked. (26.10.01) The server also drops non-auth
+  entries unacknowledged for 30 days and caps a device's queue at 50 entries (oldest
+  non-auth first), so a device that never acks can't grow its queue forever.
 
 ### Profile report — `POST /api/casa/profile_report`
 
 Body: `{"device_id": "<id>", "fields": { ... }}`. `fields` must be an object (400 otherwise);
 only live provisioning fields are kept, unknown keys are dropped. `401` no user, `404`
-device not registered. Returns `{"status": "success"}`. Sent every
+device not registered — or (26.10.01) not the caller's device: only the device's
+pinned session or its owning user may report. Returns `{"status": "success"}`. Sent every
 `profile_report_interval_seconds` or immediately on a `request_profile_report` push (§5).
+
+Report `immersive_level` as the level only (`"2"`) with `theme_color_mode` and
+`custom_color` (`"#rrggbb"`) as their own keys. A legacy `"level,mode,color"` triple is
+still accepted and split server-side. Bools may be JSON bools or `"true"`/`"false"`;
+numbers are stored as strings.
 
 ## 3. Acknowledge — `POST /api/casa/profile_updates`
 
@@ -130,6 +190,28 @@ The HA user account is never deleted; only this device's record and session are 
 | `wireguard` | `revoke`         | `{}`                                                           | remove the tunnel                  |
 | `profile`   | `update`         | `{ "profile_id": "...", "name": "...", "fields": { ... } }`     | apply `fields` (same as provisioning) |
 | `auth`      | `reauthenticate` | `{ "username": "...", "password": "..." }`                     | log out and auto-login as the new user (below) |
+| `location`  | `update`         | `{ "anchors": [ ... ], "config_version": "<string>" }`         | replace the zone config; empty `anchors` (`config_version: ""`) means tear down all regions and clear the config, without prompting for location permission |
+
+### `profile` / `update` fields
+
+`fields` is sparse — only the keys being changed are present (template applies carry
+what the template sets; the device editor pushes what the admin changed). Keys and
+types the app must accept:
+
+| Key | Type |
+|---|---|
+| `host_url` | string. A change to a different origin is refused (log + ack, keep the current server): the device has no credentials there; the panel warns that this needs a re-provision. Same-origin changes apply. |
+| `default_dashboard`, `allowed_pages`, `allowed_wifi`, `wireguard_excluded_wifi`, `push_notifications` (`"false"`, `"true"`, `"mandatory"`) | string |
+| `welcome_url` | string; `""` means no welcome page (same as absent) |
+| `immersive_level` | int, numeric string, or a legacy `"level,mode,color"` triple |
+| `theme_color_mode` (`inherit`, `custom`, `inherit_with_fallback`), `custom_color` (`#rrggbb`) | string |
+| `cache_control_hours` | number or numeric string (servers send a string; `""` = app default) |
+| `allow_all_pages`, `require_alias`, `allow_wireguard` | bool (also `"true"`/`"false"`) |
+
+WireGuard config never travels inside a profile update: when a template apply or a
+device-editor push resolves to a WireGuard config (`wireguard_config` or
+`wireguard_profile_id`), the server strips those keys and enqueues a separate
+`wireguard/update` entry. An app that still finds them in `fields` ignores them.
 
 ### `auth` / `reauthenticate` — remote credential rotation
 
@@ -155,6 +237,13 @@ heartbeat pull until the reauth completes (or the device wipes). Apps that
 predate this type ignore the entry and never ack it either — the server
 clears it at completion or on admin cancel. The push copy travels only inside
 the encrypted `casa_update` envelope (§5), never in plaintext APNs payload.
+
+(26.10.01) A queued entry always carries the target account's current password:
+any later rotation of that password (another provision, a single-use or timer
+scramble, `casa.scramble_guest_password`, a reauth that rotates it) drops the
+now-stale entry and its pending marker server-side, so a device never pulls
+credentials that can no longer log in. A push copy delivered before the rotation
+can't be recalled; its login simply fails.
 
 ---
 
@@ -189,11 +278,15 @@ doesn't match and you can't decrypt yet.
 
 ```
 command:           "wireguard_update" | "wireguard_revoke"
-encrypted:         true | false
-wireguard_payload: "<base64: nonce||ciphertext||tag>"   // or base64(plaintext) if encrypted=false
+encrypted:         true
+wireguard_payload: "<base64: nonce||ciphertext||tag>"
 device_key_id:     "<8 hex>"
 title / message:   always present; "" when silent
 ```
+
+(26.10.01) Always encrypted: the service's `encrypt_config: false` is deprecated and
+ignored with a warning. Older servers could send `encrypted: false` with
+`base64(plaintext)`.
 
 Inner JSON: `{ "action", "config", "excluded_wifi", "ts" }` (update) or
 `{ "action": "revoke", "ts" }`. **No `update_id` and nothing to ack** — these have no
@@ -210,6 +303,21 @@ data: { "update_id": "...", "type": "...", "action": "..." }
 ```
 
 Treat as a nudge: heartbeat + pull.
+
+### `casa.notify_user` pushes
+
+A visible alert with the caller's `title`/`message`; any `data` dict is passed through
+as-is (no `command`, never routed through command dispatch). Keys the app acts on:
+
+| Key | Type | Effect |
+|---|---|---|
+| `nav_path` | string | Navigate the WebView to this path. |
+| `sheet_path` | string | Open this path in a bottom sheet. |
+| `stream_url` | string | Open a native stream player sheet. |
+| `sheet_height` | number (0–1) | Sheet height fraction (default 0.6 for `sheet_path`, 0.5 for `stream_url`). |
+| `timeout` | number (s) | Auto-dismiss the sheet / stream after this long. |
+| `haptic` | string | `light`, `medium`, `heavy`, `success`, `warning`, `error` (`none` = off). |
+| `open_on_delivery` | bool | Act immediately when delivered in the foreground (banner suppressed) instead of on tap. |
 
 ### Command pushes (`deprovision`, `clear_cache_and_reload`)
 
