@@ -30,3 +30,12 @@ def test_explicit_entry_wins_without_hass_data():
 def test_explicit_entry_wins_over_stored_entry():
     entry = SimpleNamespace(options={"relay_base_url": "http://relay.local:9000"})
     assert relay_url(_hass("http://10.0.0.1"), "/send", entry=entry) == "http://relay.local:9000/send"
+
+
+from custom_components.casa import payload_relay_url
+
+
+def test_payload_relay_url_only_for_non_default_relay():
+    assert payload_relay_url(_hass()) is None
+    assert payload_relay_url(_hass("https://push.bonjour.casa/")) is None
+    assert payload_relay_url(_hass("http://relay.local:9000/")) == "http://relay.local:9000"

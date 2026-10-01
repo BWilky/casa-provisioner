@@ -65,3 +65,11 @@ def test_heartbeat_with_stale_version_reconciles():
     status, resp = _heartbeat(hass, {"device_id": "D1", "location_config_version": "old"})
     assert resp["location_config_version"] == "abcd1234" and resp["updates"] is True
     assert len(_location_entries(hass)) == 1
+
+
+def test_heartbeat_response_carries_site_id_and_relay_url():
+    hass = _hass()
+    hass.casa["stored_data"]["site_id"] = "s" * 32
+    status, resp = _heartbeat(hass, {"device_id": "D1"})
+    assert resp["site_id"] == "s" * 32
+    assert resp["relay_url"] == "https://push.bonjour.casa"

@@ -195,6 +195,13 @@ def relay_base(hass, entry=None) -> str:
     return base.rstrip("/")
 
 
+def payload_relay_url(hass) -> str | None:
+    """relay_url for provisioning payloads: the site's relay base, but only
+    when it is not the default (apps assume the default when it is absent)."""
+    base = relay_base(hass)
+    return base if base != RELAY_BASE_URL.rstrip("/") else None
+
+
 def relay_url(hass, path: str, entry=None) -> str:
     """Absolute relay URL for path, honouring the per-site relay_base_url option."""
     return relay_base(hass, entry) + "/" + path.lstrip("/")
@@ -1533,6 +1540,10 @@ class CasaHeartbeatView(HomeAssistantView):
             "heartbeat_interval_seconds": result.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
             "profile_report_interval_seconds": result.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
             "location_config_version": server_lz_version or None,
+            # The relay this site is registered with and its site_id there;
+            # a device whose stored values differ re-registers its push token.
+            "site_id": stored_data.get("site_id"),
+            "relay_url": relay_base(self.hass),
         }
         # Only emitted while an admin-set override is pending; the stored value is
         # never echoed back, so a freshly re-provisioned device keeps its own expiry.
@@ -4295,6 +4306,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "anchors": lz_anchors,
                     "config_version": lz_version,
                 }
+            # Optional, only for a non-default relay: site_id is only valid
+            # at the relay that issued it.
+            if payload_relay_url(hass):
+                profile["relay_url"] = payload_relay_url(hass)
             payload_string = json.dumps(profile, separators=(",", ":"))
             if payload_decrypted:
                 final_payload = base64.urlsafe_b64encode(payload_string.encode("utf-8")).decode("utf-8").rstrip("=")
