@@ -11,7 +11,7 @@ import uuid
 import zlib
 import urllib.parse
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.config_entries import ConfigEntry
@@ -26,7 +26,7 @@ import qrcode
 
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
-from .const import CASA_VERSION, DOMAIN, CONF_ADMIN_SYSTEM_ONLY, RELAY_BASE_URL, CONF_RELAY_BASE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
+from .const import CASA_VERSION, DOMAIN, QUEUE_MAX_AGE_DAYS, QUEUE_MAX_PER_DEVICE, CONF_ADMIN_SYSTEM_ONLY, RELAY_BASE_URL, CONF_RELAY_BASE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
 from .location import (
     ALLOWED_REASONS,
     ALLOWED_REPORT_KEYS,
@@ -876,6 +876,16 @@ def _dequeue_update(qu_data: dict, device_id: str, update_id: str) -> dict | Non
     return removed
 
 
+def _queued_before(entry: dict, cutoff) -> bool:
+    """True when a queue entry's created_at is older than cutoff (unparseable
+    timestamps are kept)."""
+    try:
+        created = datetime.fromisoformat(str(entry.get("created_at") or ""))
+        return created < cutoff
+    except (ValueError, TypeError):
+        return False
+
+
 async def _prune_stale_queued_updates(hass) -> int:
     """Drop queued updates that can never be consumed, and repair or drop
     reauth_pending markers that can never complete.
@@ -899,7 +909,11 @@ async def _prune_stale_queued_updates(hass) -> int:
         with the queue entry they reference;
       - device-record copies under deleted owners are removed when the same
         device_id also has a record under a live owner (duplicates left
-        behind by register/heartbeat racing an incomplete reauth).
+        behind by register/heartbeat racing an incomplete reauth);
+      - non-auth entries older than QUEUE_MAX_AGE_DAYS are dropped, and a
+        device's queue is capped at QUEUE_MAX_PER_DEVICE by dropping its
+        oldest non-auth entries (a device that never acks — e.g. an old app
+        that can't apply an entry type — must not grow its queue forever).
 
     Returns the number of queue entries removed.
     """
@@ -921,6 +935,7 @@ async def _prune_stale_queued_updates(hass) -> int:
 
     removed = 0
     stored_changed = False
+    cutoff = dt_util.now() - timedelta(days=QUEUE_MAX_AGE_DAYS)
 
     def _iter_records():
         for uid, udata in stored_data.get("users", {}).items():
@@ -992,7 +1007,24 @@ async def _prune_stale_queued_updates(hass) -> int:
                         device_id, target,
                     )
                     continue
+            elif _queued_before(e, cutoff):
+                removed += 1
+                _LOGGER.info(
+                    "CASA: Purged %s/%s update %s for device '%s' — unacknowledged for over %d days.",
+                    e.get("type"), e.get("action"), e.get("id"), device_id, QUEUE_MAX_AGE_DAYS,
+                )
+                continue
             kept.append(e)
+        overflow = len(kept) - QUEUE_MAX_PER_DEVICE
+        if overflow > 0:
+            # Entries are appended in order, so the first non-auth ones are the oldest.
+            drop_ids = {id(e) for e in [e for e in kept if e.get("type") != "auth"][:overflow]}
+            kept = [e for e in kept if id(e) not in drop_ids]
+            removed += len(drop_ids)
+            _LOGGER.info(
+                "CASA: Device '%s' had more than %d queued updates; dropped the %d oldest.",
+                device_id, QUEUE_MAX_PER_DEVICE, len(drop_ids),
+            )
         if len(kept) != len(entries):
             if kept:
                 qu_data["updates"][device_id] = kept
@@ -5607,6 +5639,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _scheduled_reconcile(now):
         await _reconcile_site()
+        # Daily queue hygiene too (stale/oversized queues, stranded markers).
+        await _prune_stale_queued_updates(hass)
 
     hass.data[DOMAIN]["reconcile_unsub"] = async_track_time_interval(
         hass, _scheduled_reconcile, timedelta(days=1)

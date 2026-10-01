@@ -13,6 +13,12 @@ CONF_SHOW_PANEL = "show_panel"
 # A device is considered stale if not seen for this many days.
 STALE_DAYS = 14
 
+# Queue hygiene: non-auth queued updates older than this are dropped, and a
+# device's queue is capped (oldest non-auth entries go first). auth entries
+# are only ever removed by reauth completion/cancel or a password rotation.
+QUEUE_MAX_AGE_DAYS = 30
+QUEUE_MAX_PER_DEVICE = 50
+
 # Maximum length of a device alias (admin- or user-provided).
 DEVICE_ALIAS_MAX_LEN = 60
 
