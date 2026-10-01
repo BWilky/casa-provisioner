@@ -927,6 +927,21 @@ export function createView(app) {
     return out;
   }
 
+  // First app version that refuses a cross-origin host_url push (keeps its
+  // current server); older versions apply it and strand themselves on an
+  // origin they have no credentials for.
+  const SAFE_HOST_CHANGE_APP_VERSION = [1, 8];
+
+  function appVersionAtLeast(version, min) {
+    const m = String(version || "").match(/^(\d+)(?:\.(\d+))?/);
+    if (!m) return false; // unknown -> treat as old
+    const parts = [parseInt(m[1], 10), parseInt(m[2] || "0", 10)];
+    for (let i = 0; i < min.length; i++) {
+      if (parts[i] !== min[i]) return parts[i] > min[i];
+    }
+    return true;
+  }
+
   function originOf(url) {
     try {
       return new URL(String(url || "").trim()).origin;
@@ -945,12 +960,25 @@ export function createView(app) {
     }
     const oldOrigin = originOf(provisioningBaseline && provisioningBaseline.host_url);
     if ("host_url" in fields && oldOrigin && originOf(fields.host_url) !== oldOrigin) {
+      if (!appVersionAtLeast(device.app_version, SAFE_HOST_CHANGE_APP_VERSION)) {
+        // Blocked: this app version would apply the new host unconditionally
+        // and land on an origin it has no credentials for.
+        ui.showInfo({
+          title: "Re-provision to change host",
+          message:
+            `The new host URL is on a different origin than ${oldOrigin}. Moving a device to another ` +
+            `origin requires re-provisioning it. This device runs Casa ${device.app_version || "(unknown version)"}, ` +
+            "which would switch to the new host without credentials for it and stop working, so the change " +
+            "was not pushed. Re-provision the device, or keep the current origin.",
+        });
+        return;
+      }
       ui.showConfirm({
         title: "Host change needs re-provisioning",
         message:
-          `The new host URL is on a different origin than ${oldOrigin}. The device has no credentials for it, ` +
-          "so it will refuse this change and keep its current server. To move it to the new host, " +
-          "re-provision the device. Push the other changes anyway?",
+          `The new host URL is on a different origin than ${oldOrigin}. A device can only move to another ` +
+          "origin by being re-provisioned; this app version will ignore the host change and keep its current " +
+          "server (older app versions would break). Push the other changes anyway?",
         confirmLabel: "Push anyway",
         onConfirm: () => pushProvisioning(fields),
       });
