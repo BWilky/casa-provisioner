@@ -5328,7 +5328,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         username = str(call.data.get("username", "")).strip()
         action = str(call.data.get("action", "update")).strip().lower()
         silent = call.data.get("silent", True)
-        encrypt_config = call.data.get("encrypt_config", True)
+        # encrypt_config: false is deprecated and ignored — the push always
+        # carries the config end-to-end encrypted (plaintext base64 let the
+        # relay read the tunnel's private key).
+        if call.data.get("encrypt_config", True) is False:
+            _LOGGER.warning(
+                "CASA: update_wireguard encrypt_config=false is deprecated and ignored; the WireGuard push is always encrypted."
+            )
         wireguard_config = str(call.data.get("wireguard_config", ""))
         excluded_wifi = str(call.data.get("wireguard_excluded_wifi", "")).strip()
         title = str(call.data.get("title", "")).strip()
@@ -5411,19 +5417,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             inner_str = json.dumps(inner)
 
             device_key = stored_data.get("device_key")
-            if encrypt_config:
-                if not device_key:
-                    _LOGGER.error("CASA ERROR: No site device_key available; cannot encrypt wireguard payload.")
-                    failed_count += 1
-                    continue
-                try:
-                    wg_payload = _encrypt_push_payload(inner_str, device_key, did)
-                except Exception as e:
-                    _LOGGER.error("CASA ERROR: Failed to encrypt wireguard payload for device '%s': %s", did, e)
-                    failed_count += 1
-                    continue
-            else:
-                wg_payload = base64.b64encode(inner_str.encode("utf-8")).decode("utf-8")
+            if not device_key:
+                _LOGGER.error("CASA ERROR: No site device_key available; cannot encrypt wireguard payload.")
+                failed_count += 1
+                continue
+            try:
+                wg_payload = _encrypt_push_payload(inner_str, device_key, did)
+            except Exception as e:
+                _LOGGER.error("CASA ERROR: Failed to encrypt wireguard payload for device '%s': %s", did, e)
+                failed_count += 1
+                continue
 
             payload = {
                 "target": push_token,
@@ -5435,9 +5438,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "priority": 5 if silent else 10,
                 "data": {
                     "command": command,
-                    "encrypted": bool(encrypt_config),
+                    "encrypted": True,
                     "wireguard_payload": wg_payload,
-                    "device_key_id": _device_key_id(device_key) if (encrypt_config and device_key) else None,
+                    "device_key_id": _device_key_id(device_key),
                 },
             }
 
@@ -5445,7 +5448,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             if success:
                 sent_count += 1
-                _LOGGER.info("CASA: Sent wireguard %s to device '%s' (encrypted=%s, silent=%s).", action, did, encrypt_config, silent)
+                _LOGGER.info("CASA: Sent wireguard %s to device '%s' (silent=%s).", action, did, silent)
             else:
                 failed_count += 1
                 _LOGGER.error("CASA: Failed to deliver wireguard %s to device '%s' after trying all relays.", action, did)

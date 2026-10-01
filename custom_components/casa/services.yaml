@@ -920,7 +920,7 @@ set_device_expiration:
 
 update_wireguard:
   name: "Update WireGuard Configuration"
-  description: "Pushes a new WireGuard configuration (or revokes the existing one) to a provisioned device over push notification. The config is end-to-end encrypted so the push relay can never read it."
+  description: "Pushes a new WireGuard configuration (or revokes the existing one) to a provisioned device over push notification (fire-and-forget; prefer queued updates from the admin panel). The config is always end-to-end encrypted so the push relay can never read it."
   fields:
     device_id:
       name: "Device ID"
@@ -959,8 +959,8 @@ update_wireguard:
       selector:
         text: {}
     encrypt_config:
-      name: "Encrypt Configuration"
-      description: "End-to-end encrypt the WireGuard config so the push relay cannot read or tamper with it. The key is derived from the device's existing session secret (never sent to the relay) and the app decrypts it locally. Leave enabled unless you are debugging and explicitly need a plaintext payload."
+      name: "Encrypt Configuration (deprecated)"
+      description: "Deprecated and ignored: the WireGuard push is always end-to-end encrypted with a key derived from the site device_key (never sent to the relay), so the relay cannot read or tamper with it. Passing false only logs a warning."
       default: true
       selector:
         boolean: {}
