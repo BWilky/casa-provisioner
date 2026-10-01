@@ -40,3 +40,21 @@ def test_happy_path_creates_and_tracks_user():
     assert err is None and result["username"] == "guest"
     assert result["user_id"] in hass.casa["stored_data"]["users"]
     assert "guest" in hass.auth.provider.data.passwords
+
+
+def test_rollback_removal_is_saved_and_provider_data_may_load_lazily():
+    hass = FakeHass()
+    hass.auth.provider.data = None  # newer HA: loaded on first use
+    hass.auth.fail_link = True
+    saves = []
+    data = hass.auth.provider._data
+    orig = data.async_save
+
+    async def counting_save():
+        saves.append(dict(data.passwords))
+        await orig()
+
+    data.async_save = counting_save
+    result, err = _create(hass, "Guest", "guest")
+    assert result is None
+    assert saves and "guest" not in saves[-1]  # the removal itself was persisted

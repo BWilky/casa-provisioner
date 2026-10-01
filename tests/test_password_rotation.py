@@ -96,3 +96,14 @@ def test_second_device_to_same_user_reuses_queued_password():
     assert len(e1) == len(e2) == 1
     current = hass.auth.provider.data.passwords["kiosk"]
     assert e1[0]["payload"]["password"] == e2[0]["payload"]["password"] == current
+
+
+def test_unverified_queued_password_is_not_reused():
+    hass = _reauth_hass()
+    # An admin-typed password the server never set (or one set out of band).
+    hass.casa["qu_data"]["updates"]["D1"] = [_auth_entry("e1", "kiosk", "typed-by-admin")]
+    asyncio.run(_post(hass, {"device_id": "D2", "user_id": "tgt"}))
+    e2 = _queued_auth(hass, "D2")[0]
+    assert e2["payload"]["password"] != "typed-by-admin"
+    assert e2["payload"]["password"] == hass.auth.provider.data.passwords["kiosk"]
+    assert _queued_auth(hass, "D1") == []  # stale entry dropped by the rotation

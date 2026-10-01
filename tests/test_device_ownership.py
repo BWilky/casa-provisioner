@@ -1,4 +1,6 @@
 import asyncio
+import time
+from datetime import datetime, timedelta, timezone
 
 from custom_components.casa import (
     CasaDeviceProfileReportView,
@@ -21,40 +23,72 @@ def _hass():
     return hass, sd
 
 
-def test_register_moves_record_purging_queue_and_markers():
-    hass, sd = _hass()
-    assert asyncio.run(_claim_device_for_caller(hass, "PHONE", "B", sd["users"]["B"]["devices"], "rB"))
-    assert "PHONE" not in sd["users"]["A"]["devices"]
-    moved = sd["users"]["B"]["devices"]["PHONE"]
-    assert moved["alias"] == "Hall" and "reauth_pending" not in moved
-    assert "PHONE" not in hass.casa["qu_data"]["updates"]
+def _claim(hass, sd, rtid="rB"):
+    return asyncio.run(_claim_device_for_caller(hass, "PHONE", "B", sd["users"]["B"]["devices"], rtid))
 
 
-def test_heartbeat_from_non_owner_is_refused_and_changes_nothing():
+def _moved(hass, sd):
+    return "PHONE" in sd["users"]["B"]["devices"] and "PHONE" not in sd["users"]["A"]["devices"]
+
+
+def test_knowing_a_device_id_is_not_enough():
     hass, sd = _hass()
-    ok = asyncio.run(_claim_device_for_caller(hass, "PHONE", "B", sd["users"]["B"]["devices"], "rB", heartbeat=True))
-    assert ok is False
+    assert _claim(hass, sd) is False
     assert "PHONE" in sd["users"]["A"]["devices"] and sd["users"]["B"]["devices"] == {}
     assert hass.casa["qu_data"]["updates"]["PHONE"]
 
 
-def test_heartbeat_with_pinned_token_moves():
-    hass, sd = _hass()
-    sd["users"]["A"]["devices"]["PHONE"]["refresh_token_id"] = "rB"  # misfiled record
-    assert asyncio.run(_claim_device_for_caller(hass, "PHONE", "B", sd["users"]["B"]["devices"], "rB", heartbeat=True))
-    assert "PHONE" in sd["users"]["B"]["devices"]
-
-
-def test_heartbeat_moves_when_old_session_is_gone():
+def test_old_session_gone_alone_is_not_enough():
     hass, sd = _hass()
     hass.auth.users["A"].refresh_tokens.clear()
-    assert asyncio.run(_claim_device_for_caller(hass, "PHONE", "B", sd["users"]["B"]["devices"], "rB", heartbeat=True))
-    assert "PHONE" in sd["users"]["B"]["devices"]
+    assert _claim(hass, sd) is False
+
+
+def test_pinned_token_moves():
+    hass, sd = _hass()
+    sd["users"]["A"]["devices"]["PHONE"]["refresh_token_id"] = "rB"  # misfiled record
+    assert _claim(hass, sd) and _moved(hass, sd)
+
+
+def test_redeemed_provisioning_claim_moves_purges_and_revokes_old_session():
+    hass, sd = _hass()
+    sd["provision_claims"] = {"B": {"rB": time.time()}}
+    assert _claim(hass, sd) and _moved(hass, sd)
+    moved = sd["users"]["B"]["devices"]["PHONE"]
+    assert moved["alias"] == "Hall" and "reauth_pending" not in moved
+    assert "PHONE" not in hass.casa["qu_data"]["updates"]
+    assert "rA" in hass.auth.removed_tokens  # old owner's pinned session revoked
+    assert "rB" not in sd["provision_claims"]["B"]  # claim consumed
+
+
+def test_young_session_after_recent_window_moves():
+    hass, sd = _hass()
+    sd["provision_opened"] = {"B": time.time() - 600}
+    assert _claim(hass, sd) and _moved(hass, sd)
+
+
+def test_old_session_or_old_window_does_not_move():
+    hass, sd = _hass()
+    sd["provision_opened"] = {"B": time.time() - 600}
+    hass.auth.users["B"].refresh_tokens["rB"].created_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    assert _claim(hass, sd) is False
+    hass, sd = _hass()
+    sd["provision_opened"] = {"B": time.time() - 2 * 86400}
+    assert _claim(hass, sd) is False
+    hass, sd = _hass()
+    sd["provision_opened"] = {"B": time.time() + 60}  # token predates the window
+    assert _claim(hass, sd) is False
+
+
+def test_reauth_target_moves():
+    hass, sd = _hass()
+    sd["users"]["A"]["devices"]["PHONE"]["reauth_pending"] = {"update_id": "x", "target_user_id": "B"}
+    assert _claim(hass, sd) and _moved(hass, sd)
 
 
 def test_unknown_device_is_created_by_caller():
     hass, sd = _hass()
-    assert asyncio.run(_claim_device_for_caller(hass, "NEW", "B", sd["users"]["B"]["devices"], "rB", heartbeat=True))
+    assert asyncio.run(_claim_device_for_caller(hass, "NEW", "B", sd["users"]["B"]["devices"], "rB"))
 
 
 def test_collapse_keeps_copy_with_live_token():

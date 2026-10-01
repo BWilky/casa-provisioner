@@ -162,3 +162,63 @@ def test_redeemed_event_carries_user_and_provision_id(monkeypatch):
     name, event = hass.fired[0]
     assert name == "casa_code_redeemed"
     assert event["user_id"] == "u1" and event["provision_id"] == "p9" and event["username"] == "kitchen"
+
+
+def test_window_end_records_sessions_born_during_window_as_claims(tmp_path):
+    hass = _hass(tmp_path, _record())
+    hass.auth.users["u1"].refresh_tokens["t1"] = FakeToken("t1")
+    asyncio.run(_end_provision_window(hass, "u1", "p1", "timer"))
+    assert set(hass.casa["stored_data"]["provision_claims"]["u1"]) == {"t1"}
+
+
+def test_rotation_outside_the_window_closes_it(tmp_path):
+    from custom_components.casa import _set_account_password
+
+    qr = _qr(tmp_path, "door.png")
+    hass = _hass(tmp_path, _record(qr_file="door.png"))
+
+    async def scenario():
+        _arm_pending_provision(hass, "u1")
+        timer = hass.casa["timers"]["u1"]
+        await _set_account_password(hass, hass.auth.provider, "kitchen")  # e.g. a reauth
+        await asyncio.gather(*hass.tasks, return_exceptions=True)
+        return timer
+
+    timer = asyncio.run(scenario())
+    assert timer.cancelled() or timer.done()
+    assert hass.casa["stored_data"]["pending_provisions"] == {}
+    assert not qr.exists()
+    assert hass.casa["timers"] == {} and hass.casa["listeners"] == {}
+
+
+def test_old_window_scramble_queued_behind_new_provision_is_a_no_op(tmp_path):
+    from custom_components.casa import _lock_for
+
+    hass = _hass(tmp_path, _record())
+
+    async def scenario():
+        lock = _lock_for(hass, "user", "u1")
+        await lock.acquire()
+        task = asyncio.ensure_future(_end_provision_window(hass, "u1", "p1", "timer"))
+        await asyncio.sleep(0)
+        # A newer provision replaced the window while the old scramble waited.
+        hass.casa["stored_data"]["pending_provisions"]["u1"] = _record(provision_id="p2")
+        lock.release()
+        await task
+
+    asyncio.run(scenario())
+    assert hass.auth.provider.data.passwords["kitchen"] == "link-pw"
+    assert hass.casa["stored_data"]["pending_provisions"]["u1"]["provision_id"] == "p2"
+
+
+def test_long_lived_tasks_are_background_tasks(tmp_path):
+    hass = _hass(tmp_path, _record())
+
+    async def scenario():
+        _arm_pending_provision(hass, "u1")
+        for t in hass.tasks:
+            t.cancel()
+        await asyncio.gather(*hass.tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert hass.background == ["casa provisioning timer u1", "casa provisioning listener u1"]

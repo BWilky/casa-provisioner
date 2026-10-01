@@ -25,29 +25,40 @@ class InvalidUser(Exception):
 
 
 class FakeProviderData:
+    """Mirrors homeassistant.auth.providers.homeassistant.Data (HA 2025.1):
+    add_auth / change_password are sync (bcrypt — the provider runs them in
+    the executor), async_remove_auth is a sync @callback, async_save is async."""
+
     def __init__(self, provider):
         self._provider = provider
         self.passwords = {}
         self.save_delays = []  # per-call extra yields, consumed in order
+
+    @staticmethod
+    def normalize_username(username, *, force_normalize=False):
+        return username.strip().casefold()
 
     @property
     def users(self):
         return [{"username": u, "password": "x"} for u in self.passwords]
 
     def change_password(self, username, password):
-        key = username.strip().casefold()
+        key = self.normalize_username(username)
         if key not in self.passwords:
             raise InvalidUser
         self.passwords[key] = password
 
     def add_auth(self, username, password):
-        key = username.strip().casefold()
+        key = self.normalize_username(username)
         if key in self.passwords:
             raise InvalidUser("username already exists")
         self.passwords[key] = password
 
-    async def async_remove_auth(self, username):
-        self.passwords.pop(username.strip().casefold(), None)
+    def async_remove_auth(self, username):  # @callback in HA: sync
+        key = self.normalize_username(username)
+        if key not in self.passwords:
+            raise InvalidUser
+        self.passwords.pop(key)
 
     async def async_save(self):
         # Yield so concurrent coroutines can interleave like a real disk write.
@@ -57,10 +68,41 @@ class FakeProviderData:
 
 
 class FakeProvider:
+    """Mirrors HassAuthProvider: data may be None until async_initialize;
+    the async_* credential methods initialize lazily, run the bcrypt step in
+    the executor and save."""
+
     type = "homeassistant"
 
-    def __init__(self):
-        self.data = FakeProviderData(self)
+    def __init__(self, hass=None):
+        self.hass = hass
+        self._data = FakeProviderData(self)
+        self.data = self._data
+
+    async def async_initialize(self):
+        self.data = self._data
+
+    async def _executor(self, func, *args):
+        await asyncio.sleep(0)
+        return func(*args)
+
+    async def async_add_auth(self, username, password):
+        if self.data is None:
+            await self.async_initialize()
+        await self._executor(self.data.add_auth, username, password)
+        await self.data.async_save()
+
+    async def async_remove_auth(self, username):
+        if self.data is None:
+            await self.async_initialize()
+        self.data.async_remove_auth(username)
+        await self.data.async_save()
+
+    async def async_change_password(self, username, new_password):
+        if self.data is None:
+            await self.async_initialize()
+        await self._executor(self.data.change_password, username, new_password)
+        await self.data.async_save()
 
     async def async_get_or_create_credentials(self, data):
         return cred(data["username"])
@@ -71,8 +113,11 @@ def cred(username):
 
 
 class FakeToken:
-    def __init__(self, tid):
+    def __init__(self, tid, created_at=None):
+        from datetime import datetime, timezone
+
         self.id = tid
+        self.created_at = created_at or datetime.now(timezone.utc)
         self.client_name = "Casa"
         self.client_id = "http://x/"
         self.last_used_ip = "192.0.2.1"
@@ -139,6 +184,7 @@ class FakeHass:
         self.fired = []
         self.bus = SimpleNamespace(async_fire=lambda name, data: self.fired.append((name, data)))
         self.tasks = []
+        self.background = []
         self.config = SimpleNamespace(path=lambda *p: "/nonexistent/" + "/".join(p))
         self.data = {
             "casa": {
@@ -155,9 +201,15 @@ class FakeHass:
             }
         }
 
-    def async_create_task(self, coro):
+    def async_create_task(self, coro, name=None, eager_start=True):
         task = asyncio.ensure_future(coro)
         self.tasks.append(task)
+        return task
+
+    def async_create_background_task(self, coro, name, eager_start=True):
+        task = asyncio.ensure_future(coro)
+        self.tasks.append(task)
+        self.background.append(name)
         return task
 
     async def async_add_executor_job(self, func, *args):

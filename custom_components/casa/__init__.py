@@ -427,7 +427,7 @@ def _user_matches_username(user, target_username: str) -> bool:
     )
 
 
-async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, method, on_redeemed=None, provision_id=None):
+async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, method, on_redeemed=None, provision_id=None, on_tokens=None):
     """Poll for new refresh tokens; fire casa_code_redeemed when one appears.
 
     on_redeemed: optional coroutine function run once after the first
@@ -436,6 +436,8 @@ async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, me
     redemption; otherwise it keeps reporting until the TTL ends.
     provision_id: echoed in the event (with user_id) so a card can tell its
     own code's redemption from any other.
+    on_tokens: optional sync callable given each batch of new refresh token
+    ids (records them as fresh device claims, see _has_fresh_claim).
     """
     if ttl_seconds <= 0:
         _LOGGER.warning("CASA: Listener for '%s' skipped — TTL is %s.", username, ttl_seconds)
@@ -478,6 +480,11 @@ async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, me
                         username, method, token.client_name, token.last_used_ip
                     )
             known_tokens.update(new_tokens)
+            if on_tokens is not None:
+                try:
+                    on_tokens(set(new_tokens))
+                except Exception as err:
+                    _LOGGER.error("CASA: Recording redemption for '%s' failed: %s", username, err)
 
             if on_redeemed is not None:
                 try:
@@ -489,14 +496,19 @@ async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, me
         pass
 
 
+# Process-level, so an entry reload mid-operation can't hand a second caller
+# a fresh, unheld lock for the same device/user.
+_LOCKS: dict = {}
+
+
 def _lock_for(hass, kind: str, key: str) -> asyncio.Lock:
     """Per-(kind, key) asyncio.Lock serializing read-modify-write sequences on
     the queue/store that await in between (e.g. kind "device" or "user").
-    Callers that need both always take device before user."""
-    locks = hass.data[DOMAIN].setdefault("locks", {})
-    lock = locks.get((kind, key))
+    Callers that need both always take device before user. Never hold one
+    across relay/network calls."""
+    lock = _LOCKS.get((kind, key))
     if lock is None:
-        lock = locks[(kind, key)] = asyncio.Lock()
+        lock = _LOCKS[(kind, key)] = asyncio.Lock()
     return lock
 
 
@@ -550,14 +562,28 @@ def _invalidate_queued_reauths(hass, login_username: str, current_password: str)
     return len(dropped)
 
 
+def _password_fingerprint(stored_data: dict, login_username: str, password: str) -> str:
+    """Salted fingerprint of a password the server itself set, so a later
+    reauth can tell a verified-current queued password from one an admin
+    typed (which the server never set and can't vouch for)."""
+    salt = stored_data.setdefault("password_fp_salt", secrets.token_hex(16))
+    raw = f"{salt}:{str(login_username).casefold()}:{password}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _queued_reauth_password(hass, login_username: str, exclude_device_id: str | None = None) -> str | None:
     """Password carried by a still-queued reauthenticate entry for
-    login_username on another device, or None. Every queued entry carries the
-    account's current password (_set_account_password drops the rest), so a
-    second reauth to the same user can reuse it instead of rotating — which
-    would strand the first device's entry."""
-    qu_data = (hass.data.get(DOMAIN) or {}).get("qu_data") or {}
+    login_username on another device, or None. Only a password the server
+    itself last set on that account (see _set_account_password) is reused —
+    a second reauth to the same user then doesn't rotate it out from under
+    the first device's entry. Anything unverified returns None (rotate)."""
+    data = hass.data.get(DOMAIN) or {}
+    qu_data = data.get("qu_data") or {}
+    stored_data = data.get("stored_data") or {}
     target = str(login_username or "").casefold()
+    current_fp = (stored_data.get("server_passwords") or {}).get(target)
+    if not current_fp:
+        return None
     for device_id, entries in (qu_data.get("updates") or {}).items():
         if device_id == exclude_device_id:
             continue
@@ -567,23 +593,38 @@ def _queued_reauth_password(hass, login_username: str, exclude_device_id: str | 
                 e.get("type") == "auth"
                 and str(payload.get("username", "") or "").casefold() == target
                 and payload.get("password")
+                and _password_fingerprint(stored_data, target, payload["password"]) == current_fp
             ):
                 return payload["password"]
     return None
 
 
-async def _set_account_password(hass, auth_provider, login_username: str, password: str | None = None) -> str:
+async def _set_account_password(hass, auth_provider, login_username: str, password: str | None = None,
+                                window_provision_id: str | None = None) -> str:
     """The one place a homeassistant-provider password is changed. Sets
-    password (or a fresh random one), then invalidates queued reauth entries
-    that still carry the old password. Returns the password now in effect.
-    Raises whatever change_password raises (InvalidUser for a gone login)."""
+    password (or a fresh random one) via the provider's async API (bcrypt in
+    the executor, lazy data init, save), and:
+      - invalidates queued reauth entries still carrying another password;
+      - closes any open provisioning window for this login other than
+        window_provision_id (the window doing its own scramble): its link is
+        dead now, and a later timer/listener scramble of it must not fire a
+        false casa_code_redeemed or rotate away a password other devices'
+        queued reauths now carry;
+      - records a fingerprint of the server-set password (_queued_reauth_password).
+    Returns the password now in effect. Raises what async_change_password
+    raises (InvalidUser for a gone login)."""
     if not password:
         password = generate_random_password()
-    auth_provider.data.change_password(login_username, password)
-    # Invalidate before the save await, so nothing can deliver a stale entry
-    # in between.
+    await _close_provision_windows_for_login(hass, login_username, keep_provision_id=window_provision_id)
+    # Invalidate before the (executor + save) await, so nothing can deliver a
+    # stale entry in between.
     _invalidate_queued_reauths(hass, login_username, password)
-    await auth_provider.data.async_save()
+    await auth_provider.async_change_password(login_username, password)
+    stored_data = (hass.data.get(DOMAIN) or {}).get("stored_data")
+    if stored_data is not None:
+        key = str(login_username).casefold()
+        stored_data.setdefault("server_passwords", {})[key] = _password_fingerprint(stored_data, key, password)
+        _save_stored_data(hass)
     return password
 
 
@@ -663,10 +704,80 @@ def _cancel_provision_tasks(hass, user_id: str) -> None:
             task.cancel()
 
 
+async def _close_provision_windows_for_login(hass, login_username: str, keep_provision_id: str | None = None) -> None:
+    """Forget every open provisioning window for login_username except
+    keep_provision_id: stop its timer/listener and retire its QR file. Used
+    when the password changes for any other reason (the link is dead)."""
+    data = hass.data.get(DOMAIN) or {}
+    pending = (data.get("stored_data") or {}).get("pending_provisions") or {}
+    target = str(login_username or "").casefold()
+    for user_id, rec in list(pending.items()):
+        if str(rec.get("login_username", "")).casefold() != target or rec.get("provision_id") == keep_provision_id:
+            continue
+        pending.pop(user_id, None)
+        _cancel_provision_tasks(hass, user_id)
+        _save_stored_data(hass)
+        await _retire_provision_qr(hass, rec)
+        _LOGGER.info("CASA: Provisioning window for '%s' closed — its password changed.", rec.get("login_username"))
+
+
+# Fresh-claim windows (see _has_fresh_claim).
+_CLAIM_TTL_SECONDS = 30 * 86400
+_CLAIM_WINDOW_SECONDS = 24 * 3600
+_CLAIM_TOKEN_MAX_AGE_SECONDS = 1800
+
+
+def _record_provision_claims(hass, user_id: str, token_ids) -> None:
+    """Remember the refresh tokens that redeemed a provisioning window for
+    user_id: proof that the session came from that user's provisioning link,
+    which lets it take over its device record from a previous owner."""
+    if not token_ids:
+        return
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    claims = stored_data.setdefault("provision_claims", {}).setdefault(user_id, {})
+    now = time.time()
+    for tid in token_ids:
+        claims[tid] = now
+    for tid in [t for t, ts in claims.items() if now - ts > _CLAIM_TTL_SECONDS]:
+        claims.pop(tid, None)
+    _save_stored_data(hass)
+
+
+async def _has_fresh_claim(hass, user_id: str, refresh_token_id: str | None) -> bool:
+    """True when refresh_token_id redeemed a provisioning window for user_id
+    (recorded by the listener / window end), or was created at or after a
+    window for user_id opened in the last 24 h and is under 30 min old."""
+    if not refresh_token_id:
+        return False
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    now = time.time()
+    claimed_at = ((stored_data.get("provision_claims") or {}).get(user_id) or {}).get(refresh_token_id)
+    if claimed_at and now - claimed_at <= _CLAIM_TTL_SECONDS:
+        return True
+    opened = (stored_data.get("provision_opened") or {}).get(user_id)
+    if not opened or now - opened > _CLAIM_WINDOW_SECONDS:
+        return False
+    user = await hass.auth.async_get_user(user_id)
+    token = user.refresh_tokens.get(refresh_token_id) if user else None
+    created = getattr(token, "created_at", None)
+    if created is None:
+        return False
+    created_ts = created.timestamp()
+    return created_ts >= opened and now - created_ts <= _CLAIM_TOKEN_MAX_AGE_SECONDS
+
+
+def _consume_provision_claim(hass, user_id: str, refresh_token_id: str | None) -> None:
+    claims = (hass.data[DOMAIN]["stored_data"].get("provision_claims") or {}).get(user_id)
+    if claims and claims.pop(refresh_token_id, None) is not None:
+        _save_stored_data(hass)
+
+
 async def _end_provision_window(hass, user_id: str, provision_id: str, reason: str) -> None:
     """Close a provisioning window: scramble the password (the link dies),
     retire its QR file, forget the persisted record and stop its tasks.
-    Safe when the user or its login is gone (deleted since provisioning)."""
+    Safe when the user or its login is gone (deleted since provisioning).
+    A window superseded while this waited for the user lock (a newer
+    provision, or a rotation that closed it) is left alone."""
     rec = _pending_provision(hass, user_id, provision_id)
     if rec is None:
         return
@@ -676,12 +787,21 @@ async def _end_provision_window(hass, user_id: str, provision_id: str, reason: s
     if user is None or provider is None:
         _LOGGER.info("CASA: Provisioning window for '%s' closed (%s); user no longer exists.", login_username, reason)
     else:
-        try:
-            async with _lock_for(hass, "user", user_id):
-                await _set_account_password(hass, provider, login_username)
-            _LOGGER.info("CASA: Password for %s scrambled (%s).", login_username, reason)
-        except Exception as err:  # InvalidUser: login removed since provisioning
-            _LOGGER.warning("CASA: Could not scramble password for '%s' (%s): %s", login_username, reason, err)
+        async with _lock_for(hass, "user", user_id):
+            if _pending_provision(hass, user_id, provision_id) is None:
+                return
+            # Sessions born during the window (also catches a redemption
+            # the listener missed, e.g. across a restart).
+            _record_provision_claims(
+                hass, user_id, set(user.refresh_tokens.keys()) - set(rec.get("known_token_ids") or []),
+            )
+            try:
+                await _set_account_password(hass, provider, login_username, window_provision_id=provision_id)
+                _LOGGER.info("CASA: Password for %s scrambled (%s).", login_username, reason)
+            except Exception as err:  # InvalidUser: login removed since provisioning
+                _LOGGER.warning("CASA: Could not scramble password for '%s' (%s): %s", login_username, reason, err)
+    if _pending_provision(hass, user_id, provision_id) is None:
+        return
     await _retire_provision_qr(hass, rec)
     if _pending_provision(hass, user_id, provision_id) is not None:
         hass.data[DOMAIN]["stored_data"]["pending_provisions"].pop(user_id, None)
@@ -739,7 +859,10 @@ def _arm_pending_provision(hass, user_id: str) -> None:
         return
     data = hass.data[DOMAIN]
     provision_id = rec.get("provision_id")
-    data["timers"][user_id] = hass.async_create_task(_provision_timer(hass, user_id, provision_id))
+    # Background tasks: long sleepers must not hold up HA startup.
+    data["timers"][user_id] = hass.async_create_background_task(
+        _provision_timer(hass, user_id, provision_id), name=f"casa provisioning timer {user_id}",
+    )
     ttl = int((rec.get("listen_until") or 0) - time.time())
     if ttl <= 0:
         return
@@ -748,12 +871,14 @@ def _arm_pending_provision(hass, user_id: str) -> None:
         # Single-use link: rotate the password the moment it is used.
         await _end_provision_window(hass, user_id, provision_id, "redeemed")
 
-    data["listeners"][user_id] = hass.async_create_task(
+    data["listeners"][user_id] = hass.async_create_background_task(
         _login_listener(
             hass, rec.get("login_username"), user_id, set(rec.get("known_token_ids") or []), ttl,
             rec.get("method"), on_redeemed=_on_redeemed if rec.get("single_use") else None,
             provision_id=provision_id,
-        )
+            on_tokens=lambda tids: _record_provision_claims(hass, user_id, tids),
+        ),
+        name=f"casa provisioning listener {user_id}",
     )
 
 
@@ -1092,10 +1217,14 @@ async def _create_casa_user(hass, name: str, username: str, password: str | None
         cred.auth_provider_type == "homeassistant"
         and str(cred.data.get("username", "")).strip().casefold() == username
         for u in users for cred in u.credentials
-    ) or any(
-        str(entry.get("username", "")).strip().casefold() == username
-        for entry in (getattr(provider.data, "users", None) or [])
     )
+    if not login_taken:
+        if getattr(provider, "data", None) is None and hasattr(provider, "async_initialize"):
+            await provider.async_initialize()  # newer HA loads provider data lazily
+        login_taken = any(
+            str(entry.get("username", "")).strip().casefold() == username
+            for entry in (getattr(provider.data, "users", None) or [])
+        )
     if login_taken:
         return None, "A login with this username already exists"
 
@@ -1110,9 +1239,8 @@ async def _create_casa_user(hass, name: str, username: str, password: str | None
 
     auth_added = False
     try:
-        provider.data.add_auth(username, password)
+        await provider.async_add_auth(username, password)
         auth_added = True
-        await provider.data.async_save()
 
         credentials = await provider.async_get_or_create_credentials({"username": username})
         await hass.auth.async_link_user(new_user, credentials)
@@ -1122,8 +1250,7 @@ async def _create_casa_user(hass, name: str, username: str, password: str | None
         _LOGGER.error("CASA ERROR: Could not create login '%s': %s — rolling back.", username, err)
         if auth_added:
             try:
-                await provider.data.async_remove_auth(username)
-                await provider.data.async_save()
+                await provider.async_remove_auth(username)
             except Exception as rm_err:
                 _LOGGER.warning("CASA: Could not remove login '%s' during rollback: %s", username, rm_err)
         try:
@@ -3129,8 +3256,13 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
 
         # Serialize reauths of one device: a double-click must not let the
         # first request queue a password the second has already rotated away.
+        # Only the state mutation runs under the locks; the relay push and
+        # nudge happen after they are released.
         async with _lock_for(self.hass, "device", device_id):
-            return await self._reauth(request, user, body, device_id)
+            response, push = await self._reauth(request, user, body, device_id)
+        if push is None:
+            return response
+        return await self._deliver(**push)
 
     async def _reauth(self, request, user, body, device_id):
         hass = self.hass
@@ -3138,7 +3270,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
 
         device_info, _old_uid, _old_username = _find_device_record(stored_data, device_id)
         if not device_info:
-            return self.json({"error": "Device not found"}, status_code=404)
+            return self.json({"error": "Device not found"}, status_code=404), None
 
         password = str(body.get("password", "") or "").strip()
         send_update_push = bool(body.get("send_update_push", True))
@@ -3148,7 +3280,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
 
         provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
         if not provider:
-            return self.json({"error": "Home Assistant core auth provider not found"}, status_code=500)
+            return self.json({"error": "Home Assistant core auth provider not found"}, status_code=500), None
 
         created_user = False
         revealed_password = None
@@ -3162,7 +3294,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
                 created_by=created_by,
             )
             if err:
-                return self.json({"error": err}, status_code=400)
+                return self.json({"error": err}, status_code=400), None
             target_user = await hass.auth.async_get_user(result["user_id"])
             login_username = result["username"]
             login_password = result["password"]
@@ -3178,14 +3310,14 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
             elif target_username:
                 target_user = next((u for u in users if _user_matches_username(u, target_username)), None)
             else:
-                return self.json({"error": "Must provide user_id, username, or create_user"}, status_code=400)
+                return self.json({"error": "Must provide user_id, username, or create_user"}, status_code=400), None
             if not target_user:
-                return self.json({"error": "Target user not found"}, status_code=404)
+                return self.json({"error": "Target user not found"}, status_code=404), None
             if getattr(target_user, "is_admin", False):
                 _LOGGER.error("CASA ERROR: Attempted to reauthenticate a device to an admin user. Blocked.")
-                return self.json({"error": "Cannot reauthenticate a device to an admin user"}, status_code=400)
+                return self.json({"error": "Cannot reauthenticate a device to an admin user"}, status_code=400), None
             if not getattr(target_user, "is_active", True):
-                return self.json({"error": "Target user is inactive"}, status_code=400)
+                return self.json({"error": "Target user is inactive"}, status_code=400), None
 
             login_username = None
             for cred in target_user.credentials:
@@ -3193,7 +3325,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
                     login_username = cred.data.get("username")
                     break
             if not login_username:
-                return self.json({"error": "No local Home Assistant credentials found for this user"}, status_code=400)
+                return self.json({"error": "No local Home Assistant credentials found for this user"}, status_code=400), None
 
         async with _lock_for(hass, "user", target_user.id):
             if not created_user:
@@ -3224,7 +3356,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
         # been purged meanwhile.
         device_info, old_uid, old_username = _find_device_record(stored_data, device_id)
         if not device_info:
-            return self.json({"error": "Device not found"}, status_code=404)
+            return self.json({"error": "Device not found"}, status_code=404), None
 
         # Never leave two sequential reauth entries: retrying replaces any
         # still-pending one.
@@ -3272,10 +3404,24 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
         data["qu_store"].async_delay_save(lambda: qu_data, 2.0)
         data["store"].async_delay_save(lambda: stored_data, 2.0)
 
+        return None, {
+            "device_id": device_id, "update_id": update_id, "login_username": login_username,
+            "login_password": login_password, "revealed_password": revealed_password,
+            "created_user": created_user, "scrambled_old": scrambled_old,
+            "send_update_push": send_update_push, "created_by": created_by,
+            "old_label": old_username or old_uid,
+        }
+
+    async def _deliver(self, device_id, update_id, login_username, login_password, revealed_password,
+                       created_user, scrambled_old, send_update_push, created_by, old_label):
+        """Best-effort push/nudge for an already-queued reauth (no locks held)."""
+        hass = self.hass
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        device_info, _uid, _name = _find_device_record(stored_data, device_id)
         pushed = False
         push_skipped = False
         if send_update_push:
-            if not device_info.get("push_token") or not stored_data.get("device_key"):
+            if not device_info or not device_info.get("push_token") or not stored_data.get("device_key"):
                 push_skipped = True
             else:
                 session = async_get_clientsession(hass)
@@ -3290,7 +3436,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
 
         _LOGGER.info(
             "CASA: Queued reauthentication of device '%s' from user '%s' to '%s' by %s (pushed=%s skipped=%s scrambled_old=%s).",
-            device_id, old_username or old_uid, login_username, created_by, pushed, push_skipped, scrambled_old,
+            device_id, old_label, login_username, created_by, pushed, push_skipped, scrambled_old,
         )
 
         resp = {
@@ -3561,9 +3707,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if device_id not in devices and len(devices) >= 100:
             raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
 
-        # One owner per device_id: registering as a different live user
-        # (re-provisioned without a deprovision) moves the record here.
-        await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id)
+        # One owner per device_id: registering a device_id recorded under
+        # another live user moves it here only with proof of possession
+        # (see _claim_device_for_caller); otherwise it is refused.
+        if not await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id):
+            _LOGGER.warning(
+                "CASA: Refused registration of device '%s' by user '%s' — it belongs to another user.",
+                device_id, user_id,
+            )
+            raise HomeAssistantError("Device is registered to another user.")
 
         # Checked after the last await: a purge that started meanwhile wins.
         if _device_being_purged(hass, device_id):
@@ -3700,9 +3852,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if device_id not in devices and len(devices) >= 100:
             raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
 
-        # One owner per device_id; a heartbeat from a non-owner changes
-        # nothing and is told to re-register (register_device moves it).
-        claimed = await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id, heartbeat=True)
+        # One owner per device_id. A heartbeat with proof of possession (a
+        # fresh provisioning claim covers a push-off app re-provisioned to a
+        # new user) moves the record; anything else changes nothing.
+        claimed = await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id)
         # Checked after the last await: a purge that started meanwhile wins,
         # rather than this heartbeat recreating a ghost record.
         if _device_being_purged(hass, device_id):
@@ -3712,12 +3865,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "CASA: Heartbeat for device '%s' from a user that does not own it; asking it to re-register.",
                 device_id,
             )
+            other, _ouid, _oname = _find_device_record(stored_data, device_id)
             return {
                 "owned": False,
                 "reregister": True,
                 "updates": False,
                 "require_alias": bool(stored_data.get("require_device_alias", False)),
-                "has_alias": False,
+                # The device's actual alias state, so a require-alias prompt
+                # isn't raised for a device that already has one.
+                "has_alias": bool(((other or {}).get("alias") or "").strip()),
                 "heartbeat_interval_seconds": stored_data.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS),
                 "profile_report_interval_seconds": stored_data.get("profile_report_interval_seconds", DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS),
             }
@@ -4413,14 +4569,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Persist the window (keyed by HA user id, not the typed username) so
         # single-use and expiry survive reloads and restarts; setup re-arms
-        # it. A new provision for the same user replaces the old window — its
-        # password was just rotated, so its QR file is dead too.
+        # it. An older window for this user was already closed (QR retired)
+        # when _set_account_password rotated the password above.
         now_ts = time.time()
         provision_id = secrets.token_hex(8)
         pending_provisions = stored_data.setdefault("pending_provisions", {})
-        previous = pending_provisions.get(target_user.id)
-        if previous and previous.get("qr_file") and previous.get("qr_file") != qr_file:
-            await _retire_provision_qr(hass, previous)
+        # When this user last had a window opened: a session created at or
+        # after it (and still young) may take over its device record.
+        stored_data.setdefault("provision_opened", {})[target_user.id] = now_ts
         pending_provisions[target_user.id] = {
             "provision_id": provision_id,
             "login_username": login_username,
@@ -5845,16 +6001,20 @@ def _move_device_record(stored_data: dict, qu_data: dict, device_id: str, from_u
     return info
 
 
-async def _claim_device_for_caller(hass, device_id: str, user_id: str, devices: dict, refresh_token_id=None, heartbeat: bool = False) -> bool:
+async def _claim_device_for_caller(hass, device_id: str, user_id: str, devices: dict, refresh_token_id=None) -> bool:
     """Enforce one owner per device_id before user_id's register/heartbeat
-    touches devices (user_id's own devices dict). Returns False only for a
-    heartbeat that must not touch the record.
+    touches devices (user_id's own devices dict). Returns False when the
+    caller may not take the record over from its current live owner.
 
-    If another live owner holds device_id, register_device moves the record
-    to the caller. A heartbeat moves it only when it is clearly the same
-    device session — the caller's token is the one pinned on the record, or
-    the record's own session no longer exists — so knowing a device_id is
-    not enough to take a device over by heartbeating."""
+    Knowing a device_id is not proof of anything (non-admins can list the
+    device registry). A move is allowed only when the caller:
+      (a) presents the refresh token pinned on the record;
+      (b) holds a fresh claim — a session that redeemed a provisioning
+          window for its user, or one created at/after such a window opened
+          in the last 24 h and itself under 30 min old (_has_fresh_claim);
+      (c) is the target of the record's pending reauthentication.
+    On a move the old owner's pinned session is revoked, and the record's
+    queue and reauth markers are dropped (_move_device_record)."""
     if device_id in devices:
         return True
     data = hass.data[DOMAIN]
@@ -5862,23 +6022,36 @@ async def _claim_device_for_caller(hass, device_id: str, user_id: str, devices: 
     other, other_uid, _name = _find_device_record(stored_data, device_id)
     if other is None or other_uid == user_id:
         return True
-    if heartbeat:
-        pinned = bool(refresh_token_id) and other.get("refresh_token_id") == refresh_token_id
-        if not pinned:
-            other_user = await hass.auth.async_get_user(other_uid)
-            other_rtid = other.get("refresh_token_id")
-            if other_user is not None and other_rtid and other_rtid in other_user.refresh_tokens:
-                return False
-            # Re-check after the await: the record may have moved meanwhile.
-            if device_id in devices:
-                return True
-            other, other_uid, _name = _find_device_record(stored_data, device_id)
-            if other is None or other_uid == user_id:
-                return True
+    pinned = bool(refresh_token_id) and other.get("refresh_token_id") == refresh_token_id
+    reauth_target = (other.get("reauth_pending") or {}).get("target_user_id") == user_id
+    fresh = False
+    if not (pinned or reauth_target):
+        fresh = await _has_fresh_claim(hass, user_id, refresh_token_id)
+        if not fresh:
+            return False
+        # Re-check after the await: the record may have moved meanwhile.
+        if device_id in devices:
+            return True
+        other, other_uid, _name = _find_device_record(stored_data, device_id)
+        if other is None or other_uid == user_id:
+            return True
+    old_rtid = other.get("refresh_token_id")
     qu_data = data["qu_data"]
     _move_device_record(stored_data, qu_data, device_id, other_uid, devices)
     if data.get("qu_store"):
         data["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+    if fresh:
+        _consume_provision_claim(hass, user_id, refresh_token_id)
+    _LOGGER.info(
+        "CASA: Device '%s' moved to user '%s' (%s).", device_id, user_id,
+        "pinned session" if pinned else "pending reauthentication" if reauth_target else "fresh provisioning claim",
+    )
+    # The previous owner's session for this device is no longer its own.
+    if old_rtid and old_rtid != refresh_token_id:
+        old_user = await hass.auth.async_get_user(other_uid)
+        token = old_user.refresh_tokens.get(old_rtid) if old_user else None
+        if token:
+            hass.auth.async_remove_refresh_token(token)
     return True
 
 
