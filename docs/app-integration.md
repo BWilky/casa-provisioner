@@ -27,7 +27,7 @@ Request body (only `device_id` is required; omitted fields leave the stored valu
 | `wireguard_configured` / `wireguard_connected` | bool | |
 | `alias` | string | See "Device alias flow". |
 | `ip_address`, `last_12_token` | string | Optional overrides of what the server derives from the request. |
-| `location_state`, `location_reason`, `location_config_version` | string | Zone report piggy-backed on the heartbeat (same rules as `/api/casa/location_report`). |
+| `location_state`, `location_reason`, `location_config_version` | string | Zone report piggy-backed on the heartbeat (same rules as `/api/casa/location_report`). `location_reason` (only with state `unknown`): `permission_denied` (location denied/restricted), `needs_always` (When-In-Use only — geofencing needs Always), `no_fix`, or `stale` (server-set). Unrecognised reasons are stored as `no_fix`. |
 
 Response fields:
 

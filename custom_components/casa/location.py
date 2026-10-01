@@ -18,7 +18,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 MAX_TOTAL_RINGS = 18
 RESERVED_LABELS = frozenset({"away", "unknown"})
-ALLOWED_REASONS = frozenset({"permission_denied", "no_fix", "stale"})
+# needs_always: the app holds When-In-Use only; geofencing needs Always.
+ALLOWED_REASONS = frozenset({"permission_denied", "needs_always", "no_fix", "stale"})
 ALLOWED_REPORT_KEYS = frozenset({"state", "reason", "config_version", "ts"})
 _REPORT_INFO = b"casa-report-v1"
 

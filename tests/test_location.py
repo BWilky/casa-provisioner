@@ -4,6 +4,7 @@ import time
 import pytest
 
 from custom_components.casa.location import (
+    ALLOWED_REASONS,
     ALLOWED_REPORT_KEYS,
     MAX_TOTAL_RINGS,
     RESERVED_LABELS,
@@ -140,3 +141,9 @@ def test_report_not_replayable_from_push_domain():
 def test_report_garbage_rejected():
     with pytest.raises(ValueError):
         decrypt_report_payload("not base64!!!", "k" * 64, "DEV-1")
+
+
+def test_allowed_reasons_include_needs_always():
+    # 1.8+ apps report When-In-Use-only permission as needs_always; older
+    # servers would coerce it to no_fix, so it must stay accepted here.
+    assert {"permission_denied", "needs_always", "no_fix", "stale"} <= ALLOWED_REASONS
