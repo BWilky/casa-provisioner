@@ -42,3 +42,24 @@ def test_queue_is_capped_dropping_oldest_non_auth():
     kept = hass.casa["qu_data"]["updates"]["D2"]
     assert removed == 11 and len(kept) == 50
     assert kept[0]["id"] == "a" and kept[1]["id"] == "p11" and kept[-1]["id"] == "p59"
+
+
+def test_wireguard_revoke_and_latest_wireguard_survive_age_and_cap():
+    hass = _hass()
+    revoke = dict(_entry("rv", "wireguard", days_ago=90), action="revoke")
+    latest = _entry("wg2", "wireguard", days_ago=60)
+    older_wg = _entry("wg1", "wireguard", days_ago=70)
+    hass.casa["qu_data"]["updates"]["D1"] = [revoke, older_wg, latest] + [_entry(f"p{i}") for i in range(60)]
+    asyncio.run(_prune_stale_queued_updates(hass))
+    ids = [e["id"] for e in hass.casa["qu_data"]["updates"]["D1"]]
+    assert "rv" in ids and "wg2" in ids and "wg1" not in ids
+    assert len(ids) == 50
+
+
+def test_pruned_profile_push_clears_pending_flag():
+    hass = _hass()
+    dev = hass.casa["stored_data"]["users"]["u1"]["devices"]["D1"]
+    dev["provisioning_pending_push"] = True
+    hass.casa["qu_data"]["updates"]["D1"] = [_entry("old", days_ago=40)]
+    asyncio.run(_prune_stale_queued_updates(hass))
+    assert dev["provisioning_pending_push"] is False

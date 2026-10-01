@@ -1061,6 +1061,8 @@ async def _prune_stale_queued_updates(hass) -> int:
         device's queue is capped at QUEUE_MAX_PER_DEVICE by dropping its
         oldest non-auth entries (a device that never acks — e.g. an old app
         that can't apply an entry type — must not grow its queue forever).
+        WireGuard revokes and each device's newest WireGuard entry are never
+        age/cap-pruned; a pruned profile push clears provisioning_pending_push.
 
     Returns the number of queue entries removed.
     """
@@ -1143,6 +1145,13 @@ async def _prune_stale_queued_updates(hass) -> int:
                 len(entries), device_id,
             )
             continue
+        # A long-offline device must still get its WireGuard revoke (and its
+        # latest WireGuard state), however old: never age/cap-prune those.
+        wg_entries = [e for e in entries if e.get("type") == "wireguard"]
+        protected = {id(e) for e in wg_entries if e.get("action") == "revoke"}
+        if wg_entries:
+            protected.add(id(wg_entries[-1]))
+        pruned_profile = False
         kept = []
         for e in entries:
             if e.get("type") == "auth":
@@ -1154,8 +1163,9 @@ async def _prune_stale_queued_updates(hass) -> int:
                         device_id, target,
                     )
                     continue
-            elif _queued_before(e, cutoff):
+            elif id(e) not in protected and _queued_before(e, cutoff):
                 removed += 1
+                pruned_profile = pruned_profile or e.get("type") == "profile"
                 _LOGGER.info(
                     "CASA: Purged %s/%s update %s for device '%s' — unacknowledged for over %d days.",
                     e.get("type"), e.get("action"), e.get("id"), device_id, QUEUE_MAX_AGE_DAYS,
@@ -1165,13 +1175,20 @@ async def _prune_stale_queued_updates(hass) -> int:
         overflow = len(kept) - QUEUE_MAX_PER_DEVICE
         if overflow > 0:
             # Entries are appended in order, so the first non-auth ones are the oldest.
-            drop_ids = {id(e) for e in [e for e in kept if e.get("type") != "auth"][:overflow]}
+            droppable = [e for e in kept if e.get("type") != "auth" and id(e) not in protected]
+            drop_ids = {id(e) for e in droppable[:overflow]}
+            pruned_profile = pruned_profile or any(e.get("type") == "profile" for e in droppable[:overflow])
             kept = [e for e in kept if id(e) not in drop_ids]
             removed += len(drop_ids)
             _LOGGER.info(
                 "CASA: Device '%s' had more than %d queued updates; dropped the %d oldest.",
                 device_id, QUEUE_MAX_PER_DEVICE, len(drop_ids),
             )
+        if pruned_profile and not any(e.get("type") == "profile" for e in kept):
+            # The push it was waiting to confirm is gone; stop showing it pending.
+            if device_info.get("provisioning_pending_push"):
+                device_info["provisioning_pending_push"] = False
+                stored_changed = True
         if len(kept) != len(entries):
             if kept:
                 qu_data["updates"][device_id] = kept
