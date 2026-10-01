@@ -4,7 +4,7 @@ DOMAIN = "casa"
 # panel against PANEL_VERSION in panel/version.js — keep the two in sync.
 # Any skew (including a stale Python process after an update) makes the panel
 # show a "restart Home Assistant" banner.
-CASA_VERSION = "26.09.30"
+CASA_VERSION = "26.10.01"
 
 CONF_ADMIN_SYSTEM_ONLY = "admin_system_only"
 CONF_CREATE_DEVICES = "create_devices"
