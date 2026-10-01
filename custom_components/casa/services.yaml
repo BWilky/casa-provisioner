@@ -51,7 +51,7 @@ provision:
         text: {}
     password:
       name: "Password (Optional)"
-      description: "Use an existing password instead of generating a random one. If left blank, a secure random password is automatically generated."
+      description: "Password to set on the account and embed in the payload. If left blank, a secure random password is generated. Either way the account password changes, and any queued device reauthentication to this user that carries an older password is dropped."
       selector:
         text: {}
     pin:
@@ -281,7 +281,7 @@ generate_qr:
         text: {}
     password:
       name: "Password (Optional)"
-      description: "Use an existing password instead of generating a random one. If left blank, a secure random password is automatically generated."
+      description: "Password to set on the account and embed in the payload. If left blank, a secure random password is generated. Either way the account password changes, and any queued device reauthentication to this user that carries an older password is dropped."
       selector:
         text: {}
     pin:
@@ -571,7 +571,7 @@ provision_ble_beacon:
         text: {}
     password:
       name: "Password (Optional)"
-      description: "If left blank, a random password is generated."
+      description: "Password to set on the account and embed in the payload. If left blank, a random password is generated."
       selector:
         text: {}
     pin:

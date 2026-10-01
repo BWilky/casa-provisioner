@@ -463,14 +463,110 @@ async def _login_listener(hass, username, user_id, known_tokens, ttl_seconds, me
         pass
 
 
+def _lock_for(hass, kind: str, key: str) -> asyncio.Lock:
+    """Per-(kind, key) asyncio.Lock serializing read-modify-write sequences on
+    the queue/store that await in between (e.g. kind "device" or "user").
+    Callers that need both always take device before user."""
+    locks = hass.data[DOMAIN].setdefault("locks", {})
+    lock = locks.get((kind, key))
+    if lock is None:
+        lock = locks[(kind, key)] = asyncio.Lock()
+    return lock
+
+
+def _invalidate_queued_reauths(hass, login_username: str, current_password: str) -> int:
+    """Drop queued auth/reauthenticate entries for login_username that carry a
+    password other than current_password, and clear the reauth_pending
+    markers that reference them. A stale entry can never log in: the device
+    would log out to apply it, fail, and treat that as a revoked session.
+    Returns the number of entries dropped."""
+    data = hass.data.get(DOMAIN) or {}
+    qu_data = data.get("qu_data") or {}
+    stored_data = data.get("stored_data") or {}
+    target = str(login_username or "").casefold()
+    dropped = set()
+    for device_id in list((qu_data.get("updates") or {}).keys()):
+        entries = qu_data["updates"][device_id]
+        kept = []
+        for e in entries:
+            payload = e.get("payload") or {}
+            if (
+                e.get("type") == "auth"
+                and str(payload.get("username", "") or "").casefold() == target
+                and payload.get("password") != current_password
+            ):
+                dropped.add(e.get("id"))
+                _LOGGER.warning(
+                    "CASA: Dropped queued reauthentication of device '%s' to '%s' — that user's password was rotated since it was queued.",
+                    device_id, login_username,
+                )
+                continue
+            kept.append(e)
+        if len(kept) != len(entries):
+            if kept:
+                qu_data["updates"][device_id] = kept
+            else:
+                qu_data["updates"].pop(device_id, None)
+    if not dropped:
+        return 0
+    for _uid, udata in stored_data.get("users", {}).items():
+        for dinfo in (udata.get("devices", {}) or {}).values():
+            if (dinfo.get("reauth_pending") or {}).get("update_id") in dropped:
+                dinfo.pop("reauth_pending", None)
+    for devices in stored_data.get("native_devices", {}).values():
+        for dinfo in (devices or {}).values():
+            if (dinfo.get("reauth_pending") or {}).get("update_id") in dropped:
+                dinfo.pop("reauth_pending", None)
+    if data.get("qu_store"):
+        data["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+    if data.get("store"):
+        data["store"].async_delay_save(lambda: stored_data, 2.0)
+    return len(dropped)
+
+
+def _queued_reauth_password(hass, login_username: str, exclude_device_id: str | None = None) -> str | None:
+    """Password carried by a still-queued reauthenticate entry for
+    login_username on another device, or None. Every queued entry carries the
+    account's current password (_set_account_password drops the rest), so a
+    second reauth to the same user can reuse it instead of rotating — which
+    would strand the first device's entry."""
+    qu_data = (hass.data.get(DOMAIN) or {}).get("qu_data") or {}
+    target = str(login_username or "").casefold()
+    for device_id, entries in (qu_data.get("updates") or {}).items():
+        if device_id == exclude_device_id:
+            continue
+        for e in entries:
+            payload = e.get("payload") or {}
+            if (
+                e.get("type") == "auth"
+                and str(payload.get("username", "") or "").casefold() == target
+                and payload.get("password")
+            ):
+                return payload["password"]
+    return None
+
+
+async def _set_account_password(hass, auth_provider, login_username: str, password: str | None = None) -> str:
+    """The one place a homeassistant-provider password is changed. Sets
+    password (or a fresh random one), then invalidates queued reauth entries
+    that still carry the old password. Returns the password now in effect.
+    Raises whatever change_password raises (InvalidUser for a gone login)."""
+    if not password:
+        password = generate_random_password()
+    auth_provider.data.change_password(login_username, password)
+    # Invalidate before the save await, so nothing can deliver a stale entry
+    # in between.
+    _invalidate_queued_reauths(hass, login_username, password)
+    await auth_provider.data.async_save()
+    return password
+
+
 async def _scramble_and_close(hass, username: str, auth_provider, listener_key: str) -> None:
     """Rotate the account password so the provisioning link is dead, and stop the listener."""
-    scrambled_password = generate_random_password()
-    auth_provider.data.change_password(username, scrambled_password)
-    await auth_provider.data.async_save()
+    await _set_account_password(hass, auth_provider, username)
     _LOGGER.info("CASA: Password for %s scrambled.", username)
     listener_task = hass.data[DOMAIN]["listeners"].get(listener_key)
-    if listener_task:
+    if listener_task and listener_task is not asyncio.current_task():
         listener_task.cancel()
 
 
@@ -2657,6 +2753,12 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
         if not device_id:
             return self.json({"error": "device_id is required"}, status_code=400)
 
+        # Serialize reauths of one device: a double-click must not let the
+        # first request queue a password the second has already rotated away.
+        async with _lock_for(self.hass, "device", device_id):
+            return await self._reauth(request, user, body, device_id)
+
+    async def _reauth(self, request, user, body, device_id):
         hass = self.hass
         data = hass.data[DOMAIN]
         stored_data = data["stored_data"]
@@ -2721,15 +2823,36 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
             if not login_username:
                 return self.json({"error": "No local Home Assistant credentials found for this user"}, status_code=400)
 
-            if password:
-                # Provisioning semantics: a supplied password is assumed to
-                # already be the account's password and is not changed.
-                login_password = password
-            else:
-                login_password = generate_random_password()
-                provider.data.change_password(login_username, login_password)
-                await provider.data.async_save()
-                revealed_password = login_password
+        async with _lock_for(hass, "user", target_user.id):
+            if not created_user:
+                if password:
+                    # Provisioning semantics: a supplied password is assumed to
+                    # already be the account's password and is not changed.
+                    login_password = password
+                else:
+                    # Another device's still-queued reauth to this user holds
+                    # the current password; rotating would strand that entry.
+                    login_password = _queued_reauth_password(hass, login_username, exclude_device_id=device_id)
+                    if not login_password:
+                        login_password = await _set_account_password(hass, provider, login_username)
+                    revealed_password = login_password
+            return await self._queue_reauth(
+                device_id, target_user, login_username, login_password, revealed_password,
+                created_user, scramble_old, send_update_push, provider, created_by,
+            )
+
+    async def _queue_reauth(self, device_id, target_user, login_username, login_password, revealed_password,
+                            created_user, scramble_old, send_update_push, provider, created_by):
+        hass = self.hass
+        data = hass.data[DOMAIN]
+        stored_data = data["stored_data"]
+        qu_data = data["qu_data"]
+
+        # Re-resolve after the awaits above: the record may have moved or
+        # been purged meanwhile.
+        device_info, old_uid, old_username = _find_device_record(stored_data, device_id)
+        if not device_info:
+            return self.json({"error": "Device not found"}, status_code=404)
 
         # Never leave two sequential reauth entries: retrying replaces any
         # still-pending one.
@@ -2751,8 +2874,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
                     None,
                 )
                 if old_login:
-                    provider.data.change_password(old_login, generate_random_password())
-                    await provider.data.async_save()
+                    await _set_account_password(hass, provider, old_login)
                 spare = device_info.get("refresh_token_id")
                 for token in list(old_user.refresh_tokens.values()):
                     if token.id != spare:
@@ -3627,12 +3749,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         target_password = str(get_field("password", "")).strip()
 
-        if target_password:
-            login_password = target_password
-        else:
-            login_password = generate_random_password()
-            provider.data.change_password(login_username, login_password)
-            await provider.data.async_save()
+        # A supplied password is set on the account too (it used to be
+        # embedded as-is, so a wrong one produced a link that could never log
+        # in). Either way, queued reauths carrying the old password are dropped.
+        async with _lock_for(hass, "user", target_user.id):
+            login_password = await _set_account_password(hass, provider, login_username, target_password or None)
 
         if deauthenticate_existing:
             for token in list(target_user.refresh_tokens.values()):
@@ -4233,11 +4354,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not provider:
             return {"error": "Home Assistant core auth provider not found"}
 
-        new_password = generate_random_password()
+        async with _lock_for(hass, "user", target_user.id):
+            new_password = await _set_account_password(hass, provider, login_username)
 
-        provider.data.change_password(login_username, new_password)
-        await provider.data.async_save()
-        
         _LOGGER.info("CASA: Password for user '%s' manually scrambled.", target_username)
 
         if deauthenticate:
