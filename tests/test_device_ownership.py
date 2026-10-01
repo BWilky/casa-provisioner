@@ -98,3 +98,19 @@ def test_profile_report_from_owner_or_pinned_token_applies():
     sd["users"]["A"]["devices"]["PHONE"].pop("provisioning_fields")
     sd["users"]["A"]["devices"]["PHONE"]["refresh_token_id"] = "rB"
     assert _report(hass, hass.auth.users["B"], bearer("rB"))[0] == 200
+
+
+def test_device_is_marked_purging_during_relay_await(monkeypatch):
+    import custom_components.casa as casa
+
+    hass, sd = _hass()
+    seen = []
+
+    async def fake_unregister(h, token, did):
+        seen.append(casa._device_being_purged(h, did))
+
+    monkeypatch.setattr(casa, "_unregister_relay_token", fake_unregister)
+    result = asyncio.run(casa._purge_device(hass, "PHONE"))
+    assert result["found"] and seen == [True]
+    assert not casa._device_being_purged(hass, "PHONE")
+    assert "PHONE" not in sd["users"]["A"]["devices"]

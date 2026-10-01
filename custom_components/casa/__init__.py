@@ -46,6 +46,21 @@ _LOGGER = logging.getLogger(__name__)
 # so only register it once per HA process.
 _PANEL_STATIC_REGISTERED = False
 
+# hass.data key (outside hass.data[DOMAIN], which unload pops) marking that
+# the HTTP views are registered on this HA instance.
+_VIEWS_REGISTERED_KEY = f"{DOMAIN}_views_registered"
+
+
+def _entry_func(hass, key: str):
+    """Coroutine that forwards to hass.data[DOMAIN][key] at call time, so a
+    view registered once keeps reaching the current entry's closure."""
+    async def _call(*args, **kwargs):
+        func = (hass.data.get(DOMAIN) or {}).get(key)
+        if func is None:
+            raise HomeAssistantError("Casa integration is not loaded.")
+        return await func(*args, **kwargs)
+    return _call
+
 def generate_random_password(length=12):
     chars = string.ascii_letters + string.digits
     return ''.join(secrets.choice(chars) for _ in range(length))
@@ -3327,9 +3342,8 @@ class CasaAdminRegenerateKeyView(HomeAssistantView):
         # affects all of them, not just one, and an earlier check-in means
         # less time spent falling back to plaintext pulls with the old key.
         session = async_get_clientsession(self.hass)
-        for udata in stored_data.get("users", {}).values():
-            for dinfo in udata.get("devices", {}).values():
-                await _nudge_device_checkin(self.hass, session, stored_data, dinfo)
+        for _did, dinfo in _iter_all_devices(stored_data):  # managed and native
+            await _nudge_device_checkin(self.hass, session, stored_data, dinfo)
 
         return self.json({"status": "ok", "device_key_id": key_id})
 
@@ -3551,6 +3565,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # (re-provisioned without a deprovision) moves the record here.
         await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id)
 
+        # Checked after the last await: a purge that started meanwhile wins.
+        if _device_being_purged(hass, device_id):
+            raise HomeAssistantError("Device is being removed.")
+
         now_iso = dt_util.now().isoformat()
         
         # Keep existing push token if not provided in the update
@@ -3684,7 +3702,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # One owner per device_id; a heartbeat from a non-owner changes
         # nothing and is told to re-register (register_device moves it).
-        if not await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id, heartbeat=True):
+        claimed = await _claim_device_for_caller(hass, device_id, user_id, devices, refresh_token_id, heartbeat=True)
+        # Checked after the last await: a purge that started meanwhile wins,
+        # rather than this heartbeat recreating a ghost record.
+        if _device_being_purged(hass, device_id):
+            raise HomeAssistantError("Device is being removed.")
+        if not claimed:
             _LOGGER.info(
                 "CASA: Heartbeat for device '%s' from a user that does not own it; asking it to re-register.",
                 device_id,
@@ -3823,24 +3846,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             result["expires_at"] = pending_expiry
         return result
 
-    # Register the HTTP views
-    hass.http.register_view(CasaRegisterDeviceView(hass, async_register_device))
-    hass.http.register_view(CasaDeprovisionView(hass))
-    hass.http.register_view(CasaHeartbeatView(hass, async_heartbeat))
-    hass.http.register_view(CasaDeviceProfileReportView(hass))
-    hass.http.register_view(CasaAdminSummaryView(hass))
-    hass.http.register_view(CasaWireGuardProfilesView(hass))
-    hass.http.register_view(CasaLocationZonesView(hass))
-    hass.http.register_view(CasaLocationReportView(hass))
-    hass.http.register_view(CasaProvisionProfilesView(hass))
-    hass.http.register_view(CasaAdminDeviceView(hass))
-    hass.http.register_view(CasaAdminSettingsView(hass))
-    hass.http.register_view(CasaAdminSessionsView(hass))
-    hass.http.register_view(CasaAdminCheckUsernameView(hass))
-    hass.http.register_view(CasaProfileUpdatesView(hass))
-    hass.http.register_view(CasaAdminQueueUpdateView(hass))
-    hass.http.register_view(CasaAdminReauthDeviceView(hass))
-    hass.http.register_view(CasaAdminRegenerateKeyView(hass))
+    # Register the HTTP views once per HA instance: routes can't be removed
+    # and survive entry reloads, and a second registration would shadow
+    # nothing (the first route wins) — so the views resolve the current
+    # entry's register/heartbeat functions through hass.data at call time.
+    hass.data[DOMAIN]["register_device_func"] = async_register_device
+    hass.data[DOMAIN]["heartbeat_func"] = async_heartbeat
+    if not hass.data.get(_VIEWS_REGISTERED_KEY):
+        hass.http.register_view(CasaRegisterDeviceView(hass, _entry_func(hass, "register_device_func")))
+        hass.http.register_view(CasaDeprovisionView(hass))
+        hass.http.register_view(CasaHeartbeatView(hass, _entry_func(hass, "heartbeat_func")))
+        hass.http.register_view(CasaDeviceProfileReportView(hass))
+        hass.http.register_view(CasaAdminSummaryView(hass))
+        hass.http.register_view(CasaWireGuardProfilesView(hass))
+        hass.http.register_view(CasaLocationZonesView(hass))
+        hass.http.register_view(CasaLocationReportView(hass))
+        hass.http.register_view(CasaProvisionProfilesView(hass))
+        hass.http.register_view(CasaAdminDeviceView(hass))
+        hass.http.register_view(CasaAdminSettingsView(hass))
+        hass.http.register_view(CasaAdminSessionsView(hass))
+        hass.http.register_view(CasaAdminCheckUsernameView(hass))
+        hass.http.register_view(CasaProfileUpdatesView(hass))
+        hass.http.register_view(CasaAdminQueueUpdateView(hass))
+        hass.http.register_view(CasaAdminReauthDeviceView(hass))
+        hass.http.register_view(CasaAdminRegenerateKeyView(hass))
+        hass.data[_VIEWS_REGISTERED_KEY] = True
 
     # Serve the admin panel assets once per process; the route survives reloads.
     global _PANEL_STATIC_REGISTERED
@@ -3861,15 +3891,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # file (the entry propagates ?v= to its sibling module imports), so any
         # updated panel file is picked up after an HA restart without a hard refresh.
         panel_dir_path = os.path.join(os.path.dirname(__file__), "panel")
-        panel_version = 0
-        try:
-            for dirpath, _dirs, filenames in os.walk(panel_dir_path):
-                for fname in filenames:
-                    if fname.endswith(".js"):
-                        mtime = int(os.path.getmtime(os.path.join(dirpath, fname)))
-                        panel_version = max(panel_version, mtime)
-        except OSError:
-            pass
+
+        def _newest_panel_mtime() -> int:
+            newest = 0
+            try:
+                for dirpath, _dirs, filenames in os.walk(panel_dir_path):
+                    for fname in filenames:
+                        if fname.endswith(".js"):
+                            newest = max(newest, int(os.path.getmtime(os.path.join(dirpath, fname))))
+            except OSError:
+                pass
+            return newest
+
+        # Disk walk off the event loop.
+        panel_version = await hass.async_add_executor_job(_newest_panel_mtime)
         if not panel_version:
             panel_version = int(time.time())
         frontend.async_register_built_in_panel(
@@ -5907,6 +5942,22 @@ async def _purge_device(hass: HomeAssistant, device_id: str, owner_user_id=None)
     under deleted owners (admin services, see _pop_device_record).
     Returns {"found", "username", "push_token", "access_revoked"}.
     """
+    # Mark the device as being purged for the duration: a heartbeat or
+    # register arriving during the relay/auth awaits below must not
+    # recreate a ghost record (see _device_being_purged).
+    purging = hass.data[DOMAIN].setdefault("purging", set())
+    purging.add(device_id)
+    try:
+        return await _purge_device_inner(hass, device_id, owner_user_id)
+    finally:
+        purging.discard(device_id)
+
+
+def _device_being_purged(hass, device_id: str) -> bool:
+    return device_id in ((hass.data.get(DOMAIN) or {}).get("purging") or ())
+
+
+async def _purge_device_inner(hass: HomeAssistant, device_id: str, owner_user_id=None) -> dict:
     stored_data = hass.data[DOMAIN]["stored_data"]
     store = hass.data[DOMAIN]["store"]
 
