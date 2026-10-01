@@ -676,9 +676,18 @@ def _pending_provision(hass, user_id: str, provision_id: str | None = None) -> d
 
 
 def _save_stored_data(hass) -> None:
+    """Delayed save through the CURRENT entry's store and data. Code that
+    outlives a reload (setup closures, background tasks) must save this way,
+    never through a Store/dict it captured, or it writes stale data back."""
     data = hass.data.get(DOMAIN) or {}
     if data.get("store") is not None:
         data["store"].async_delay_save(lambda: data["stored_data"], 2.0)
+
+
+async def _save_stored_data_now(hass) -> None:
+    data = hass.data.get(DOMAIN) or {}
+    if data.get("store") is not None:
+        await data["store"].async_save(data["stored_data"])
 
 
 async def _retire_provision_qr(hass, rec: dict) -> None:
@@ -1005,7 +1014,7 @@ def _apply_location_report(hass, device_id: str, device_info: dict, state, reaso
     if isinstance(config_version, str) and config_version:
         device_info["location_config_version"] = config_version
     async_dispatcher_send(hass, f"casa_device_updated_{device_id}")
-    hass.data[DOMAIN]["store"].async_delay_save(lambda: hass.data[DOMAIN]["stored_data"], 2.0)
+    _save_stored_data(hass)
     return True
 
 
@@ -3793,7 +3802,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if pending_alias and not str(devices[device_id].get("alias") or "").strip():
                 devices[device_id]["alias"] = pending_alias[:DEVICE_ALIAS_MAX_LEN]
 
-        store.async_delay_save(lambda: stored_data, 2.0)
+        _save_stored_data(hass)
         
         # Register in Home Assistant Device Registry if enabled
         create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
@@ -3977,7 +3986,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 device_info["expires_at_override_sent"] = True
                 pending_expiry = override
 
-        store.async_delay_save(lambda: stored_data, 2.0)
+        _save_stored_data(hass)
 
         # Ensure registered in Home Assistant Device Registry if enabled
         create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
@@ -5047,7 +5056,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ha_user_ids = {u.id for u in users_in_ha}
 
         stored_data = hass.data[DOMAIN]["stored_data"]
-        store = hass.data[DOMAIN]["store"]
 
         # Sync with actual Home Assistant state to detect out-of-band deletions
         changed = False
@@ -5080,7 +5088,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 changed = True
 
         if changed:
-            await store.async_save(stored_data)
+            await _save_stored_data_now(hass)
             # Users deleted outside the integration strand their devices'
             # queued updates the same way handle_remove_user would.
             await _prune_stale_queued_updates(hass)
@@ -5436,7 +5444,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if device_info is None:
             raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
 
-        store.async_delay_save(lambda: stored_data, 2.0)
+        _save_stored_data(hass)
         _LOGGER.info(
             "CASA: Expiration override for device '%s' set to %s.",
             device_id, "permanent" if value == 0 else value
@@ -5805,7 +5813,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             devices[did]["needs_reregister"] = True
 
         if orphaned or stale:
-            await store.async_save(stored_data)
+            await _save_stored_data_now(hass)
 
         result = {
             "live": len(relay_tokens),
@@ -5855,7 +5863,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         stored_data.pop("site_id", None)
         stored_data.pop("site_key", None)
         _delete_relay_site_credentials(stored_data, relay_base(hass))
-        ok = await _register_site(hass, stored_data, store)
+        ok = await _register_site(hass, stored_data, hass.data[DOMAIN]["store"])
         return {"success": bool(ok), "site_id": stored_data.get("site_id")}
 
     hass.services.async_register(
