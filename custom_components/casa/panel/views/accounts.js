@@ -76,7 +76,7 @@ export function createView(app) {
   /* ---------- one-time credentials modal ---------- */
 
   // Non-dismissable on purpose: the password is shown exactly once.
-  function showCredentials({ modalTitle, heading, name, username, password }) {
+  function showCredentials({ modalTitle, heading, name, username, password, offerProvision = false }) {
     const body = document.createElement("div");
     const row = (label, value, mono) => `
       <div class="field-row" style="margin-bottom:10px;">
@@ -103,7 +103,19 @@ export function createView(app) {
       title: modalTitle,
       bodyEl: body,
       dismissable: false,
-      buttons: [{ label: "Done", variant: "primary", onClick: () => { app.refresh(); } }],
+      buttons: [
+        ...(offerProvision
+          ? [{
+              label: "Provision a device now",
+              variant: "outlined",
+              onClick: () => {
+                app.refresh();
+                app.navigate("/provision/account/" + encodeURIComponent(username));
+              },
+            }]
+          : []),
+        { label: "Done", variant: "primary", onClick: () => { app.refresh(); } },
+      ],
     });
   }
 
@@ -189,6 +201,7 @@ export function createView(app) {
                 name,
                 username,
                 password: resp.password || password || "(Securely generated in backend)",
+                offerProvision: true,
               });
               app.refresh();
             } catch (err) {
@@ -247,6 +260,7 @@ export function createView(app) {
     ui.openMenu({
       anchor,
       items: [
+        { icon: "mdi:qrcode", label: "Provision device", onSelect: () => app.navigate("/provision/account/" + encodeURIComponent(a.username)) },
         { icon: "mdi:lock-reset", label: "Reset password", onSelect: () => confirmResetPassword(a) },
         { icon: "mdi:account-remove", label: "Remove account", danger: true, onSelect: () => confirmRemove(a) },
       ],
