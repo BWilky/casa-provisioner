@@ -3523,7 +3523,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
             "old_label": old_username or old_uid,
         }
 
-    async def _deliver(self, device_id, update_id, login_username, login_password, revealed_password,
+    async def _deliver_result(self, device_id, update_id, login_username, login_password, revealed_password,
                        created_user, scrambled_old, send_update_push, created_by, old_label):
         """Best-effort push/nudge for an already-queued reauth (no locks held)."""
         hass = self.hass
@@ -3561,7 +3561,115 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
         }
         if revealed_password:
             resp["password"] = revealed_password
-        return self.json(resp)
+        return resp
+
+    async def _deliver(self, **push):
+        return self.json(await self._deliver_result(**push))
+
+
+class CasaAdminReprovisionDeviceView(HomeAssistantView):
+    """Admin-only one-click re-provision of an existing device, always on its
+    current (Casa-managed) account.
+
+    method "auto": over encrypted push when the device is push-registered —
+    the reauth internals rotate the account password (or reuse one another
+    device's queued reauth already carries), queue `auth/reauthenticate`, and
+    revoke this device's old session only once it signs back in. Settings are
+    untouched. Otherwise (or method "qr"): a fresh QR/link seeded from the
+    device's reported settings → original template → defaults, tagged with
+    replaces_device_id so a replacement phone takes over this record, and the
+    device's current session is revoked immediately. Other sessions on the
+    account are never touched. Passwords are never returned.
+    """
+
+    url = "/api/casa/admin/reprovision_device"
+    name = "api:casa:admin:reprovision_device"
+
+    def __init__(self, hass: HomeAssistant, provision_func):
+        self.hass = hass
+        self.provision_func = provision_func
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = str(body.get("device_id", "")).strip()
+        if not device_id:
+            return self.json({"error": "device_id is required"}, status_code=400)
+        method = str(body.get("method", "auto") or "auto").strip().lower()
+        if method not in ("auto", "qr"):
+            return self.json({"error": "method must be 'auto' or 'qr'"}, status_code=400)
+        host_url = str(body.get("host_url", "") or "").strip()
+
+        hass = self.hass
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        device_info, owner_uid, _username = _find_device_record(stored_data, device_id)
+        if not device_info:
+            return self.json({"error": "Device not found"}, status_code=404)
+        udata = (stored_data.get("users") or {}).get(owner_uid)
+        if not udata or udata.get("deleted", False):
+            return self.json({"error": "Re-provision is only available for Casa-managed accounts"}, status_code=400)
+        owner = await hass.auth.async_get_user(owner_uid)
+        if not owner or getattr(owner, "is_admin", False):
+            return self.json({"error": "Cannot re-provision a device on an admin account"}, status_code=400)
+
+        push_ready = bool(device_info.get("push_token")) and bool(stored_data.get("device_key"))
+        if method == "auto" and push_ready:
+            return await self._via_push(request, user, device_id, owner_uid)
+        return await self._via_qr(device_id, host_url)
+
+    async def _via_push(self, request, user, device_id, owner_uid):
+        reauth = CasaAdminReauthDeviceView(self.hass)
+        reauth.json = self.json
+        reauth.json_message = self.json_message
+        body = {"device_id": device_id, "user_id": owner_uid, "send_update_push": True}
+        async with _lock_for(self.hass, "device", device_id):
+            response, push = await reauth._reauth(request, user, body, device_id)
+        if push is None:
+            return response
+        result = await reauth._deliver_result(**push)
+        result.pop("password", None)
+        result["method"] = "push"
+        return self.json(result)
+
+    async def _via_qr(self, device_id, host_url):
+        hass = self.hass
+        data = hass.data[DOMAIN]
+        stored_data = data["stored_data"]
+        async with _lock_for(hass, "device", device_id):
+            # Re-resolve under the lock: the record may have moved meanwhile.
+            device_info, owner_uid, username = _find_device_record(stored_data, device_id)
+            if not device_info:
+                return self.json({"error": "Device not found"}, status_code=404)
+
+            service_data = _reprovision_service_data(hass, device_info, host_url)
+            service_data["user_id"] = owner_uid
+            service_data["username"] = username
+            result = await self.provision_func(service_data, replaces_device_id=device_id)
+            if not isinstance(result, dict) or result.get("error"):
+                # Nothing changed on failure: pending reauth and session kept.
+                return self.json({"error": (result or {}).get("error") or "Provisioning failed"}, status_code=400)
+
+            # A still-pending push reauth would fight the new QR's password.
+            prev = device_info.pop("reauth_pending", None)
+            if prev and prev.get("update_id"):
+                _dequeue_update(data["qu_data"], device_id, prev["update_id"])
+                data["qu_store"].async_delay_save(lambda: data["qu_data"], 2.0)
+
+            # Cut this device off now; it comes back through the new QR/link.
+            rtid = device_info.get("refresh_token_id")
+            if rtid:
+                owner = await hass.auth.async_get_user(owner_uid)
+                token = owner.refresh_tokens.get(rtid) if owner else None
+                if token:
+                    hass.auth.async_remove_refresh_token(token)
+            _save_stored_data(hass)
+        return self.json({**result, "method": "qr"})
 
 
 class CasaAdminRegenerateKeyView(HomeAssistantView):
@@ -4148,6 +4256,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(CasaProfileUpdatesView(hass))
         hass.http.register_view(CasaAdminQueueUpdateView(hass))
         hass.http.register_view(CasaAdminReauthDeviceView(hass))
+        hass.http.register_view(CasaAdminReprovisionDeviceView(hass, _entry_func(hass, "provision_func")))
         hass.http.register_view(CasaAdminRegenerateKeyView(hass))
         hass.data[_VIEWS_REGISTERED_KEY] = True
 
