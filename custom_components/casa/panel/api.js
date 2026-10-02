@@ -257,20 +257,6 @@ export class CasaApi {
   queueUpdate(req) {
     return this._hass.callApi("POST", "casa/admin/queue_update", req);
   }
-  // Reauthenticate a device with a new username/password
-  // ({device_id, user_id? | username? | create_user: {name, username},
-  //   password?, scramble_old?, send_update_push?}).
-  reauthDevice(body) {
-    // A version-skewed backend (updated on disk, not yet restarted) has no
-    // reauth_device route and would 404 confusingly — refuse instead; the
-    // skew banner tells the admin to restart Home Assistant.
-    const backend = this.summary && this.summary.version;
-    if (this.panelVersion && backend && backend !== this.panelVersion) {
-      return Promise.reject(new Error("Casa was updated on disk — restart Home Assistant before reauthenticating devices."));
-    }
-    return this._hass.callApi("POST", "casa/admin/reauth_device", body);
-  }
-
   // One-click re-provision of an existing device on its current account
   // ({device_id, method: "auto" | "qr", host_url}). Push when registered,
   // else a fresh QR/link — see CasaAdminReprovisionDeviceView.

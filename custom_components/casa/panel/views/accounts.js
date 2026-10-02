@@ -111,7 +111,7 @@ export function createView(app) {
 
   async function openCreateModal() {
     // Shared name→username slug + live availability chip (same module the
-    // guided wizard and Reauthenticate modal use). null → degrade to plain
+    // provision wizard uses). null → degrade to plain
     // lowercase-on-input; create_user stays the authoritative validator.
     const usernameUtils = await app.loadModule("views/username-utils.js").catch(() => null);
 

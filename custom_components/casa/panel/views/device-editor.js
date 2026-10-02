@@ -156,257 +156,6 @@ export async function openPushModal(app, device, kind) {
   });
 }
 
-// openReauthModal(app, device) — reauthenticate a device with a new
-// username/password: pick an existing (non-admin) user or create one inline,
-// auto-generate or supply the password, deliver via encrypted push and/or the
-// durable heartbeat queue. Generated passwords get the same non-dismissable
-// one-time reveal the Accounts view uses.
-export async function openReauthModal(app, device) {
-  const { api, ui } = app;
-  const esc = ui.esc;
-
-  let sessionUsers;
-  let usernameUtils = null;
-  try {
-    const [res, utils] = await Promise.all([
-      api.getSessions(),
-      app.loadModule("views/username-utils.js").catch(() => null),
-    ]);
-    usernameUtils = utils; // null → degrade to manual username entry
-    sessionUsers = ((res && res.users) || []).filter(
-      (u) => !u.is_admin && !u.is_owner && u.is_active !== false
-    );
-  } catch (err) {
-    ui.toast("Failed to load users: " + ui.errMsg(err), { error: true });
-    return;
-  }
-
-  const currentUsername = device.username || "";
-  const userOptions = sessionUsers
-    .map((u) => {
-      const uname = u.username || u.name;
-      const label = u.username && u.username !== u.name ? `${u.name} (${u.username})` : u.name;
-      const selected = uname && uname.toLowerCase() === currentUsername.toLowerCase() ? " selected" : "";
-      const chip = u.casa_managed ? " · casa" : "";
-      return `<option value="${esc(u.user_id)}" data-username="${esc(uname || "")}"${selected}>${esc(label)}${chip}</option>`;
-    })
-    .join("");
-
-  const body = document.createElement("div");
-  body.innerHTML = `
-    <div class="field">
-      <label>Target account</label>
-      <label class="toggle"><input type="radio" name="ra-mode" value="existing" checked> Existing user</label>
-      <label class="toggle"><input type="radio" name="ra-mode" value="create"> Create new user</label>
-    </div>
-    <div data-ra-existing>
-      <div class="field">
-        <select class="select" data-ra-user style="width:100%;">${userOptions}</select>
-      </div>
-    </div>
-    <div data-ra-create hidden>
-      <div class="field">
-        <label>Full Name *</label>
-        <input class="input" data-ra-name placeholder="e.g. John Doe">
-      </div>
-      <div class="field">
-        <label>Username *</label>
-        <input class="input" data-ra-username placeholder="e.g. john" autocapitalize="none" autocomplete="off">
-        <div class="field__help">Auto-generated from the name — edit to override.</div>
-        <div data-ra-avail style="margin-top:4px;"></div>
-      </div>
-    </div>
-    <div class="field">
-      <label>Password</label>
-      <input class="input" data-ra-password type="password" placeholder="••••••••" autocomplete="new-password">
-      <div class="field__help" data-ra-pwhelp>Leave blank to auto-generate a secure password.</div>
-    </div>
-    <label class="toggle" data-ra-scramble-row hidden>
-      <input type="checkbox" data-ra-scramble checked>
-      <span data-ra-scramble-label></span>
-    </label>
-    <label class="toggle">
-      <input type="checkbox" data-ra-push ${device.push_registered ? "checked" : "disabled"}>
-      Send via encrypted push${device.push_registered ? "" : " (device has no push registration)"}
-    </label>
-    <div class="muted" style="font-size:12px; margin:6px 0 10px;">
-      Always queued durably — applied on the device's next check-in if the push is missed.
-      Older app builds ignore this command; a stuck request can be cancelled from Pending Updates.
-    </div>
-    <div style="display:flex; gap:8px; align-items:center; margin:0 0 10px; padding:10px 12px; border-radius:8px; background:color-mix(in srgb, var(--casa-warning) 16%, transparent); color:var(--casa-warning); font-size:13px;">
-      <ha-icon icon="mdi:alert" style="--mdc-icon-size:18px; flex:none;"></ha-icon>
-      <span>The device will log out and sign back in as the selected user. If the login fails, the device resets and must be re-provisioned.</span>
-    </div>
-    <div class="field__error" data-ra-err hidden></div>`;
-
-  const existingWrap = body.querySelector("[data-ra-existing]");
-  const createWrap = body.querySelector("[data-ra-create]");
-  const userSelect = body.querySelector("[data-ra-user]");
-  const nameInput = body.querySelector("[data-ra-name]");
-  const usernameInput = body.querySelector("[data-ra-username]");
-  const passwordInput = body.querySelector("[data-ra-password]");
-  const pwHelp = body.querySelector("[data-ra-pwhelp]");
-  const scrambleRow = body.querySelector("[data-ra-scramble-row]");
-  const scrambleLabel = body.querySelector("[data-ra-scramble-label]");
-  const errEl = body.querySelector("[data-ra-err]");
-
-  // Auto-slug the username from the name + live availability chip (shared
-  // with the guided wizard). Falls back to plain lowercase-on-input if the
-  // module failed to load; the submit-time checkUsername stays authoritative.
-  if (usernameUtils) {
-    usernameUtils.attachUsernameField({
-      nameInput,
-      usernameInput,
-      hintEl: body.querySelector("[data-ra-avail]"),
-      checkUsername: (u, n) => api.checkUsername(u, n),
-    });
-  } else {
-    usernameInput.addEventListener("input", () => {
-      usernameInput.value = usernameInput.value.toLowerCase();
-    });
-  }
-
-  const mode = () => body.querySelector("input[name='ra-mode']:checked").value;
-  const selectedUsername = () => {
-    if (mode() === "create") return usernameInput.value.trim();
-    const opt = userSelect.selectedOptions[0];
-    return (opt && opt.dataset.username) || "";
-  };
-  const isSwitching = () => {
-    const target = selectedUsername();
-    return !!currentUsername && !!target && target.toLowerCase() !== currentUsername.toLowerCase();
-  };
-
-  function refreshDynamic() {
-    const creating = mode() === "create";
-    existingWrap.hidden = creating;
-    createWrap.hidden = !creating;
-    pwHelp.textContent = creating
-      ? "Leave blank to auto-generate a secure password."
-      : "Leave blank to auto-generate. A typed password must already be that user's password — it will not be changed.";
-    const switching = isSwitching();
-    scrambleRow.hidden = !switching;
-    if (switching) {
-      scrambleLabel.textContent = `Also scramble '${currentUsername}'s password and revoke their other sessions`;
-    }
-  }
-  for (const radio of body.querySelectorAll("input[name='ra-mode']")) {
-    radio.addEventListener("change", refreshDynamic);
-  }
-  userSelect.addEventListener("change", refreshDynamic);
-  usernameInput.addEventListener("input", refreshDynamic);
-  // Typing the name can rewrite the username via auto-slug (no input event
-  // fires on programmatic writes), so re-evaluate the scramble row here too.
-  nameInput.addEventListener("input", refreshDynamic);
-  refreshDynamic();
-
-  // Non-dismissable one-time reveal for generated passwords — same UX as
-  // the Accounts view's showCredentials.
-  function showRevealModal(username, password) {
-    const rbody = document.createElement("div");
-    const row = (label, value) => `
-      <div class="field-row" style="margin-bottom:10px;">
-        <span style="width:88px; flex:none; font-weight:600; font-size:13px;">${esc(label)}</span>
-        <span class="mono" style="flex:1; min-width:0; word-break:break-all;">${esc(value)}</span>
-        <button class="btn btn--outlined" style="height:28px; padding:0 10px; font-size:12px;" data-copy="${esc(value)}">Copy</button>
-      </div>`;
-    rbody.innerHTML = `
-      <div style="text-align:center; margin-bottom:16px;">
-        <ha-icon icon="mdi:check-circle" style="--mdc-icon-size:48px; color:var(--casa-success);"></ha-icon>
-        <h4 style="margin:8px 0 0; font-size:16px;">Reauthentication queued</h4>
-      </div>
-      ${row("Username", username)}
-      ${row("Password", password)}
-      <div style="display:flex; gap:8px; align-items:center; margin-top:14px; padding:10px 12px; border-radius:8px; background:color-mix(in srgb, var(--casa-warning) 16%, transparent); color:var(--casa-warning); font-size:13px;">
-        <ha-icon icon="mdi:alert" style="--mdc-icon-size:18px; flex:none;"></ha-icon>
-        <span>This password is shown only once.</span>
-      </div>`;
-    for (const btn of rbody.querySelectorAll("[data-copy]")) {
-      ui.bindCopyButton(btn, () => btn.dataset.copy);
-    }
-    ui.openModal({
-      title: "One-time credentials",
-      bodyEl: rbody,
-      dismissable: false,
-      buttons: [{ label: "Done", variant: "primary", onClick: () => { app.refresh(); } }],
-    });
-  }
-
-  ui.openModal({
-    title: `Reauthenticate — ${device.alias || device.device_id}`,
-    bodyEl: body,
-    buttons: [
-      { label: "Cancel", variant: "text" },
-      {
-        label: "Reauthenticate",
-        variant: "primary",
-        onClick: async (btn) => {
-          errEl.hidden = true;
-          const creating = mode() === "create";
-          const password = passwordInput.value.trim();
-          const req = {
-            device_id: device.device_id,
-            password: password || undefined,
-            scramble_old: !scrambleRow.hidden && body.querySelector("[data-ra-scramble]").checked,
-            send_update_push: body.querySelector("[data-ra-push]").checked,
-          };
-          if (creating) {
-            const name = nameInput.value.trim();
-            const username = usernameInput.value.trim().toLowerCase();
-            if (!name || !username) {
-              errEl.hidden = false;
-              errEl.textContent = "Name and Username are required.";
-              return false;
-            }
-            req.create_user = { name, username };
-          } else {
-            const userId = userSelect.value;
-            if (!userId) {
-              errEl.hidden = false;
-              errEl.textContent = "Select a user first.";
-              return false;
-            }
-            req.user_id = userId;
-          }
-          btn.disabled = true;
-          btn.textContent = "Queueing…";
-          try {
-            if (creating) {
-              const avail = await api.checkUsername(req.create_user.username, req.create_user.name);
-              if (avail && avail.available === false) {
-                errEl.hidden = false;
-                errEl.textContent = avail.username_conflict
-                  ? "That username is already taken."
-                  : "That name is already taken.";
-                btn.disabled = false;
-                btn.textContent = "Reauthenticate";
-                return false;
-              }
-            }
-            const res = await api.reauthDevice(req);
-            const deliveredNote = res.pushed
-              ? "encrypted push sent"
-              : res.push_skipped
-                ? "no push possible — queued for next check-in"
-                : "queued for next check-in";
-            if (res.password) {
-              showRevealModal(res.username, res.password);
-            } else {
-              ui.toast(`Reauthentication to '${res.username}' queued (${deliveredNote}).`);
-            }
-            app.refresh();
-          } catch (err) {
-            errEl.hidden = false;
-            errEl.textContent = "Failed: " + ui.errMsg(err);
-            btn.disabled = false;
-            btn.textContent = "Reauthenticate";
-            return false;
-          }
-        },
-      },
-    ],
-  });
-}
 
 /* ---------- view ---------- */
 
@@ -738,10 +487,20 @@ export function createView(app) {
           </div>
           ${msgHtml(msgs.alias)}
         </div>
-      </div></div>`;
+      </div></div>
+      ${d.native ? "" : `
+      <div class="card section-card"><div class="card__body">
+        <h5>Re-provision</h5>
+        <p class="muted" style="margin:0 0 10px; font-size:13px;">Give this device a fresh login on its account — over push when possible, otherwise a new QR code. Other devices on the account stay signed in.</p>
+        <button class="btn btn--outlined" id="dev-reprovision"><ha-icon icon="mdi:qrcode"></ha-icon> Re-provision</button>
+      </div></div>`}`;
 
     bindInfoGrid(shell.formEl.querySelector("#dev-ov-grid"));
     shell.formEl.querySelector("#dev-save-alias").addEventListener("click", saveAlias);
+    shell.formEl.querySelector("#dev-reprovision")?.addEventListener("click", async () => {
+      const mod = await app.loadModule("views/reprovision.js");
+      mod.openReprovisionModal(app, device);
+    });
   }
 
   async function saveAlias() {

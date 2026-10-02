@@ -1,8 +1,8 @@
 // Casa admin panel — shared username helpers: name→username slugification and
 // the live (debounced, advisory) availability check against
-// /api/casa/admin/check_username. Extracted from provision-guided.js so the
-// guided wizard, the Reauthenticate modal, and the Create Account modal all
-// derive usernames and render availability the same way. Loaded lazily via
+// /api/casa/admin/check_username. Shared by the provision wizard and the
+// Create Account modal so they derive usernames and render availability the
+// same way. Loaded lazily via
 // app.loadModule("views/username-utils.js") — never static-imported.
 
 export const USERNAME_RE = /^[a-z0-9][a-z0-9-]*$/;
@@ -23,7 +23,7 @@ const escapeHtml = (v) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]
   );
 
-// Availability hint markup shared with provision-guided's availabilityHtml().
+// Availability hint markup shared with the provision wizard's availabilityHtml().
 // a: null | {checking:true} | {available, username_conflict, for}
 export function availabilityHintHtml(a, username, esc = escapeHtml) {
   if (!username || !a) return "";

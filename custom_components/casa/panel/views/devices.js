@@ -399,15 +399,16 @@ export function createView(app) {
             mod.openPushModal(app, d, "profile");
           },
         },
-        { icon: "mdi:qrcode", label: "Re-provision user", onSelect: () => gotoProvision({ presetUsername: d.username }) },
-        {
-          icon: "mdi:account-key",
-          label: "Reauthenticate…",
-          onSelect: async () => {
-            const mod = await app.loadModule("views/device-editor.js");
-            mod.openReauthModal(app, d);
-          },
-        },
+        ...(d.native
+          ? []
+          : [{
+              icon: "mdi:qrcode",
+              label: "Re-provision",
+              onSelect: async () => {
+                const mod = await app.loadModule("views/reprovision.js");
+                mod.openReprovisionModal(app, d);
+              },
+            }]),
         "divider",
         { icon: "mdi:delete-outline", label: "Delete record", danger: true, onSelect: () => confirmDeviceAction(d, "delete") },
         { icon: "mdi:cellphone-remove", label: "Deprovision", danger: true, onSelect: () => confirmDeviceAction(d, "deprovision") },
