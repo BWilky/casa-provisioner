@@ -77,3 +77,9 @@ test("setupResultHtml renders QR, both links and validity, escaped", () => {
   assert.match(html, /&quot;x/);
   assert.match(html, /valid until 11:20 PM/);
 });
+
+test("setupResultHtml marks the QR as zoomable", () => {
+  const html = setupResultHtml({ qr_data_uri: "data:image/png;base64,AA" }, { esc, fmtExpiry: () => "" });
+  assert.match(html, /data-qr-zoom/);
+  assert.match(html, /Click to enlarge/);
+});
