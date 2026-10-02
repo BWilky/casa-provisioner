@@ -1043,20 +1043,27 @@ def _rename_casa_entity(registry, entry, alias: str) -> str | None:
         return None
     label = entry.original_name or entry.name or ""
     from homeassistant.util import slugify
+    if not slugify(alias):
+        return None
     preferred = slugify(f"{alias} {label}".strip())
     if object_id == preferred or re.fullmatch(re.escape(preferred) + r"_\d+", object_id):
         return None
     target = registry.async_generate_entity_id(domain, f"{alias} {label}".strip())
     if target == entry.entity_id:
         return None
-    registry.async_update_entity(entry.entity_id, new_entity_id=target)
+    old_id = entry.entity_id
+    registry.async_update_entity(old_id, new_entity_id=target)
+    _LOGGER.info("CASA: Renamed entity '%s' → '%s' after the device name.", old_id, target)
     return target
 
 
 def _rename_device_entities(hass, device_id: str) -> None:
     """While a freshly provisioned device's rename window is open, rename its
     auto-generated entity ids after its alias (see _rename_casa_entity)."""
-    stored_data = hass.data[DOMAIN]["stored_data"]
+    data = hass.data.get(DOMAIN)
+    if not data:
+        return
+    stored_data = data["stored_data"]
     device_info, _uid, _username = _find_device_record(stored_data, device_id)
     if not device_info or (device_info.get("entity_rename_until") or 0) < time.time():
         return
@@ -4231,6 +4238,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _apply_pending_provision(hass, user_id, device_info, refresh_token_id)
         if _device_being_purged(hass, device_id):
             raise HomeAssistantError("Device is being removed.")
+
+        # QR re-provision redeemed by a replacement phone: take over the old
+        # record before this heartbeat creates the HA device, so the new
+        # entities don't collide with the old ones (see async_register_device).
+        replaced_device_id = await _apply_device_replacement(hass, device_id, device_info, refresh_token_id)
+        if _device_being_purged(hass, device_id):
+            raise HomeAssistantError("Device is being removed.")
+        if replaced_device_id:
+            _remove_registry_device(hass, replaced_device_id)
+        # Re-bind: if the record was purged during the awaits above, this
+        # re-creates it in the live dict instead of writing to an orphan.
+        device_info = devices.setdefault(device_id, device_info)
 
         if last_12_token is not None:
             device_info["last_12_token"] = last_12_token

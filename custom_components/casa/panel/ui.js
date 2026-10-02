@@ -211,7 +211,11 @@ export function createUi({ popoverLayer, modalLayer, shadowRoot }) {
       overlay.remove();
     };
     const onKey = (e) => {
-      if (e.key === "Escape" && dismissable) close();
+      if (e.key !== "Escape" || !dismissable) return;
+      // Stacked modals: only the topmost one handles Escape.
+      if (overlay !== modalLayer.lastElementChild) return;
+      e.stopPropagation();
+      close();
     };
     window.addEventListener("keydown", onKey, true);
 

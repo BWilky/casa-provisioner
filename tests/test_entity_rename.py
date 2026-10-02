@@ -99,3 +99,21 @@ def test_already_slugged_name_is_noop_even_with_casa_device_alias():
     reg = FakeEntityRegistry([_entry("sensor.casa_device_guest_ip_address", "IP Address")])
     assert _rename_casa_entity(reg, reg.entries["sensor.casa_device_guest_ip_address"], "Casa Device Guest") is None
     assert reg.updates == []
+
+
+def test_emoji_only_alias_is_not_renamed():
+    reg = FakeEntityRegistry([_entry("sensor.casa_device_guest_ip_address", "IP Address")])
+    assert _rename_casa_entity(reg, reg.entries["sensor.casa_device_guest_ip_address"], "🙂🙂") is None
+    assert reg.updates == []
+
+
+def test_rename_logs_old_and_new(caplog):
+    import logging
+    reg = FakeEntityRegistry([_entry("sensor.casa_device_guest_ip_address_2", "IP Address")])
+    with caplog.at_level(logging.INFO):
+        _rename_casa_entity(reg, reg.entries["sensor.casa_device_guest_ip_address_2"], "Bryce Mobile")
+    assert "sensor.casa_device_guest_ip_address_2" in caplog.text and "sensor.bryce_mobile_ip_address" in caplog.text
+
+
+def test_rename_device_entities_after_unload_is_noop():
+    _rename_device_entities(FakeHass(), "D1")
