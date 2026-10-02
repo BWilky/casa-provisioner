@@ -3860,6 +3860,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # the new record takes over the old one's identity and the old record
         # is purged. No claim (the normal case) → no-op.
         replaced_device_id = await _apply_device_replacement(hass, device_id, devices[device_id], refresh_token_id)
+
+        # The replacement awaited (purge + store save): re-apply the guard above.
+        if _device_being_purged(hass, device_id):
+            raise HomeAssistantError("Device is being removed.")
+
         if replaced_device_id:
             _remove_registry_device(hass, replaced_device_id)
 
