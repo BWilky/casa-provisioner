@@ -305,7 +305,7 @@ These are called by the Casa iOS app directly (authenticated via HA long-lived o
 | `POST` | `/api/casa/location_report` | Encrypted location-state report; unauthenticated at the HTTP layer, body encrypted with the device key |
 | `POST` | `/api/casa/deprovision` | Device removes its own record and session (`{device_id}`) |
 
-Admin-only endpoints (used by the panel): `/api/casa/admin/summary`, `/api/casa/admin/device` (alias + `expires_at_override`), `/api/casa/admin/wireguard_profiles`, `/api/casa/admin/provision_profiles`, `/api/casa/admin/queue_update`, `/api/casa/admin/regenerate_device_key`, `/api/casa/admin/location_zones`, `/api/casa/admin/settings`, `/api/casa/admin/sessions`, `/api/casa/admin/check_username`, `/api/casa/admin/reauth_device`.
+Admin-only endpoints (used by the panel): `/api/casa/admin/summary`, `/api/casa/admin/device` (alias + `expires_at_override`), `/api/casa/admin/wireguard_profiles`, `/api/casa/admin/provision_profiles`, `/api/casa/admin/queue_update`, `/api/casa/admin/regenerate_device_key`, `/api/casa/admin/location_zones`, `/api/casa/admin/settings`, `/api/casa/admin/sessions`, `/api/casa/admin/check_username`, `/api/casa/admin/reauth_device`, `/api/casa/admin/reprovision_device` (one-click re-provision of a device on its current account: over push when the device is push-registered, else a fresh QR).
 
 **Protocol:** see [`docs/provisioning-protocol.md`](docs/provisioning-protocol.md).
 

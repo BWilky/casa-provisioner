@@ -867,6 +867,10 @@ export function createView(app) {
     // for the overlay leaving the DOM.
     confirmLeave() {
       if (!dirty()) return true;
+      const createdName = state.createdUser ? state.createdUser.username || state.createdUser.name || "" : "";
+      const bodyText = state.createdUser
+        ? `This device hasn't been provisioned yet. The account <strong>${ui.esc(createdName)}</strong> was already created and is kept (remove it from Accounts if unwanted). Discard this setup and leave?`
+        : "This device hasn't been provisioned yet. Discard this setup and leave?";
       return new Promise((resolve) => {
         let settled = false;
         let observer = null;
@@ -879,7 +883,7 @@ export function createView(app) {
         const modal = ui.openModal({
           title: "Leave provisioning?",
           bodyHtml:
-            '<p style="margin:0; font-size:14px; line-height:1.5;">This device hasn\'t been provisioned yet. Discard this setup and leave?</p>',
+            `<p style="margin:0; font-size:14px; line-height:1.5;">${bodyText}</p>`,
           buttons: [
             { label: "Keep going", variant: "text", onClick: () => done(false) },
             { label: "Discard", variant: "danger", onClick: () => done(true) },

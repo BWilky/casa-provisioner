@@ -825,8 +825,8 @@ async def _apply_device_replacement(hass, new_device_id: str, new_info: dict, re
         return None
     if not str(new_info.get("alias") or "").strip() and str(old_info.get("alias") or "").strip():
         new_info["alias"] = old_info["alias"]
-    for key in ("provisioning_profile_id", "provisioning_profile_name"):
-        if not new_info.get(key) and old_info.get(key):
+    for key in ("provisioning_profile_id", "provisioning_profile_name", "provisioning_expiration_hours"):
+        if new_info.get(key) is None and old_info.get(key) is not None:
             new_info[key] = old_info[key]
     await _purge_device(hass, old_device_id)
     _LOGGER.info("CASA: Device '%s' replaced '%s' after a QR re-provision.", new_device_id, old_device_id)
@@ -855,6 +855,7 @@ async def _end_provision_window(hass, user_id: str, provision_id: str, reason: s
             # the listener missed, e.g. across a restart).
             _record_provision_claims(
                 hass, user_id, set(user.refresh_tokens.keys()) - set(rec.get("known_token_ids") or []),
+                replaces_device_id=rec.get("replaces_device_id"),
             )
             try:
                 await _set_account_password(hass, provider, login_username, window_provision_id=provision_id)
@@ -1956,6 +1957,7 @@ class CasaAdminSummaryView(HomeAssistantView):
                     "provisioning_pending_push": bool(dinfo.get("provisioning_pending_push", False)),
                     "provisioning_profile_id": dinfo.get("provisioning_profile_id"),
                     "provisioning_profile_name": dinfo.get("provisioning_profile_name"),
+                    "push_ready": bool(dinfo.get("push_token")) and bool(stored_data.get("device_key")),
                     "reauth_pending": _reauth(dinfo),
                 })
 
@@ -2000,7 +2002,8 @@ class CasaAdminSummaryView(HomeAssistantView):
                         "provisioning_pending_push": bool(dinfo.get("provisioning_pending_push", False)),
                         "provisioning_profile_id": dinfo.get("provisioning_profile_id"),
                         "provisioning_profile_name": dinfo.get("provisioning_profile_name"),
-                        "reauth_pending": _reauth(dinfo),
+                        "push_ready": bool(dinfo.get("push_token")) and bool(stored_data.get("device_key")),
+                    "reauth_pending": _reauth(dinfo),
                     })
 
         accounts = []
@@ -2682,6 +2685,9 @@ def _reprovision_service_data(hass, device_info: dict, fallback_host_url: str) -
     template_host = str(((template or {}).get("fields") or {}).get("host_url") or "").strip()
     if not str(data.get("host_url") or "").strip() and not template_host:
         data["host_url"] = fallback_host_url
+    recorded_hours = device_info.get("provisioning_expiration_hours")
+    if isinstance(recorded_hours, int) and not isinstance(recorded_hours, bool):
+        data["expiration_hours"] = recorded_hours
     data["method"] = "qr"
     data["deauthenticate_existing"] = False
     alias = str(device_info.get("alias") or "").strip()
@@ -3679,11 +3685,22 @@ class CasaAdminReprovisionDeviceView(HomeAssistantView):
             device_info, owner_uid, username = _find_device_record(stored_data, device_id)
             if not device_info:
                 return self.json({"error": "Device not found"}, status_code=404)
+            udata = (stored_data.get("users") or {}).get(owner_uid)
+            if not udata or udata.get("deleted", False):
+                return self.json({"error": "Re-provision is only available for Casa-managed accounts"}, status_code=400)
+            owner = await hass.auth.async_get_user(owner_uid)
+            if not owner or getattr(owner, "is_admin", False):
+                return self.json({"error": "Cannot re-provision a device on an admin account"}, status_code=400)
+            if not getattr(owner, "is_active", True):
+                return self.json({"error": "Target user is inactive"}, status_code=400)
 
             service_data = _reprovision_service_data(hass, device_info, host_url)
             service_data["user_id"] = owner_uid
             service_data["username"] = username
-            result = await self.provision_func(service_data, replaces_device_id=device_id)
+            try:
+                result = await self.provision_func(service_data, replaces_device_id=device_id)
+            except Exception as err:
+                return self.json({"error": str(err) or "Provisioning failed"}, status_code=400)
             if not isinstance(result, dict) or result.get("error"):
                 # Nothing changed on failure: pending reauth and session kept.
                 return self.json({"error": (result or {}).get("error") or "Provisioning failed"}, status_code=400)
@@ -3697,8 +3714,7 @@ class CasaAdminReprovisionDeviceView(HomeAssistantView):
             # Cut this device off now; it comes back through the new QR/link.
             rtid = device_info.get("refresh_token_id")
             if rtid:
-                owner = await hass.auth.async_get_user(owner_uid)
-                token = owner.refresh_tokens.get(rtid) if owner else None
+                token = owner.refresh_tokens.get(rtid)
                 if token:
                     hass.auth.async_remove_refresh_token(token)
             _save_stored_data(hass)
@@ -4018,10 +4034,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # unrelated later registration) past the same 30-min TTL
         # _login_listener caps at.
         pending_by_user = hass.data[DOMAIN].get("pending_profile_by_user", {})
-        pending = pending_by_user.pop(user_id, None)
+        # Only the session that redeemed the window may consume it: on a
+        # shared account another device's first registration must not.
+        pending = pending_by_user.get(user_id)
+        if pending and await _has_fresh_claim(hass, user_id, refresh_token_id):
+            pending_by_user.pop(user_id, None)
+        else:
+            pending = None
         if pending and (time.time() - pending.get("set_at", 0)) <= 1800:
             devices[device_id]["provisioning_profile_id"] = pending.get("profile_id")
             devices[device_id]["provisioning_profile_name"] = pending.get("profile_name")
+            if "expiration_hours" in pending:
+                devices[device_id]["provisioning_expiration_hours"] = pending["expiration_hours"]
             # Alias typed at provision time; never overwrite one already set
             # (same precedence as the heartbeat's device-submitted alias).
             pending_alias = str(pending.get("device_alias") or "").strip()
@@ -4600,6 +4624,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "profile_id": profile_key or None,
             "profile_name": matched_profile.get("name") if matched_profile else None,
             "device_alias": str(service_data.get("device_alias", "")).strip()[:DEVICE_ALIAS_MAX_LEN] or None,
+            "expiration_hours": expiration_hours,
             "set_at": time.time(),
         }
 

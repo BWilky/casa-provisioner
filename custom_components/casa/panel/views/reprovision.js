@@ -11,7 +11,7 @@ export async function openReprovisionModal(app, device) {
   const esc = ui.esc;
   const label = device.alias || device.device_id;
   const account = device.username || "this account";
-  let forceQr = !device.push_registered;
+  let forceQr = !(device.push_ready ?? device.push_registered);
 
   const body = document.createElement("div");
   const draw = () => {
@@ -21,7 +21,7 @@ export async function openReprovisionModal(app, device) {
     body.innerHTML = `
       <p style="margin:0 0 8px; font-size:14px; line-height:1.5;">${text}</p>
       <p class="muted" style="margin:0 0 8px; font-size:13px;">Other devices on <span class="mono">${esc(account)}</span> stay signed in.</p>
-      ${device.push_registered && !forceQr
+      ${(device.push_ready ?? device.push_registered) && !forceQr
         ? `<button class="btn btn--text" data-act="force-qr" style="padding-left:0;">Phone wiped or replaced? Show QR instead</button>`
         : ""}
       <div class="field__error" data-err hidden></div>`;

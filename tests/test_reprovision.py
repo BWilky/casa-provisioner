@@ -183,3 +183,32 @@ def test_summary_accounts_carry_user_id():
     status, resp = asyncio.run(view.get(FakeRequest(make_user("admin", admin=True))))
     assert status == 200
     assert resp["accounts"][0]["user_id"] == "u1"
+
+
+def test_seed_recorded_expiration_wins_over_template():
+    hass = _hass([{"id": "t1", "name": "T", "fields": {"host_url": "https://t", "expiration_hours": 336}}])
+    info = {"provisioning_profile_id": "t1", "provisioning_expiration_hours": 0}
+    assert _reprovision_service_data(hass, info, ORIGIN)["expiration_hours"] == 0
+
+
+def test_seed_without_recorded_expiration_omits_key():
+    assert "expiration_hours" not in _reprovision_service_data(_hass(), {}, ORIGIN)
+
+
+def test_qr_inactive_owner_rejected_and_nothing_revoked():
+    hass, provision, calls = _site()
+    hass.auth.users["u1"].is_active = False
+    status, resp = _post(hass, provision, {"device_id": "D1", "method": "qr", "host_url": ORIGIN})
+    assert status == 400 and resp["error"] == "Target user is inactive"
+    assert calls == [] and hass.auth.removed_tokens == []
+
+
+def test_qr_provision_exception_returns_400_and_revokes_nothing():
+    hass, _, _ = _site()
+
+    async def boom(service_data, users=None, *, replaces_device_id=None):
+        raise RuntimeError("relay down")
+
+    status, resp = _post(hass, boom, {"device_id": "D1", "method": "qr", "host_url": ORIGIN})
+    assert status == 400 and resp["error"] == "relay down"
+    assert hass.auth.removed_tokens == []

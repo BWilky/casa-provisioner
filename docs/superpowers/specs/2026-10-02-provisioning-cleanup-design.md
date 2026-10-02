@@ -126,7 +126,7 @@ nothing preselected.
 3. **`api.provision`** with: `method: "qr"`, `user_id`, `username`,
    `device_alias`, the coerced fields, process fields (pin, Wi-Fi,
    deauthenticate_existing), `profile` lineage (rules below).
-   No `password` (server generates).
+   A new account's generated password (from create_user) is sent so a retry never rotates it; an existing account sends none (server rotates). Never shown.
 
 Lineage: selected template unchanged → its id; saved-as-new → the new id;
 customized but not saved, or Configure manually unsaved → no `profile`.
@@ -278,7 +278,7 @@ Response: the normal provision result (`qr_data_uri`, `deep_link`,
 Known constraint (unchanged): `pending_provisions` is keyed by account, and
 `_set_account_password` closes other open windows for the login — so on a
 shared account only one setup link/QR is live at a time; generating a new one
-invalidates the previous one.
+invalidates the previous one. A QR re-provision rotates the account password, which also drops other devices' still-queued reauths on that account (their sessions survive; their pending re-provision is cancelled).
 
 ## Removals
 

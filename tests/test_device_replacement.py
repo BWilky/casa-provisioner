@@ -129,3 +129,20 @@ def test_armed_window_forwards_replaces_device_id(monkeypatch):
 
     asyncio.run(scenario())
     assert hass.casa["stored_data"]["replacement_claims"]["r-new"]["replaces_device_id"] == "OLD"
+
+
+def test_replacement_copies_expiration_hours():
+    hass = _hass()
+    _devices(hass)["OLD"]["provisioning_expiration_hours"] = 0
+    _record_provision_claims(hass, "u1", {"r-new"}, replaces_device_id="OLD")
+    new_info = _devices(hass)["NEW"]
+    asyncio.run(_apply_device_replacement(hass, "NEW", new_info, "r-new"))
+    assert new_info["provisioning_expiration_hours"] == 0
+
+
+def test_has_fresh_claim_true_for_recorded_false_for_unrelated():
+    from custom_components.casa import _has_fresh_claim
+    hass = _hass()
+    _record_provision_claims(hass, "u1", {"r-new"})
+    assert asyncio.run(_has_fresh_claim(hass, "u1", "r-new")) is True
+    assert asyncio.run(_has_fresh_claim(hass, "u1", "r-old")) is False

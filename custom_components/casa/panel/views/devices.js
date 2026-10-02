@@ -135,7 +135,7 @@ export function createView(app) {
       );
     if (d.reauth_pending)
       badges.push(
-        `<span class="badge badge--pending" title="Reauthentication to '${ui.esc(d.reauth_pending.target_username || "")}' pending">reauth</span>`
+        `<span class="badge badge--pending" title="Re-provision pending (signing back in as '${ui.esc(d.reauth_pending.target_username || "")}')">re-provisioning</span>`
       );
     const icons = [];
     if (d.wireguard_connected)
