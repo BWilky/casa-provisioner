@@ -1,116 +1,102 @@
-// Casa admin panel — provision device flow. Full-page view at /provision
-// with a step-tab flow: Template (pick a saved template, create a new one, or
-// one-off config) → Configure → Deploy (QR / deep link / BLE) → Done. Tabs
-// are progress indicators — earlier tabs are clickable and preserve state,
-// forward movement only happens through the footer buttons so validation
-// can't be skipped. "Create new template" saves via the templates API at
-// deploy time (no orphan templates if the flow is abandoned); retries reuse
-// the created id so a failed provision never duplicates the template.
+// Casa admin panel — provision a new device. Full-page wizard at /provision:
+// ① Account — create a new account named after the device (username
+//   suggested as casa-<slug>, live availability; a taken username that is a
+//   Casa account offers "use this account instead"), or pick an existing
+//   Casa account; the device name is required either way.
+// ② Template — a saved template or "Configure manually". Per-device tweaks
+//   live behind "Customize for this device" (with an optional "Also save as
+//   new template"); PIN / Wi-Fi join / sign-out-others behind "Advanced".
+// ③ Done — QR + setup links.
+// Re-provisioning an existing device is a device action
+// (views/reprovision.js), not part of this flow.
 //
-// Templates are sparse (they store only explicitly-set fields), so the
-// configure step always shows the full form: fields the template sets are
-// badged "from template", the rest are badged "review" and prefilled with
-// the system defaults for the admin to fill in or accept. The resolved
-// values are stamped at provision time — precedence is admin input >
-// template > default, enforced both here (the form is seeded that way) and
-// server-side (get_field).
-//
-// The field schema/renderer is shared with the template editor and device
-// editor via profile-fields.js — this view renders the same sections
-// filtered by scope: template (LIVE + expiration_hours) fields alongside
-// process-only fields (username/password/pin, deauth, timeout, scramble,
-// Wi-Fi join), which are legitimate here because this flow IS the
-// provisioning action. Process values ride casa.provision service_data and
-// are never persisted to a template.
-
-const METHOD_LABELS = {
-  qr: "Generate Link & QR Code",
-  deep_link: "Generate Setup Links",
-  ble: "Broadcast Provisioning Beacon",
-};
-
-const RESULT_TITLES = {
-  qr: "QR code ready",
-  deep_link: "Setup links ready",
-  ble: "Beacon broadcast",
-};
-
-// Gating fields → the accordion section whose body re-renders when they flip.
-const KEY_SECTION = {
-  theme_color_mode: "appui",
-  allow_all_pages: "access",
-  wireguard_profile_id: "pushvpn",
-};
-
-// Full-form Timing section shows only template-scope timing fields; the
-// process-scope timing/wifi fields live in the "Provisioning options" section.
-const TEMPLATE_TIMING_SET = new Set(["expiration_hours", "cache_control_hours"]);
-const FORM_PROCESS_SET = new Set([
-  "timeout_minutes", "password_scramble", "password_scramble_in",
-  "connect_wifi_ssid", "connect_wifi_password",
-]);
+// Generate order is create_user → (save template) → casa.provision, each
+// guarded by state so a retry never duplicates the account (createdUser) or
+// the template (savedTemplateId). A new account's generated password rides
+// casa.provision explicitly so a retry never rotates it; an existing account
+// sends none and the server rotates it. Passwords are never shown. Decision
+// logic lives in provision-logic.js (node-tested).
 
 const STEPS = [
+  { id: "account", label: "Account" },
   { id: "template", label: "Template" },
-  { id: "configure", label: "Configure" },
-  { id: "deploy", label: "Deploy" },
   { id: "result", label: "Done" },
 ];
 const stepIndex = (id) => STEPS.findIndex((s) => s.id === id);
+
+// Gating fields → the Customize section whose body re-renders when they flip.
+const KEY_SECTION = { theme_color_mode: "appui", allow_all_pages: "access", wireguard_profile_id: "pushvpn" };
+const CONNECTION_SET = new Set(["host_url"]);
+const TIMING_SET = new Set(["expiration_hours", "cache_control_hours"]);
+const ADV_CONNECTION_SET = new Set(["pin", "deauthenticate_existing"]);
+const ADV_WIFI_SET = new Set(["connect_wifi_ssid", "connect_wifi_password"]);
+const SEARCH_THRESHOLD = 8;
 
 export function createView(app) {
   const { api, ui } = app;
   const esc = ui.esc;
   const unwrap = (res) => api.constructor.response(res); // CasaApi.response
-
   const trim = (v) => String(v ?? "").trim();
-  const bleAvailable = () => !!(app.hass() && app.hass().services && app.hass().services.esphome);
 
   /* ---------- lazily loaded siblings (never static imports) ---------- */
   let fieldsMod = null; // views/profile-fields.js
   let previewMod = null; // payload-preview.js
+  let utilsMod = null; // views/username-utils.js
+  let logicMod = null; // views/provision-logic.js
+  let resultMod = null; // views/provision-result.js
 
   /* ---------- per-mount state ---------- */
   let mountToken = 0;
   let state = null;
   let refs = null; // { tabs, body }
   let wgRequested = false;
+  let availTimer = 0;
   let mountedWithPresetPath = false;
-  let scenarioModal = null; // scenario-picker handle, closed on unmount
 
   function freshState() {
     return {
-      step: "template", // "template" | "configure" | "deploy" | "result"
-      entry: null, // "template" | "new" | "oneoff"
-      // step 1
+      step: "account",
+      // ① account
+      accountMode: "new", // "new" | "existing"
+      deviceName: "",
+      username: "",
+      usernameEdited: false, // admin typed in the username field; stop auto-suggesting
+      availability: null, // null | {checking:true} | {available, username_conflict, name_conflict, for}
+      existingUsername: "",
+      accountError: "",
+      createdUser: null, // {name, username, password, user_id} — retry guard
+      // ② template
       templates: null, // null = loading
       templatesError: null,
       search: "",
-      template: null, // selected saved-template object
-      templateSetKeys: null, // Set of fields the selected template sets
-      presetUsername: "",
-      // step 2 — full form (all entry kinds)
-      form: null, // fieldsMod.DEFAULTS shape; built once per run
-      newSetKeys: null, // entry === "new": fields the admin touched (sparse template save)
-      formOpen: { connection: true, appui: false, access: false, pushvpn: false, timing: false, process: false },
-      templateName: "", // entry === "new" only
-      savedTemplateId: null, // set once saveProvisionTemplate succeeds (retry guard)
-      configError: "",
-      // step 3
-      method: "qr",
-      bleTargets: [],
-      deleteQr: true,
-      qrFilename: "",
-      qrOptionsOpen: false,
+      choice: null, // template id | "manual" | null
+      form: null, // full DEFAULTS-shaped values (profile + process keys)
+      baseline: null, // collectFields(form, PROFILE_KEYS) at seed time
+      customizeOpen: false,
+      advancedOpen: false,
+      saveAsTemplate: false,
+      newTemplateName: "",
+      savedTemplateId: null, // retry guard
+      wgProfiles: null,
       deployError: "",
       busy: false,
-      // step 4
+      // ③
       result: null,
-      wgProfiles: null, // lazy cache for the "Link WireGuard profile" select
     };
   }
 
-  const dirty = () => !!(state && state.entry !== null && state.step !== "result");
+  const dirty = () =>
+    !!(state && state.step !== "result" && (trim(state.deviceName) || state.choice || state.createdUser));
+
+  const casaAccounts = () =>
+    ((app.summary() && app.summary().accounts) || [])
+      .slice()
+      .sort((a, b) => String(a.name || a.username).localeCompare(String(b.name || b.username)));
+
+  const selectedTemplate = () =>
+    state.choice && state.choice !== "manual"
+      ? (state.templates || []).find((t) => t && t.id === state.choice) || null
+      : null;
 
   /* ---------- data ---------- */
 
@@ -147,64 +133,65 @@ export function createView(app) {
       })
       .then(() => {
         if (token !== mountToken || !state) return;
-        rerenderFormSection("pushvpn");
+        rerenderCustomizeSection("pushvpn");
       });
   }
 
-  /* ---------- step transitions ---------- */
+  /* ---------- username availability (advisory — create_user is authoritative) ---------- */
+
+  function conflictAccount() {
+    const a = state.availability;
+    const u = trim(state.username);
+    if (!a || a.checking || a.for !== u || a.available || !a.username_conflict) return null;
+    return casaAccounts().find((x) => x.username === u) || null;
+  }
+
+  function availabilityHtml() {
+    const acct = conflictAccount();
+    if (acct) {
+      return `
+        <span class="chip chip--error"><ha-icon icon="mdi:alert-circle" style="--mdc-icon-size:14px;"></ha-icon> ${esc(acct.username)} already exists</span>
+        <button class="btn btn--text" data-act="use-existing" data-username="${esc(acct.username)}" style="height:24px;">Use this account instead?</button>`;
+    }
+    return utilsMod ? utilsMod.availabilityHintHtml(state.availability, trim(state.username), esc) : "";
+  }
+
+  function renderAvailability() {
+    const el = refs && refs.body.querySelector("#pv-availability");
+    if (el) el.innerHTML = availabilityHtml();
+  }
+
+  function scheduleAvailability() {
+    clearTimeout(availTimer);
+    const username = trim(state.username);
+    if (!username || !utilsMod || !utilsMod.USERNAME_RE.test(username)) {
+      state.availability = null;
+      renderAvailability();
+      return;
+    }
+    state.availability = { checking: true };
+    renderAvailability();
+    const token = mountToken;
+    const name = trim(state.deviceName);
+    availTimer = setTimeout(async () => {
+      try {
+        const res = await api.checkUsername(username, name);
+        if (token !== mountToken || !state || trim(state.username) !== username) return;
+        state.availability = { ...res, for: username };
+      } catch {
+        if (token !== mountToken || !state) return;
+        state.availability = null;
+      }
+      renderAvailability();
+    }, 350);
+  }
+
+  /* ---------- tabs / shared chrome ---------- */
 
   function gotoStep(id) {
     state.step = id;
     render();
   }
-
-  function selectTemplate(template) {
-    if (!fieldsMod) return; // sibling modules still loading (sub-second window)
-    state.entry = "template";
-    state.template = template || null;
-    const f = (template && template.fields) || {};
-    // Seed the full form: template-set fields on top of the defaults. The
-    // admin can override anything — precedence admin input > template >
-    // default holds because the template's values are just the starting
-    // point, and get_field re-applies the same order server-side.
-    state.form = { ...fieldsMod.DEFAULTS };
-    for (const key of Object.keys(f)) {
-      if (fieldsMod.PROFILE_KEYS.has(key)) state.form[key] = f[key];
-    }
-    state.templateSetKeys = new Set(Object.keys(f).filter((k) => fieldsMod.PROFILE_KEYS.has(k)));
-    state.formSource = "template";
-    if (!trim(state.form.host_url)) state.form.host_url = window.location.origin;
-    if (state.presetUsername) state.form.username = state.presetUsername;
-    state.configError = "";
-    gotoStep("configure");
-  }
-
-  function selectEntry(kind) {
-    if (!fieldsMod) return; // sibling modules still loading (sub-second window)
-    state.entry = kind; // "new" | "oneoff"
-    state.template = null;
-    state.templateSetKeys = null;
-    if (kind === "new" && !state.newSetKeys) state.newSetKeys = new Set();
-    // A form seeded from a template must not leak into a manual entry.
-    if (state.formSource === "template") state.form = null;
-    state.formSource = "manual";
-    if (!state.form) {
-      // Built once per run — later expander/gating re-renders always read
-      // back from this object, so no keystroke is ever lost.
-      state.form = { ...fieldsMod.DEFAULTS };
-      state.form.host_url = window.location.origin;
-      if (state.presetUsername) state.form.username = state.presetUsername;
-    }
-    state.configError = "";
-    gotoStep("configure");
-  }
-
-  function goBack() {
-    if (state.step === "configure") gotoStep("template");
-    else if (state.step === "deploy") gotoStep("configure");
-  }
-
-  /* ---------- step tabs ---------- */
 
   function renderTabs() {
     const cur = stepIndex(state.step);
@@ -217,432 +204,402 @@ export function createView(app) {
       </button>`).join("");
   }
 
-  /* ---------- step 1: template ---------- */
-
-  function entryCardsHtml() {
-    return `
-      <div style="display:flex; gap:12px; flex-wrap:wrap;">
-        <button class="option-card" data-act="entry-new" style="flex:1; min-width:260px;">
-          <ha-icon icon="mdi:file-plus-outline" style="color:var(--casa-text-2);"></ha-icon>
-          <span class="option-card__text">
-            <span class="option-card__title" style="display:block;">Create new template</span>
-            <span class="option-card__desc" style="display:block;">Build a reusable template as you go — saved when you deploy</span>
-          </span>
-          <ha-icon class="chevron" icon="mdi:chevron-right"></ha-icon>
-        </button>
-        <button class="option-card" data-act="entry-oneoff" style="flex:1; min-width:260px;">
-          <ha-icon icon="mdi:tune" style="color:var(--casa-text-2);"></ha-icon>
-          <span class="option-card__text">
-            <span class="option-card__title" style="display:block;">One-off configuration</span>
-            <span class="option-card__desc" style="display:block;">Device-specific setup, nothing saved</span>
-          </span>
-          <ha-icon class="chevron" icon="mdi:chevron-right"></ha-icon>
-        </button>
-      </div>`;
-  }
-
-  function templateTableHtml() {
-    if (state.templates === null) {
-      return `<div class="empty-state" style="padding:32px 16px;"><span class="muted">Loading templates…</span></div>`;
-    }
-    let errHtml = "";
-    if (state.templatesError) {
-      errHtml = `
-        <div class="errbar" style="display:flex; align-items:center; gap:10px;">
-          <span style="flex:1;">Failed to load templates: ${esc(state.templatesError)}</span>
-          <button class="btn btn--outlined" data-act="retry-templates" style="height:28px; flex:none;">Retry</button>
-        </div>`;
-    }
-    if (!state.templates.length) {
-      return `${errHtml}
-        <div class="empty-state">
-          <ha-icon icon="mdi:file-cog-outline"></ha-icon>
-          <div>No provision templates yet</div>
-          <div class="muted" style="font-size:13px;">Create one as you provision, or configure this device one-off.</div>
-          <button class="btn btn--primary" data-act="entry-new">+ Create new template</button>
-        </div>`;
-    }
-    const q = state.search.trim().toLowerCase();
-    const matches = state.templates.filter((p) => {
-      if (!q) return true;
-      const f = p.fields || {};
-      return [p.name, f.host_url].some((v) => String(v || "").toLowerCase().includes(q));
-    });
-    if (!matches.length) {
-      return `${errHtml}
-        <div class="empty-state">
-          <ha-icon icon="mdi:magnify-close"></ha-icon>
-          <div>No templates match "${esc(state.search.trim())}"</div>
-          <button class="btn btn--text" data-act="clear-search">Clear search</button>
-        </div>`;
-    }
-    const trs = matches
-      .map((p) => {
-        const f = p.fields || {};
-        const setCount = Object.keys(f).length;
-        const chips = (previewMod ? previewMod.profileChips(p) : [])
-          .map((c) => `<span class="chip ${esc(c.cls || "chip--neutral")}">${esc(c.label)}</span>`)
-          .join("");
-        return `<tr class="row--clickable" data-id="${esc(p.id)}">
-          <td>
-            <strong>${esc(p.name || "(unnamed)")}</strong>
-            ${chips ? `<div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">${chips}</div>` : ""}
-          </td>
-          <td class="mono">${esc(f.host_url || "—")}</td>
-          <td><span class="chip chip--neutral">sets ${setCount} field${setCount === 1 ? "" : "s"}</span></td>
-          <td>${esc(ui.fmtTime(p.updated_at))}</td>
-          <td class="col-actions">
-            <button class="btn btn--icon" data-act="edit-template" data-id="${esc(p.id)}" title="Edit template"><ha-icon icon="mdi:pencil"></ha-icon></button>
-            <button class="btn btn--text" data-act="select-template" data-id="${esc(p.id)}" style="height:28px;">Select</button>
-          </td>
-        </tr>`;
-      })
-      .join("");
-    return `${errHtml}
-      <div class="card" style="overflow-x:auto;">
-        <table class="table">
-          <thead><tr><th>Name</th><th>Host</th><th>Fields</th><th>Updated</th><th></th></tr></thead>
-          <tbody>${trs}</tbody>
-        </table>
-      </div>`;
-  }
-
-  function renderTemplateStep() {
-    return `
-      ${entryCardsHtml()}
-      <div style="border-top:1px solid var(--casa-divider); margin:8px 0 14px;"></div>
-      <h4 style="margin:0 0 10px; font-size:14px; font-weight:600;">Or start from a saved template</h4>
-      <div class="list-toolbar">
-        <div class="search-field">
-          <ha-icon icon="mdi:magnify"></ha-icon>
-          <input class="input" id="pw-search" type="search" placeholder="Search templates…" value="${esc(state.search)}">
-        </div>
-      </div>
-      <div id="pw-table">${templateTableHtml()}</div>`;
-  }
-
-  function rerenderTemplateTable() {
-    const table = refs && refs.body.querySelector("#pw-table");
-    if (table) table.innerHTML = templateTableHtml();
-  }
-
-  /* ---------- step 2: configure ---------- */
-
-  function stepFooter(primaryLabel, primaryAct) {
+  function footer(primaryLabel, primaryAct, { back = true } = {}) {
     return `
       <div style="display:flex; justify-content:space-between; gap:8px; margin-top:18px; padding-top:12px; border-top:1px solid var(--casa-divider);">
-        <button class="btn btn--text" data-act="back">Back</button>
+        ${back ? `<button class="btn btn--text" data-act="back">Back</button>` : "<span></span>"}
         <button class="btn btn--primary" data-act="${esc(primaryAct)}" ${state.busy ? "disabled" : ""}>
           ${state.busy ? "Working…" : esc(primaryLabel)}
         </button>
       </div>`;
   }
 
-  function originChipHtml() {
-    if (state.entry === "template") {
-      return `<span class="chip chip--app">Template: ${esc(state.template ? state.template.name || state.template.id : "")}</span>`;
-    }
-    if (state.entry === "new") {
-      return `<span class="chip chip--app">New template: ${esc(trim(state.templateName) || "(unnamed)")}</span>`;
-    }
-    return `<span class="chip chip--neutral">One-off configuration</span>`;
-  }
-
-  /* ---------- step 2: configure (full form) ---------- */
-
-  // Post-render required-error insertion into the shared renderer's
-  // [data-field] wrappers — same pattern template-editor.js uses.
-  function markFieldError(key, msg) {
-    const wrap = refs.body.querySelector(`[data-field="${key}"]`);
+  function markFieldError(field, msg) {
+    const wrap = refs.body.querySelector(`[data-pv-field="${field}"]`);
     if (!wrap || wrap.classList.contains("field--error")) return;
     wrap.classList.add("field--error");
     wrap.insertAdjacentHTML("beforeend", `<div class="field__error">${esc(msg)}</div>`);
   }
 
-  // Template-entry badges: PROFILE-scope fields the template sets get "from
-  // template"; the rest get "review" (prefilled with the default for the
-  // admin to fill in or accept). Process fields are always per-run, so they
-  // carry no badge.
-  function templateAnnotations() {
-    if (state.entry !== "template" || !state.templateSetKeys) return null;
-    const ann = {};
-    for (const key of fieldsMod.PROFILE_KEYS) {
-      ann[key] = state.templateSetKeys.has(key) ? "template" : "review";
-    }
-    return ann;
-  }
+  /* ---------- step 1: account ---------- */
 
-  // Count of "review" (template-unset) PROFILE-scope fields in a section.
-  function sectionReviewCount(sectionId) {
-    if (state.entry !== "template" || !state.templateSetKeys) return 0;
-    const keys = fieldsMod.SECTION_FIELDS[sectionId] || [];
-    return keys.filter((k) => fieldsMod.PROFILE_KEYS.has(k) && !state.templateSetKeys.has(k)).length;
-  }
-
-  // Accordion sections, each rendered by the shared profile-fields.js
-  // renderer filtered to its scope. Connection intentionally includes the
-  // process-scope account fields (username/password/pin/deauth) — this flow
-  // IS the provisioning action, so they're first-class here even though the
-  // template editor no longer shows them. Template-scope timing fields stay
-  // under "Timing & Security"; the remaining process fields (provisioning
-  // window, scramble, Wi-Fi join) get their own "Provisioning options"
-  // section. QR/BLE delivery options live on the Deploy step.
-  function formSectionDefs() {
-    const F = fieldsMod;
-    const annotations = templateAnnotations();
-    const shared = (sectionId, extra = {}) =>
-      F.renderSectionHtml(sectionId, state.form, {
-        esc, heading: false, wgProfiles: state.wgProfiles || [], annotations,
-        setKeys: state.entry === "new" ? state.newSetKeys : null,
-        ...extra,
-      });
-    const siteNote = () => {
-      const summary = app.summary && app.summary();
-      const line = summary && summary.site_id
-        ? `Site binding is automatic — site ${summary.site_id}`
-        : "Site binding is automatic — the server applies the site ID at provision time";
-      return `<div class="muted" style="font-size:12px; margin:2px 0 14px;">${esc(line)}.</div>`;
-    };
-    return [
-      { id: "connection", label: "Connection", render: () => shared("connection") },
-      { id: "appui", label: "App UI", render: () => shared("appui", { fields: F.LIVE_KEYS }) },
-      { id: "access", label: "Access Control", render: () => shared("access", { fields: F.LIVE_KEYS }) },
-      { id: "pushvpn", label: "Push & VPN", render: () => shared("pushvpn", { fields: F.LIVE_KEYS }) + siteNote() },
-      { id: "timing", label: "Timing & Security", render: () => shared("timing", { fields: TEMPLATE_TIMING_SET }) },
-      {
-        id: "process",
-        label: "Provisioning options",
-        render: () => shared("timing", { fields: FORM_PROCESS_SET }) + shared("wifi", { fields: FORM_PROCESS_SET }),
-      },
-    ];
-  }
-
-  // Re-render one section's body from state (used for gating changes and the
-  // lazy WireGuard-profile load) so sibling sections keep their DOM untouched.
-  function rerenderFormSection(id) {
-    if (!state || state.step !== "configure" || !fieldsMod || !state.form) return;
-    const def = formSectionDefs().find((s) => s.id === id);
-    const body = refs.body.querySelector(`[data-section-body="${id}"]`);
-    if (def && body) body.innerHTML = def.render();
-  }
-
-  function renderFullConfigure() {
-    const sections = formSectionDefs().map(({ id, label, render: renderFn }) => {
-      const open = !!state.formOpen[id];
-      const reviewCount = sectionReviewCount(id);
-      const reviewChip = reviewCount
-        ? ` <span class="chip chip--warn">${reviewCount} to review</span>`
-        : "";
-      return `
-        <div style="border-top:1px solid var(--casa-divider);">
-          <button class="btn btn--text" data-act="toggle-section" data-section="${esc(id)}" style="margin:6px 0; padding-left:0;">
-            <ha-icon icon="mdi:chevron-down" style="transition:transform 0.15s; transform:rotate(${open ? "180deg" : "0deg"});"></ha-icon>
-            ${esc(label)}${reviewChip}
-          </button>
-          <div data-section-body="${esc(id)}" ${open ? "" : "hidden"}>${renderFn()}</div>
-        </div>`;
-    }).join("");
-    const nameFieldHtml = state.entry === "new" ? `
-      <div class="field" data-field="templateName">
-        <label>Template name *</label>
-        <input class="input" data-field="templateName" value="${esc(state.templateName)}" placeholder="e.g. Guest tablet">
-        <div class="field__help">Saved as a provision template when you deploy — only the fields you touch are stored on it.</div>
-      </div>` : "";
-    const reviewHint = state.entry === "template" ? `
-      <div class="muted" style="font-size:12px; margin:0 0 12px;">
-        <span class="chip chip--app">from template</span> fields come from the
-        selected template; <span class="chip chip--warn">review</span> fields
-        are not set by it and show the system default — fill them in or accept
-        as-is. You can override anything for this provision.
-      </div>` : "";
+  function modeCard(mode, title, desc) {
+    const active = state.accountMode === mode;
     return `
-      <div style="margin:0 0 14px;">${originChipHtml()}</div>
-      ${state.configError ? `<div class="errbar">${esc(state.configError)}</div>` : ""}
-      ${reviewHint}
-      ${nameFieldHtml}
-      <div id="pw-form-sections">${sections}</div>
-      ${stepFooter("Continue", "to-deploy")}`;
-  }
-
-  function renderConfigureStep() {
-    return renderFullConfigure();
-  }
-
-  function toDeploy() {
-    state.configError = "";
-    const host = trim(state.form.host_url);
-    const user = trim(state.form.username);
-    const needName = state.entry === "new" && !trim(state.templateName);
-    if (!host || !user || needName) {
-      const missing = [];
-      if (needName) missing.push("Template name");
-      if (!host) missing.push("Host URL");
-      if (!user) missing.push("Username");
-      state.configError = missing.join(", ") + (missing.length === 1 ? " is" : " are") + " required.";
-      if (!host || !user) state.formOpen.connection = true;
-      render();
-      if (needName) markFieldError("templateName", "Name this template — it's created when you deploy.");
-      if (!host) markFieldError("host_url", "Required.");
-      if (!user) markFieldError("username", "Required.");
-      return;
-    }
-    if (state.method === "ble" && !bleAvailable()) state.method = "qr";
-    state.deployError = "";
-    gotoStep("deploy");
-  }
-
-  /* ---------- step 3: deploy ---------- */
-
-  function optionCard({ method, title, desc, disabled, disabledTitle, active }) {
-    return `
-      <button class="option-card" data-act="method" data-method="${esc(method)}"
-        style="${active ? "border-color:var(--casa-primary); background:color-mix(in srgb, var(--casa-primary) 6%, transparent);" : ""}"
-        ${disabled ? `disabled title="${esc(disabledTitle || "")}"` : ""}>
+      <button class="option-card" data-act="mode" data-mode="${esc(mode)}" style="flex:1; min-width:240px;
+        ${active ? "border-color:var(--casa-primary); background:color-mix(in srgb, var(--casa-primary) 6%, transparent);" : ""}">
+        <ha-icon icon="${active ? "mdi:radiobox-marked" : "mdi:radiobox-blank"}" style="color:${active ? "var(--casa-primary)" : "var(--casa-text-2)"};"></ha-icon>
         <span class="option-card__text">
           <span class="option-card__title" style="display:block;">${esc(title)}</span>
           <span class="option-card__desc" style="display:block;">${esc(desc)}</span>
         </span>
-        <ha-icon class="chevron" icon="${active ? "mdi:check-circle" : "mdi:chevron-right"}"
-          style="${active ? "color:var(--casa-primary);" : ""}"></ha-icon>
       </button>`;
   }
 
-  function bleChipsHtml() {
-    if (!state.bleTargets.length) {
-      return `<span class="muted" style="font-size:12px;">No targets added yet — at least one is required.</span>`;
-    }
-    return state.bleTargets
-      .map(
-        (t) => `
-        <span class="chip">
-          ${esc(t)}
-          <button data-act="remove-target" data-target="${esc(t)}" title="Remove"
-            style="border:none; background:none; cursor:pointer; padding:0; display:inline-flex; color:inherit;">
-            <ha-icon icon="mdi:close" style="--mdc-icon-size:14px;"></ha-icon>
-          </button>
-        </span>`
-      )
-      .join("");
-  }
-
-  function bleTargetsField() {
-    const services = Object.keys((app.hass() && app.hass().services && app.hass().services.esphome) || {}).map(
-      (s) => "esphome." + s
-    );
+  function deviceNameField() {
     return `
-      <div class="field">
-        <label>Beacon targets *</label>
-        <div class="field-row">
-          <input class="input" id="pw-ble-input" list="pw-ble-list" placeholder="esphome.provision_beacon" autocomplete="off">
-          <datalist id="pw-ble-list">
-            ${services.map((s) => `<option value="${esc(s)}"></option>`).join("")}
-          </datalist>
-          <button class="btn btn--outlined" data-act="add-target" style="flex:none;">Add</button>
-        </div>
-        <div id="pw-ble-chips" style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;">${bleChipsHtml()}</div>
-        <div class="field__help">ESPHome services that broadcast the provisioning beacon.</div>
+      <div class="field" data-pv-field="deviceName">
+        <label>Device name *</label>
+        <input class="input" data-pv="deviceName" value="${esc(state.deviceName)}" maxlength="60"
+          placeholder="e.g. Kitchen iPad" autocomplete="off">
+        <div class="field__help">${state.accountMode === "new"
+          ? "Shown in the device list, and used as the account's name."
+          : "Shown in the device list — applied automatically when the device first connects."}</div>
       </div>`;
   }
 
-  function qrOptionsFields() {
-    return `
-      <label class="toggle">
-        <input type="checkbox" data-field="deleteQr" ${state.deleteQr ? "checked" : ""}>
-        Delete the QR file after the entry window (otherwise it is overwritten with EXPIRED)
-      </label>
-      <div class="field">
-        <label>QR filename</label>
-        <input class="input" data-field="qrFilename" value="${esc(state.qrFilename)}" placeholder="Optional — leave blank to write no file">
-        <div class="field__help">Only if a dashboard needs it: also saves the QR as a public file at /local/&lt;name&gt;.png until the window ends.</div>
-      </div>`;
-  }
-
-  function methodOptionsHtml() {
-    if (state.method === "ble") return bleTargetsField();
-    if (state.method === "qr") {
+  function renderAccountStep() {
+    if (state.createdUser) {
+      const u = state.createdUser;
       return `
-        <button class="btn btn--text" data-act="toggle-qr-options" style="margin:2px 0 8px; padding-left:0;">
-          <ha-icon icon="mdi:chevron-down" style="transition:transform 0.15s; transform:rotate(${state.qrOptionsOpen ? "180deg" : "0deg"});"></ha-icon>
-          QR options
-        </button>
-        <div ${state.qrOptionsOpen ? "" : "hidden"}>
-          ${qrOptionsFields()}
-        </div>`;
-    }
-    return "";
-  }
-
-  function renderDeployStep() {
-    const src = state.form;
-    return `
-      <div class="card" style="margin:0 0 16px;">
-        <div class="card__body" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <ha-icon icon="mdi:account-arrow-right-outline" style="color:var(--casa-text-2); flex:none;"></ha-icon>
-          <span style="font-size:14px;"><strong>${esc(trim(src.username))}</strong> <span class="muted">@ ${esc(trim(src.host_url))}</span></span>
-          <span class="spacer"></span>
-          ${originChipHtml()}
+        <div style="display:flex; gap:8px; align-items:center; margin:0 0 14px; padding:10px 12px; border-radius:var(--casa-radius-sm); background:var(--casa-bg-2); font-size:13px;">
+          <ha-icon icon="mdi:information-outline" style="--mdc-icon-size:18px; flex:none; color:var(--casa-text-2);"></ha-icon>
+          <span>Account <strong class="mono">${esc(u.username)}</strong> was already created for this run — continue to retry, or leave to keep it (remove it from Accounts if unwanted).</span>
         </div>
+        <div class="field"><label>Device name</label><input class="input" value="${esc(state.deviceName)}" disabled></div>
+        ${footer("Continue", "to-template", { back: false })}`;
+    }
+    const accounts = casaAccounts();
+    const newFields = `
+      ${deviceNameField()}
+      <div class="field" data-pv-field="username">
+        <label>Username *</label>
+        <input class="input mono" data-pv="username" value="${esc(state.username)}"
+          placeholder="e.g. casa-kitchen-ipad" autocapitalize="none" autocomplete="off" spellcheck="false">
+        <div id="pv-availability" style="min-height:20px; margin-top:6px;">${availabilityHtml()}</div>
+        <div class="field__help">The account this device signs in with — suggested from the name, edit if you like.</div>
+      </div>`;
+    const existingFields = accounts.length
+      ? `
+        <div class="field" data-pv-field="existingUsername">
+          <label>Account *</label>
+          <select class="select" data-pv="existingUsername" style="width:100%;">
+            <option value="" ${state.existingUsername ? "" : "selected"} disabled>Choose an account…</option>
+            ${accounts.map((a) => `<option value="${esc(a.username)}" ${a.username === state.existingUsername ? "selected" : ""}>${esc(a.name || a.username)} (${esc(a.username)}) · ${Number(a.device_count) || 0} device${Number(a.device_count) === 1 ? "" : "s"}</option>`).join("")}
+          </select>
+          <div class="field__help">Several devices can share an account; other devices on it stay signed in.</div>
+        </div>
+        ${deviceNameField()}`
+      : `<div class="empty-state" style="padding:24px 16px;"><div>No Casa accounts yet</div>
+           <button class="btn btn--text" data-act="mode" data-mode="new">Create one instead</button></div>`;
+    return `
+      ${state.accountError ? `<div class="errbar">${esc(state.accountError)}</div>` : ""}
+      <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:14px;">
+        ${modeCard("new", "Create new account", "A fresh account for this device")}
+        ${modeCard("existing", "Use existing account", "Sign this device in as an account you already have")}
       </div>
-      ${state.deployError ? `<div class="errbar">${esc(state.deployError)}</div>` : ""}
-      <h4 style="margin:0 0 10px; font-size:14px; font-weight:600;">Choose a delivery method</h4>
-      ${optionCard({
-        method: "qr",
-        title: "Guided provisioning",
-        desc: "QR code plus setup links — recommended",
-        active: state.method === "qr",
-      })}
-      ${optionCard({
-        method: "deep_link",
-        title: "Deep link only",
-        desc: "Send a setup link; no QR image is written",
-        active: state.method === "deep_link",
-      })}
-      ${optionCard({
-        method: "ble",
-        title: "BLE beacon",
-        desc: "Broadcast via ESPHome provisioning beacons",
-        disabled: !bleAvailable(),
-        disabledTitle: "No ESPHome services found — set up an ESPHome provisioning beacon first",
-        active: state.method === "ble",
-      })}
-      ${methodOptionsHtml()}
-      ${stepFooter(METHOD_LABELS[state.method] || "Generate", "deploy")}`;
+      ${state.accountMode === "new" ? newFields : existingFields}
+      ${footer("Continue", "to-template", { back: false })}`;
   }
 
-  function addBleTarget() {
-    const input = refs.body.querySelector("#pw-ble-input");
-    if (!input) return;
-    let value = input.value.trim();
-    if (!value) return;
-    if (!value.includes(".")) value = "esphome." + value;
-    if (!state.bleTargets.includes(value)) state.bleTargets.push(value);
-    input.value = "";
-    const chips = refs.body.querySelector("#pw-ble-chips");
-    if (chips) chips.innerHTML = bleChipsHtml();
-    input.focus();
+  function toTemplateStep() {
+    state.accountError = "";
+    if (state.createdUser) return gotoStep("template");
+    const name = trim(state.deviceName);
+    const errs = [];
+    if (state.accountMode === "new") {
+      const username = trim(state.username);
+      if (!name) errs.push(["deviceName", "Required."]);
+      if (!username) errs.push(["username", "Required."]);
+      else if (!utilsMod.USERNAME_RE.test(username)) errs.push(["username", "Lowercase letters, numbers and dashes only."]);
+      const a = state.availability;
+      if (username && a && !a.checking && a.for === username && !a.available) {
+        errs.push(a.username_conflict ? ["username", "Already in use."] : ["deviceName", `A user named '${name}' already exists.`]);
+      }
+    } else {
+      if (!casaAccounts().some((x) => x.username === state.existingUsername)) errs.push(["existingUsername", "Choose an account."]);
+      if (!name) errs.push(["deviceName", "Required."]);
+    }
+    if (errs.length) {
+      state.accountError = "Fix the highlighted fields to continue.";
+      render();
+      for (const [field, msg] of errs) markFieldError(field, msg);
+      return;
+    }
+    gotoStep("template");
   }
 
-  /* ---------- deploy (save-then-provision) ---------- */
+  /* ---------- step 2: template ---------- */
 
-  async function submitProvision(data) {
+  function seedForm(template) {
+    const F = fieldsMod;
+    const form = { ...F.DEFAULTS };
+    const f = (template && template.fields) || {};
+    for (const key of Object.keys(f)) {
+      if (F.PROFILE_KEYS.has(key)) form[key] = f[key];
+    }
+    if (!trim(form.host_url)) form.host_url = window.location.origin;
+    // Advanced (process) inputs survive a template switch.
+    if (state.form) for (const key of F.PROCESS_KEYS) form[key] = state.form[key];
+    return form;
+  }
+
+  function applyChoice(choice) {
+    state.choice = choice;
+    state.form = seedForm(selectedTemplate());
+    state.baseline = fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS);
+    state.customizeOpen = choice === "manual" || state.customizeOpen;
     state.deployError = "";
+    render();
+  }
+
+  function isCustomized() {
+    if (!state.form || !state.baseline) return false;
+    const fields = fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS);
+    return logicMod.changedKeys(fields, state.baseline).length > 0;
+  }
+
+  function requestChoice(choice) {
+    if (choice === state.choice) return;
+    if (!isCustomized()) return applyChoice(choice);
+    ui.showConfirm({
+      title: "Discard customizations?",
+      message: "Switching discards the changes you made under 'Customize for this device'.",
+      confirmLabel: "Switch",
+      confirmDanger: false,
+      onConfirm: () => applyChoice(choice),
+    });
+  }
+
+  function choiceRow({ choice, title, chipsHtml, desc }) {
+    const active = state.choice === choice;
+    return `
+      <button class="option-card" data-act="choose" data-choice="${esc(choice)}" style="width:100%; margin-bottom:8px;
+        ${active ? "border-color:var(--casa-primary); background:color-mix(in srgb, var(--casa-primary) 6%, transparent);" : ""}">
+        <ha-icon icon="${active ? "mdi:radiobox-marked" : "mdi:radiobox-blank"}" style="color:${active ? "var(--casa-primary)" : "var(--casa-text-2)"};"></ha-icon>
+        <span class="option-card__text">
+          <span class="option-card__title" style="display:block;">${esc(title)}</span>
+          ${chipsHtml ? `<span style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">${chipsHtml}</span>` : ""}
+          ${desc ? `<span class="option-card__desc" style="display:block;">${esc(desc)}</span>` : ""}
+        </span>
+      </button>`;
+  }
+
+  function templateListHtml() {
+    if (state.templates === null) {
+      return `<div class="empty-state" style="padding:24px 16px;"><span class="muted">Loading templates…</span></div>`;
+    }
+    const errHtml = state.templatesError ? `
+      <div class="errbar" style="display:flex; align-items:center; gap:10px;">
+        <span style="flex:1;">Failed to load templates: ${esc(state.templatesError)}</span>
+        <button class="btn btn--outlined" data-act="retry-templates" style="height:28px; flex:none;">Retry</button>
+      </div>` : "";
+    const q = state.search.trim().toLowerCase();
+    const rows = state.templates
+      .filter((p) => !q || String(p.name || "").toLowerCase().includes(q))
+      .map((p) => {
+        const chips = (previewMod ? previewMod.profileChips(p) : [])
+          .map((c) => `<span class="chip ${esc(c.cls || "chip--neutral")}">${esc(c.label)}</span>`)
+          .join("");
+        return choiceRow({ choice: p.id, title: p.name || "(unnamed)", chipsHtml: chips });
+      })
+      .join("");
+    const search = state.templates.length > SEARCH_THRESHOLD ? `
+      <div class="list-toolbar"><div class="search-field">
+        <ha-icon icon="mdi:magnify"></ha-icon>
+        <input class="input" id="pv-search" type="search" placeholder="Search templates…" value="${esc(state.search)}">
+      </div></div>` : "";
+    return `${errHtml}${search}${rows}
+      ${choiceRow({ choice: "manual", title: "Configure manually", desc: "Set every option yourself — optionally save it as a new template" })}`;
+  }
+
+  function customizeSectionDefs() {
+    const F = fieldsMod;
+    const opts = (extra) => ({ esc, heading: false, wgProfiles: state.wgProfiles || [], ...extra });
+    return [
+      { id: "connection", label: "Connection", render: () => F.renderSectionHtml("connection", state.form, opts({ fields: CONNECTION_SET })) },
+      { id: "appui", label: "App UI", render: () => F.renderSectionHtml("appui", state.form, opts({ fields: F.LIVE_KEYS })) },
+      { id: "access", label: "Access Control", render: () => F.renderSectionHtml("access", state.form, opts({ fields: F.LIVE_KEYS })) },
+      { id: "pushvpn", label: "Push & VPN", render: () => F.renderSectionHtml("pushvpn", state.form, opts({ fields: F.LIVE_KEYS })) },
+      { id: "timing", label: "Timing & Security", render: () => F.renderSectionHtml("timing", state.form, opts({ fields: TIMING_SET })) },
+    ];
+  }
+
+  function rerenderCustomizeSection(id) {
+    if (!state || state.step !== "template" || !state.form || !fieldsMod) return;
+    const def = customizeSectionDefs().find((s) => s.id === id);
+    const body = refs.body.querySelector(`[data-cz-section="${id}"]`);
+    if (def && body) body.innerHTML = def.render();
+  }
+
+  function expander(act, open, label) {
+    return `
+      <button class="btn btn--text" data-act="${esc(act)}" style="margin:6px 0; padding-left:0;">
+        <ha-icon icon="mdi:chevron-down" style="transition:transform 0.15s; transform:rotate(${open ? "180deg" : "0deg"});"></ha-icon>
+        ${esc(label)}
+      </button>`;
+  }
+
+  function customizeHtml() {
+    const sections = customizeSectionDefs()
+      .map((s) => `<h5 style="margin:12px 0 6px;">${esc(s.label)}</h5><div data-cz-section="${esc(s.id)}">${s.render()}</div>`)
+      .join("");
+    return `
+      <div id="pv-customize">${sections}</div>
+      <div style="border-top:1px solid var(--casa-divider); margin-top:12px; padding-top:12px;">
+        <label class="toggle">
+          <input type="checkbox" data-pv="saveAsTemplate" ${state.saveAsTemplate ? "checked" : ""}>
+          Also save as new template
+        </label>
+        ${state.saveAsTemplate ? `
+          <div class="field" data-pv-field="newTemplateName" style="margin-top:8px;">
+            <label>Template name *</label>
+            <input class="input" data-pv="newTemplateName" value="${esc(state.newTemplateName)}" placeholder="e.g. Kitchen tablets">
+          </div>` : ""}
+      </div>`;
+  }
+
+  function advancedHtml() {
+    const F = fieldsMod;
+    return `
+      <div id="pv-advanced">
+        ${F.renderSectionHtml("connection", state.form, { esc, heading: false, fields: ADV_CONNECTION_SET })}
+        ${F.renderSectionHtml("wifi", state.form, { esc, heading: false, fields: ADV_WIFI_SET })}
+      </div>`;
+  }
+
+  function accountSummaryChip() {
+    const who = state.accountMode === "new" ? (state.createdUser ? state.createdUser.username : trim(state.username)) : state.existingUsername;
+    return `
+      <div class="card" style="margin:0 0 16px;"><div class="card__body" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <ha-icon icon="mdi:cellphone" style="color:var(--casa-text-2); flex:none;"></ha-icon>
+        <span style="font-size:14px;"><strong>${esc(trim(state.deviceName))}</strong> <span class="muted">→ ${esc(who)}</span></span>
+        <span class="spacer"></span>
+        <span class="chip ${state.accountMode === "new" ? "chip--app" : "chip--neutral"}">${state.accountMode === "new" ? "New account" : "Existing account"}</span>
+      </div></div>`;
+  }
+
+  function renderTemplateStep() {
+    const ready = !!(state.form && state.choice);
+    return `
+      ${accountSummaryChip()}
+      ${state.deployError ? `<div class="errbar">${esc(state.deployError)}</div>` : ""}
+      <h4 style="margin:0 0 10px; font-size:14px; font-weight:600;">Choose a template</h4>
+      <div id="pv-templates">${templateListHtml()}</div>
+      ${ready ? `
+        <div style="border-top:1px solid var(--casa-divider); margin-top:8px;">
+          ${expander("toggle-customize", state.customizeOpen, "Customize for this device")}
+          <div ${state.customizeOpen ? "" : "hidden"}>${customizeHtml()}</div>
+        </div>
+        <div style="border-top:1px solid var(--casa-divider);">
+          ${expander("toggle-advanced", state.advancedOpen, "Advanced (PIN, Wi-Fi join, sign out other devices)")}
+          <div ${state.advancedOpen ? "" : "hidden"}>${advancedHtml()}</div>
+        </div>` : ""}
+      ${footer("Generate setup", "generate")}`;
+  }
+
+  function rerenderTemplateList() {
+    const el = refs && refs.body.querySelector("#pv-templates");
+    if (el) el.innerHTML = templateListHtml();
+  }
+
+  /* ---------- generate: create user → save template → provision ---------- */
+
+  async function generate() {
+    state.deployError = "";
+    const F = fieldsMod;
+    if (!state.choice || !state.form) {
+      state.deployError = "Pick a template, or Configure manually.";
+      return render();
+    }
+    if (!trim(state.form.host_url)) {
+      state.deployError = "Host URL is required (under Customize for this device → Connection).";
+      state.customizeOpen = true;
+      return render();
+    }
+    if (state.saveAsTemplate && !trim(state.newTemplateName)) {
+      state.deployError = "Name the new template, or untick 'Also save as new template'.";
+      state.customizeOpen = true;
+      render();
+      return markFieldError("newTemplateName", "Required.");
+    }
+
+    const fields = F.collectFields(state.form, F.PROFILE_KEYS);
+    const changed = logicMod.changedKeys(fields, state.baseline);
+    const template = selectedTemplate();
+    const token = mountToken;
     state.busy = true;
     render();
-    const token = mountToken;
+
+    // 1. Account.
+    let account;
+    if (state.accountMode === "new") {
+      if (!state.createdUser) {
+        const name = trim(state.deviceName);
+        const username = trim(state.username);
+        let resp;
+        try {
+          resp = unwrap(await api.createUser({ name, username, localOnly: true }));
+        } catch (err) {
+          resp = { error: ui.errMsg(err) };
+        }
+        if (token !== mountToken || !state) return;
+        if (resp && resp.error) {
+          state.busy = false;
+          state.step = "account";
+          state.accountError = String(resp.error);
+          state.availability = null;
+          return render();
+        }
+        state.createdUser = { name, username, password: resp && resp.password, user_id: resp && resp.user_id };
+      }
+      account = state.createdUser;
+    } else {
+      const a = casaAccounts().find((x) => x.username === state.existingUsername);
+      if (!a) {
+        state.busy = false;
+        state.step = "account";
+        state.accountError = "That account no longer exists — choose another.";
+        return render();
+      }
+      account = { username: a.username, user_id: a.user_id };
+    }
+
+    // 2. Optional new template (skipped on retry via savedTemplateId).
+    if (state.saveAsTemplate && !state.savedTemplateId) {
+      try {
+        const body = {
+          name: trim(state.newTemplateName),
+          fields: logicMod.templateFieldsToSave({
+            fields,
+            baseSetKeys: template ? Object.keys(template.fields || {}) : [],
+            changed,
+          }),
+        };
+        const res = await api.saveProvisionTemplate(body);
+        if (token !== mountToken || !state) return;
+        if (res && res.id) state.savedTemplateId = res.id;
+        ui.toast(`Template '${trim(state.newTemplateName)}' created.`);
+      } catch (err) {
+        if (token !== mountToken || !state) return;
+        state.busy = false;
+        state.deployError = "Failed to save template: " + ui.errMsg(err);
+        return render();
+      }
+    }
+
+    // 3. Provision.
+    const data = logicMod.buildProvisionRequest({
+      fields,
+      form: state.form,
+      account,
+      deviceName: trim(state.deviceName),
+      lineage: logicMod.lineageFor({
+        templateId: template && template.id,
+        customized: changed.length > 0,
+        savedTemplateId: state.savedTemplateId,
+      }),
+    });
     try {
-      const res = await api.provision(data);
+      const resp = unwrap(await api.provision(data));
       if (token !== mountToken || !state) return;
-      const resp = unwrap(res);
       state.busy = false;
       if (resp && resp.error) {
-        // User-level failure — server reports these in-band, not as a throw.
         state.deployError = String(resp.error);
-        render();
-        return;
+        return render();
       }
       state.result = resp;
-      state.step = "result";
-      render();
+      gotoStep("result");
     } catch (err) {
       if (token !== mountToken || !state) return;
       state.busy = false;
@@ -651,148 +608,20 @@ export function createView(app) {
     }
   }
 
-  async function deploy() {
-    if (state.method === "ble" && !state.bleTargets.length) {
-      state.deployError = "Add at least one beacon target.";
-      render();
-      return;
-    }
-
-    // Coerce by the defaults' types: booleans as booleans, numbers via
-    // parseInt (falling back to the default), strings trimmed. The server's
-    // get_field treats "" as unset, so blank optional keys are harmless.
-    const fields = {};
-    for (const [key, def] of Object.entries(fieldsMod.DEFAULTS)) {
-      const raw = state.form[key];
-      if (typeof def === "boolean") fields[key] = !!raw;
-      else if (typeof def === "number") {
-        const n = parseInt(raw, 10);
-        fields[key] = Number.isFinite(n) ? n : def;
-      } else fields[key] = trim(raw);
-    }
-
-    if (state.entry === "new") {
-      // Save-then-provision: the template is created here, at deploy time.
-      // Nested sparse body — { name, fields: {only-touched-keys} } — so a
-      // wizard-authored template stores only what the admin actually set;
-      // process inputs are for this generation only. A retry after a failed
-      // provision carries the id from the first save, so it updates instead
-      // of duplicating.
-      state.deployError = "";
-      state.busy = true;
-      render();
-      const token = mountToken;
-      try {
-        const body = {
-          name: trim(state.templateName),
-          fields: fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS, { setKeys: state.newSetKeys }),
-        };
-        if (state.savedTemplateId) body.id = state.savedTemplateId;
-        const res = await api.saveProvisionTemplate(body);
-        if (token !== mountToken || !state) return;
-        if (!state.savedTemplateId) {
-          if (res && res.id) state.savedTemplateId = res.id;
-          ui.toast(`Template '${trim(state.templateName)}' created.`);
-        }
-      } catch (err) {
-        if (token !== mountToken || !state) return;
-        state.busy = false;
-        state.deployError = "Failed to save template: " + (ui.errMsg(err));
-        render();
-        return;
-      }
-    }
-
-    const data = { method: state.method, ...fields };
-    // Lineage only — explicit fields already win server-side per-key
-    // (_provision_internal's get_field), so this doesn't change resolved
-    // values, it just correlates the device back to its originating template.
-    if (state.entry === "new" && state.savedTemplateId) data.profile = state.savedTemplateId;
-    else if (state.entry === "template" && state.template && state.template.id) data.profile = state.template.id;
-
-    if (state.method === "ble") data.esphome_service = state.bleTargets.slice();
-    if (state.method === "qr") {
-      data.delete_qr_after_window = !!state.deleteQr;
-      const fn = trim(state.qrFilename);
-      if (fn) data.qr_filename = fn;
-    }
-
-    await submitProvision(data);
-  }
-
-  /* ---------- step 4: result ---------- */
-
-  function linkRow(label, value) {
-    return `
-      <div class="field">
-        <label>${esc(label)}</label>
-        <div class="field-row">
-          <input class="input mono" readonly value="${esc(value)}">
-          <button class="btn btn--outlined" data-copy="${esc(value)}" style="flex:none;">Copy</button>
-        </div>
-      </div>`;
-  }
-
-  function validityChip(expiresAt) {
-    if (!expiresAt) return "";
-    return `<div style="margin-top:6px;"><span class="chip chip--warn">valid until ${esc(ui.fmtExpiry(expiresAt))}</span></div>`;
-  }
-
-  function renderQrResult(r) {
-    return `
-      <div style="text-align:center; margin-bottom:16px;">
-        <div class="muted" style="font-size:13px; margin-bottom:12px;">Scan with the Casa app, or send a setup link.</div>
-        <img src="${esc(r.qr_data_uri || r.url_path)}" alt="Provisioning QR code"
-          style="width:220px; height:220px; border:1px solid var(--casa-divider); border-radius:var(--casa-radius-sm); padding:12px; background:#fff;">
-      </div>
-      ${linkRow("Setup Deep Link", r.deep_link)}
-      ${r.universal_link ? linkRow("Universal Link (opens from Safari / iMessage)", r.universal_link) : ""}
-      ${validityChip(r.expires_at)}`;
-  }
-
-  function renderDeepLinkResult(r) {
-    return `
-      <div class="muted" style="font-size:13px; margin-bottom:12px;">Send a setup link to the device.</div>
-      ${linkRow("Setup Deep Link", r.deep_link)}
-      ${r.universal_link ? linkRow("Universal Link (opens from Safari / iMessage)", r.universal_link) : ""}
-      ${validityChip(r.expires_at)}`;
-  }
-
-  function renderBleResult(r) {
-    const okSet = new Set(r.successful_targets || []);
-    const submitted = state.bleTargets.length ? state.bleTargets : r.successful_targets || [];
-    const rows = submitted
-      .map(
-        (t) => `
-        <div class="field-row" style="margin-bottom:8px;">
-          <span class="mono" style="flex:1; word-break:break-all;">${esc(t)}</span>
-          ${okSet.has(t)
-            ? `<span class="chip chip--ok"><ha-icon icon="mdi:check-circle" style="--mdc-icon-size:14px;"></ha-icon> Broadcasting</span>`
-            : `<span class="chip chip--error"><ha-icon icon="mdi:alert-circle" style="--mdc-icon-size:14px;"></ha-icon> Failed</span>`}
-        </div>`
-      )
-      .join("");
-    const pin = trim(state.form && state.form.pin);
-    return `
-      <div class="muted" style="font-size:13px; margin-bottom:12px;">Bring the device near a beacon to provision it.</div>
-      ${rows}
-      ${r.pin_required ? `
-        <div style="display:flex; gap:8px; align-items:center; margin-top:10px; padding:10px 12px; border-radius:var(--casa-radius-sm); background:var(--casa-bg-2); font-size:13px;">
-          <ha-icon icon="mdi:dialpad" style="--mdc-icon-size:18px; flex:none; color:var(--casa-text-2);"></ha-icon>
-          <span>The device will prompt for PIN <strong class="mono">${esc(pin)}</strong>.</span>
-        </div>` : ""}
-      ${validityChip(r.expires_at)}`;
-  }
+  /* ---------- step 3: done ---------- */
 
   function renderResultStep() {
     const r = state.result || {};
-    let content;
-    if (r.method === "ble") content = renderBleResult(r);
-    else if (r.method === "deep_link") content = renderDeepLinkResult(r);
-    else content = renderQrResult(r);
     return `
-      <h3 style="margin:0 0 16px; font-size:16px; font-weight:600;">${esc(RESULT_TITLES[r.method] || "Provisioning result")}</h3>
-      ${content}
+      <div style="text-align:center; margin-bottom:16px;">
+        <ha-icon icon="mdi:check-circle" style="--mdc-icon-size:48px; color:var(--casa-success);"></ha-icon>
+        <h3 style="margin:8px 0 0; font-size:16px; font-weight:600;">${esc(trim(state.deviceName))} is ready to set up</h3>
+      </div>
+      ${resultMod.setupResultHtml(r, { esc, fmtExpiry: ui.fmtExpiry })}
+      <div style="display:flex; gap:8px; align-items:center; margin-top:14px; padding:10px 12px; border-radius:var(--casa-radius-sm); background:var(--casa-bg-2); font-size:13px;">
+        <ha-icon icon="mdi:tag-outline" style="--mdc-icon-size:18px; flex:none; color:var(--casa-text-2);"></ha-icon>
+        <span>The device will be named <strong>${esc(trim(state.deviceName))}</strong> automatically when it connects (within 30 minutes).</span>
+      </div>
       <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px; padding-top:12px; border-top:1px solid var(--casa-divider);">
         <button class="btn btn--outlined" data-act="another">Provision another</button>
         <button class="btn btn--primary" data-act="done">Done</button>
@@ -804,218 +633,134 @@ export function createView(app) {
   function render() {
     if (!refs || !state) return;
     renderTabs();
-    if (state.step === "template") refs.body.innerHTML = renderTemplateStep();
-    else if (state.step === "configure") refs.body.innerHTML = renderConfigureStep();
-    else if (state.step === "deploy") refs.body.innerHTML = renderDeployStep();
-    else refs.body.innerHTML = renderResultStep();
-    for (const btn of refs.body.querySelectorAll("[data-copy]")) {
-      ui.bindCopyButton(btn, () => btn.dataset.copy);
+    if (!fieldsMod || !utilsMod || !logicMod || !resultMod) {
+      refs.body.innerHTML = `<div class="empty-state" style="padding:32px 16px;"><span class="muted">Loading…</span></div>`;
+      return;
     }
-    // Shared-renderer fields (data-key inputs) get their delegated handling
-    // from bindFieldEvents on their container; view-private inputs
-    // (data-field) keep the body listeners below. Old listeners die with the
-    // replaced DOM, so re-binding per render leaks nothing.
-    if (state.step === "configure" && fieldsMod) {
-      const formContainer = refs.body.querySelector("#pw-form-sections");
-      if (formContainer && state.form) {
-        fieldsMod.bindFieldEvents(formContainer, {
+    if (state.step === "account") refs.body.innerHTML = renderAccountStep();
+    else if (state.step === "template") refs.body.innerHTML = renderTemplateStep();
+    else refs.body.innerHTML = renderResultStep();
+
+    if (state.step === "result") resultMod.bindCopyButtons(refs.body, ui);
+    if (state.step === "template" && state.form) {
+      const bind = (el) =>
+        el && fieldsMod.bindFieldEvents(el, {
           values: state.form,
-          onSectionRerender: (key) => rerenderFormSection(KEY_SECTION[key]),
-          setKeys: state.entry === "new" ? state.newSetKeys : null,
+          onSectionRerender: (key) => rerenderCustomizeSection(KEY_SECTION[key]),
           esc,
         });
-      }
-      if (state.formOpen.pushvpn) ensureWgProfiles();
+      bind(refs.body.querySelector("#pv-customize"));
+      bind(refs.body.querySelector("#pv-advanced"));
+      if (state.customizeOpen) ensureWgProfiles();
     }
   }
 
   function onBodyClick(e) {
     const el = e.target.closest("[data-act]");
-    if (el && !el.disabled && refs.body.contains(el)) {
-      switch (el.dataset.act) {
-        case "goto-step":
-          // Backward only — forward tabs are disabled in the markup, but
-          // guard anyway so a stray click can never skip validation.
-          if (stepIndex(el.dataset.step) < stepIndex(state.step) && state.step !== "result") gotoStep(el.dataset.step);
-          return;
-        case "back":
-          goBack();
-          return;
-        case "entry-new":
-          selectEntry("new");
-          return;
-        case "entry-oneoff":
-          selectEntry("oneoff");
-          return;
-        case "retry-templates":
-          loadTemplates();
-          return;
-        case "clear-search": {
-          state.search = "";
-          const input = refs.body.querySelector("#pw-search");
-          if (input) input.value = "";
-          rerenderTemplateTable();
-          return;
-        }
-        case "select-template": {
-          const p = (state.templates || []).find((x) => x && x.id === el.dataset.id);
-          if (p) selectTemplate(p);
-          return;
-        }
-        case "edit-template":
-          app.navigate("/templates/" + encodeURIComponent(el.dataset.id));
-          return;
-        case "to-deploy":
-          toDeploy();
-          return;
-        case "method":
-          state.method = el.dataset.method;
-          render();
-          return;
-        case "toggle-qr-options":
-          state.qrOptionsOpen = !state.qrOptionsOpen;
-          render();
-          return;
-        case "toggle-section": {
-          // Flip visibility in place — no re-render, so in-progress edits and
-          // focus elsewhere in the form are untouched.
-          const id = el.dataset.section;
-          state.formOpen[id] = !state.formOpen[id];
-          const body = refs.body.querySelector(`[data-section-body="${id}"]`);
-          if (body) body.hidden = !state.formOpen[id];
-          const icon = el.querySelector("ha-icon");
-          if (icon) icon.style.transform = `rotate(${state.formOpen[id] ? "180deg" : "0deg"})`;
-          if (id === "pushvpn" && state.formOpen.pushvpn) ensureWgProfiles();
-          return;
-        }
-        case "add-target":
-          addBleTarget();
-          return;
-        case "remove-target": {
-          state.bleTargets = state.bleTargets.filter((t) => t !== el.dataset.target);
-          const chips = refs.body.querySelector("#pw-ble-chips");
-          if (chips) chips.innerHTML = bleChipsHtml();
-          return;
-        }
-        case "deploy":
-          deploy();
-          return;
-        case "another": {
-          // Fresh run: rebuild state locally (works even if the router skips
-          // a same-path remount) and strip any preset segment from the URL.
-          state = freshState();
-          wgRequested = false;
-          loadTemplates();
-          render();
-          if (mountedWithPresetPath) app.navigate("/provision", { replace: true });
-          return;
-        }
-        case "done":
-          app.refresh();
-          app.navigate("/");
-          return;
-      }
-      return;
-    }
-    // Row click (no data-act target) selects the template.
-    const row = e.target.closest("tr[data-id]");
-    if (row && state.step === "template") {
-      const p = (state.templates || []).find((x) => x && x.id === row.dataset.id);
-      if (p) selectTemplate(p);
+    if (!el || el.disabled || !(refs.body.contains(el) || refs.tabs.contains(el))) return;
+    switch (el.dataset.act) {
+      case "goto-step":
+        if (stepIndex(el.dataset.step) < stepIndex(state.step) && state.step !== "result") gotoStep(el.dataset.step);
+        return;
+      case "back":
+        if (state.step === "template") gotoStep("account");
+        return;
+      case "mode":
+        state.accountMode = el.dataset.mode;
+        state.accountError = "";
+        render();
+        return;
+      case "use-existing":
+        state.accountMode = "existing";
+        state.existingUsername = el.dataset.username;
+        state.accountError = "";
+        render();
+        return;
+      case "to-template":
+        toTemplateStep();
+        return;
+      case "retry-templates":
+        loadTemplates();
+        return;
+      case "choose":
+        requestChoice(el.dataset.choice);
+        return;
+      case "toggle-customize":
+        state.customizeOpen = !state.customizeOpen;
+        render();
+        return;
+      case "toggle-advanced":
+        state.advancedOpen = !state.advancedOpen;
+        render();
+        return;
+      case "generate":
+        generate();
+        return;
+      case "another":
+        state = freshState();
+        wgRequested = false;
+        loadTemplates();
+        render();
+        if (mountedWithPresetPath) app.navigate("/provision", { replace: true });
+        return;
+      case "done":
+        app.refresh();
+        app.navigate("/");
+        return;
     }
   }
 
-  // View-private inputs only (data-field). Shared-renderer fields (data-key,
-  // including the color picker and reveal-password buttons) are handled by
-  // fieldsMod.bindFieldEvents bound per-container in render().
+  // View-private inputs carry data-pv (shared-renderer fields use data-key and
+  // are handled by fieldsMod.bindFieldEvents). Typing never re-renders the
+  // whole step, so focus is kept.
   function onBodyInput(e) {
     const t = e.target;
-    if (t.id === "pw-search") {
+    if (t.id === "pv-search") {
       state.search = t.value;
-      rerenderTemplateTable();
+      rerenderTemplateList();
       return;
     }
-    const field = t.dataset && t.dataset.field;
-    if (!field) return;
-    if (field === "templateName") {
-      state.templateName = t.value;
-      return;
-    }
-    if (field === "deleteQr") {
-      state.deleteQr = !!t.checked;
-      return;
-    }
-    if (field === "qrFilename") {
-      state.qrFilename = t.value;
-      return;
-    }
-  }
-
-  function onBodyKeydown(e) {
-    if (e.key === "Enter" && e.target.id === "pw-ble-input") {
-      e.preventDefault();
-      addBleTarget();
-    }
-  }
-
-  /* ---------- scenario picker ---------- */
-
-  // Shown on plain /provision visits only — preset paths (/provision/user/…,
-  // /provision/template/…) already declare their intent. Dismissing lands on
-  // the classic wizard, which is fully rendered underneath.
-  function openScenarioModal() {
-    const card = ({ act, icon, title, desc }) => `
-      <button class="option-card" data-scenario="${esc(act)}" style="width:100%;">
-        <ha-icon icon="${esc(icon)}" style="color:var(--casa-text-2);"></ha-icon>
-        <span class="option-card__text">
-          <span class="option-card__title" style="display:block;">${esc(title)}</span>
-          <span class="option-card__desc" style="display:block;">${esc(desc)}</span>
-        </span>
-        <ha-icon class="chevron" icon="mdi:chevron-right"></ha-icon>
-      </button>`;
-    const body = document.createElement("div");
-    body.innerHTML = `
-      <div style="display:flex; flex-direction:column; gap:10px;">
-        ${card({
-          act: "guided",
-          icon: "mdi:account-plus-outline",
-          title: "New device with its own account",
-          desc: "Guided — name the device, we create the account, pick a template, get a link or QR",
-        })}
-        ${card({
-          act: "reprovision",
-          icon: "mdi:cellphone-arrow-down",
-          title: "Re-provision an existing device",
-          desc: "Use the classic wizard with an existing guest account",
-        })}
-        ${card({
-          act: "advanced",
-          icon: "mdi:tune",
-          title: "Advanced / manual setup",
-          desc: "Full control — templates, one-off config, BLE beacons",
-        })}
-      </div>`;
-    body.addEventListener("click", (e) => {
-      const el = e.target.closest("[data-scenario]");
-      if (!el) return;
-      const scenario = el.dataset.scenario;
-      scenarioModal?.close();
-      scenarioModal = null;
-      if (scenario === "guided") {
-        app.navigate("/provision/guided");
-      } else if (scenario === "reprovision") {
-        ui.toast("Tip: you can also re-provision straight from a device's menu in the device list.");
+    switch (t.dataset && t.dataset.pv) {
+      case "deviceName":
+        state.deviceName = t.value;
+        if (state.accountMode === "new" && !state.usernameEdited) {
+          state.username = logicMod.suggestUsername(t.value, utilsMod.slugify);
+          const u = refs.body.querySelector('[data-pv="username"]');
+          if (u) u.value = state.username;
+        }
+        if (state.accountMode === "new") scheduleAvailability();
+        return;
+      case "username": {
+        const lower = t.value.toLowerCase();
+        if (lower !== t.value) t.value = lower;
+        state.username = lower;
+        // Clearing the field re-couples it to the device name.
+        state.usernameEdited = !!lower;
+        scheduleAvailability();
+        return;
       }
-      // "reprovision" and "advanced" both land on the classic wizard below.
-    });
-    scenarioModal = ui.openModal({
-      title: "How do you want to provision?",
-      bodyEl: body,
-      dismissable: true,
-    });
+      case "newTemplateName":
+        state.newTemplateName = t.value;
+        return;
+    }
   }
 
-  /* ---------- unload guard ---------- */
+  function onBodyChange(e) {
+    const t = e.target;
+    switch (t.dataset && t.dataset.pv) {
+      case "existingUsername":
+        state.existingUsername = t.value;
+        return;
+      case "saveAsTemplate":
+        state.saveAsTemplate = !!t.checked;
+        if (state.saveAsTemplate && !trim(state.newTemplateName)) {
+          const base = selectedTemplate();
+          state.newTemplateName = base ? `${base.name} (copy)` : "";
+        }
+        render();
+        return;
+    }
+  }
 
   function onBeforeUnload(e) {
     if (!dirty()) return;
@@ -1033,59 +778,75 @@ export function createView(app) {
     async mount(el, params) {
       const token = ++mountToken;
       state = freshState();
-      state.presetUsername = (params && params.username) || "";
-      const presetTemplateId = (params && params.templateId) || null;
-      mountedWithPresetPath = !!(state.presetUsername || presetTemplateId);
       wgRequested = false;
+      const presetUsername = (params && params.username) || "";
+      const presetTemplateId = (params && params.templateId) || "";
+      mountedWithPresetPath = !!(presetUsername || presetTemplateId);
 
       el.innerHTML = `
         <div class="page">
-          <div class="tabs tabs--steps" id="pw-tabs"></div>
-          <div id="pw-body"></div>
+          <div class="tabs tabs--steps" id="pv-tabs"></div>
+          <div id="pv-body"></div>
         </div>`;
-      refs = {
-        tabs: el.querySelector("#pw-tabs"),
-        body: el.querySelector("#pw-body"),
-      };
+      refs = { tabs: el.querySelector("#pv-tabs"), body: el.querySelector("#pv-body") };
+      refs.tabs.addEventListener("click", onBodyClick); // step tabs live outside the body
       refs.body.addEventListener("click", onBodyClick);
       refs.body.addEventListener("input", onBodyInput);
-      refs.body.addEventListener("keydown", onBodyKeydown);
+      refs.body.addEventListener("change", onBodyChange);
       window.addEventListener("beforeunload", onBeforeUnload);
-      render(); // loading state while modules + profiles land
+      render();
 
       try {
-        const [fields, preview] = await Promise.all([
+        const [fields, preview, utils, logic, result] = await Promise.all([
           fieldsMod || app.loadModule("views/profile-fields.js"),
           previewMod || app.loadModule("payload-preview.js"),
+          utilsMod || app.loadModule("views/username-utils.js"),
+          logicMod || app.loadModule("views/provision-logic.js"),
+          resultMod || app.loadModule("views/provision-result.js"),
         ]);
         if (token !== mountToken) return;
         fieldsMod = fields;
         previewMod = preview;
+        utilsMod = utils;
+        logicMod = logic;
+        resultMod = result;
       } catch (err) {
         if (token !== mountToken) return;
         refs.body.innerHTML = `<div class="errbar">Failed to load: ${esc(ui.errMsg(err))}</div>`;
         return;
       }
 
+      // Deep links can land before the first summary poll.
+      if (presetUsername && !app.summary()) await app.refresh();
+      if (token !== mountToken || !state) return;
+      if (presetUsername) {
+        if (casaAccounts().some((a) => a.username === presetUsername)) {
+          state.accountMode = "existing";
+          state.existingUsername = presetUsername;
+        } else {
+          ui.toast("That account no longer exists.", { error: true });
+        }
+      }
+      render();
+
       await loadTemplates();
       if (token !== mountToken || !state) return;
       if (presetTemplateId) {
-        const p = (state.templates || []).find((x) => x && x.id === presetTemplateId);
-        if (p) {
-          selectTemplate(p);
-          return;
+        if ((state.templates || []).some((t) => t && t.id === presetTemplateId)) {
+          state.choice = presetTemplateId;
+          state.form = seedForm(selectedTemplate());
+          state.baseline = fieldsMod.collectFields(state.form, fieldsMod.PROFILE_KEYS);
+        } else {
+          ui.toast("That provision template no longer exists.", { error: true });
         }
-        ui.toast("That provision template no longer exists.", { error: true });
       }
       render();
-      if (!mountedWithPresetPath) openScenarioModal();
     },
 
     unmount() {
       mountToken++;
+      clearTimeout(availTimer);
       window.removeEventListener("beforeunload", onBeforeUnload);
-      scenarioModal?.close();
-      scenarioModal = null;
       refs = null;
       state = null;
     },

@@ -347,12 +347,9 @@ export function createView(app) {
 
   const gotoEdit = (id) => app.navigate("/devices/" + encodeURIComponent(id));
 
-  // Provisioning is a full-page flow (views/provision.js); a preset username
-  // (re-provision) rides the route as a path segment.
-  const gotoProvision = (opts = {}) =>
-    app.navigate(
-      opts.presetUsername ? "/provision/user/" + encodeURIComponent(opts.presetUsername) : "/provision"
-    );
+  // New-device provisioning is a full-page flow (views/provision.js);
+  // re-provisioning an existing device is the Re-provision modal.
+  const gotoProvision = () => app.navigate("/provision");
 
   function toggleSort(key) {
     if (sortKey === key) sortDir = sortDir === "asc" ? "desc" : "asc";

@@ -92,9 +92,12 @@ export async function createApp({ host, loadModule, version }) {
     { pattern: ["settings"], view: "views/settings.js" },
     { pattern: ["settings", ":tab"], view: "views/settings.js" },
     { pattern: ["provision"], view: "views/provision.js" },
-    { pattern: ["provision", "guided"], view: "views/provision-guided.js" },
-    { pattern: ["provision", "user", ":username"], view: "views/provision.js" },
+    { pattern: ["provision", "account", ":username"], view: "views/provision.js" },
     { pattern: ["provision", "template", ":templateId"], view: "views/provision.js" },
+    // Legacy provision paths — same wizard (the guided flow and the
+    // username-preset path were folded into it).
+    { pattern: ["provision", "guided"], view: "views/provision.js" },
+    { pattern: ["provision", "user", ":username"], view: "views/provision.js" },
     // Legacy aliases (pre-template bookmarks) — same views as above.
     { pattern: ["profiles"], view: "views/templates.js" },
     { pattern: ["profiles", "new"], view: "views/template-editor.js" },
