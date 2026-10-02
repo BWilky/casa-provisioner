@@ -13,7 +13,7 @@ import urllib.parse
 import re
 from datetime import datetime, timedelta
 
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt as dt_util
@@ -854,6 +854,8 @@ async def _apply_pending_provision(hass, user_id: str, device_info: dict, refres
     alias = str(pending.get("device_alias") or "").strip()
     if alias and not str(device_info.get("alias") or "").strip():
         device_info["alias"] = alias[:DEVICE_ALIAS_MAX_LEN]
+    if str(device_info.get("alias") or "").strip():
+        device_info["entity_rename_until"] = time.time() + ENTITY_RENAME_WINDOW_SECONDS
     return True
 
 
@@ -1026,6 +1028,46 @@ async def _sync_ha_device_name(hass, device_id: str) -> None:
     name = _ha_device_name(device_info, username)
     if device.name != name:
         dev_reg.async_update_device(device.id, name=name)
+
+
+ENTITY_RENAME_WINDOW_SECONDS = 600
+
+
+def _rename_casa_entity(registry, entry, alias: str) -> str | None:
+    """Give one auto-generated Casa entity an id from the device name
+    ("sensor.casa_device_guest_ip_address_2" -> "sensor.bryce_mobile_ip_address").
+    Ids that don't start with casa_device_ were chosen by a person and are
+    left alone. Collisions get HA's _2/_3 suffix. Returns the new id or None."""
+    domain, object_id = entry.entity_id.split(".", 1)
+    if not object_id.startswith("casa_device_") or not alias:
+        return None
+    label = entry.original_name or entry.name or ""
+    target = registry.async_generate_entity_id(domain, f"{alias} {label}".strip())
+    if target == entry.entity_id:
+        return None
+    registry.async_update_entity(entry.entity_id, new_entity_id=target)
+    return target
+
+
+def _rename_device_entities(hass, device_id: str) -> None:
+    """While a freshly provisioned device's rename window is open, rename its
+    auto-generated entity ids after its alias (see _rename_casa_entity)."""
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    device_info, _uid, _username = _find_device_record(stored_data, device_id)
+    if not device_info or (device_info.get("entity_rename_until") or 0) < time.time():
+        return
+    alias = str(device_info.get("alias") or "").strip()
+    if not alias:
+        return
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+    device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, device_id)})
+    if device is None:
+        return
+    registry = er.async_get(hass)
+    for entry in list(er.async_entries_for_device(registry, device.id, include_disabled_entities=True)):
+        if getattr(entry, "platform", DOMAIN) == DOMAIN:
+            _rename_casa_entity(registry, entry, alias)
 
 
 def _device_owned_by(stored_data: dict, user_id: str, device_id: str) -> bool:
@@ -4082,6 +4124,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 manufacturer="Casa Integration",
                 sw_version="1.0",
             )
+            _rename_device_entities(hass, device_id)
             
             # Dispatch dynamic added/updated signals
             from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -4272,6 +4315,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 manufacturer="Casa Integration",
                 sw_version="1.0",
             )
+            _rename_device_entities(hass, device_id)
             
             # Dispatch dynamic added/updated signals
             from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -6166,6 +6210,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, _scheduled_reconcile, timedelta(days=1)
     )
 
+    from homeassistant.helpers import entity_registry as er
+
+    @callback
+    def _on_entity_registry_updated(event):
+        if event.data.get("action") != "create":
+            return
+        entry = er.async_get(hass).async_get(event.data.get("entity_id"))
+        if not entry or entry.platform != DOMAIN or not entry.device_id:
+            return
+        from homeassistant.helpers import device_registry as dr
+        device = dr.async_get(hass).async_get(entry.device_id)
+        ident = next((i for d, i in (device.identifiers if device else ()) if d == DOMAIN), None)
+        if ident:
+            _rename_device_entities(hass, ident)
+
+    hass.data[DOMAIN]["entity_rename_unsub"] = hass.bus.async_listen(
+        er.EVENT_ENTITY_REGISTRY_UPDATED, _on_entity_registry_updated
+    )
+
     async def _location_staleness_sweep(_now):
         data = hass.data.get(DOMAIN, {})
         lz = data.get("lz_data", {})
@@ -6610,6 +6673,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     lz_stale_unsub = hass.data[DOMAIN].get("lz_stale_unsub")
     if lz_stale_unsub:
         lz_stale_unsub()
+
+    entity_rename_unsub = hass.data[DOMAIN].get("entity_rename_unsub")
+    if entity_rename_unsub:
+        entity_rename_unsub()
 
     try:
         frontend.async_remove_panel(hass, "casa")

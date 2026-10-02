@@ -57,6 +57,7 @@ def _install_homeassistant_stubs() -> None:
         HomeAssistant=_Stub,
         ServiceCall=_Stub,
         SupportsResponse=_SupportsResponse,
+        callback=lambda f: f,
     )
     _ensure_module("homeassistant.config_entries", ConfigEntry=_Stub)
     _ensure_module("homeassistant.helpers")
