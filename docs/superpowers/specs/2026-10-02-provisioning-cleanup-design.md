@@ -48,9 +48,11 @@ changes.
 | `/provision` | Wizard, nothing preselected. |
 | `/provision/account/:username` | *Use existing account* preselected with that account. |
 | `/provision/template/:templateId` | That template preselected on step 2. |
-| `/provision/user/:username` | Redirect → `/provision/account/:username`. |
-| `/provision/profile/:templateId` | Redirect → `/provision/template/:templateId` (existing alias kept). |
-| `/provision/guided` | Redirect → `/provision`. |
+| `/provision/user/:username` | Legacy alias — same view and behavior as `/provision/account/:username`. |
+| `/provision/profile/:templateId` | Legacy alias — same as `/provision/template/:templateId`. |
+| `/provision/guided` | Legacy alias — same as `/provision`. |
+
+(The panel router has no redirects; legacy patterns map to the same view.)
 
 Unknown preselected account/template → toast ("That account no longer
 exists." / "That provision template no longer exists.") and start with
@@ -145,9 +147,8 @@ QR image (`qr_data_uri`), Universal link + Deep link with Copy, "valid until
 - `views/accounts.js`: row ⋮ menu gains "Provision device" →
   `/provision/account/<username>`. Create-account success dialog gains a
   "Provision a device now" button → same route.
-- `views/templates.js`: row action "Provision with this template" →
-  `/provision/template/<id>` (new — the templates view has no provision
-  action today).
+- `views/templates.js`: row ⋮ "Provision with this template" →
+  `/provision/template/<id>` — already exists, no change.
 
 ## Panel: re-provision (`views/reprovision.js`, new)
 
@@ -155,8 +156,9 @@ Exported `openReprovisionModal(app, device)`, lazy-loaded by:
 
 - `views/devices.js` row ⋮ menu: "Re-provision" (replaces "Re-provision
   user"; "Reauthenticate…" removed).
-- `views/device-editor.js`: a "Re-provision" button in the page header
-  actions.
+- `views/device-editor.js`: a "Re-provision" card + button in the
+  **Overview** section (the app shell has no header-action slot).
+- Hidden for native (non-Casa) devices in both places.
 
 ### Confirm dialog
 
@@ -213,10 +215,14 @@ already does.
 
 ### Push path
 
-Reuse the reauth internals (the prepare + `_deliver` split behind
-`reauth_device`), refactored into a callable helper, with:
+Reuse the reauth internals (`CasaAdminReauthDeviceView._reauth` +
+`_deliver`, with `_deliver` split so its result dict is reusable) with:
 target user = the device's current owner, no account switch, no
-`scramble_old`, `send_update_push = true`, password auto-generated.
+`scramble_old`, `send_update_push = true`, no password supplied. As in
+reauth today, if another device's still-queued reauth to the same account
+already holds a server-set password, that password is reused instead of
+rotating (rotating would strand that device's entry); otherwise the password
+is rotated. The password is never returned to the panel.
 
 Effects (all existing behavior of those internals): rotate the account
 password via `_set_account_password` (closes other open windows for the
@@ -249,13 +255,15 @@ Response: the normal provision result (`qr_data_uri`, `deep_link`,
 
 ### Replacement on redeem (`replaces_device_id`)
 
-- `_provision_internal` accepts an internal-only `replaces_device_id`
-  (not exposed on the `casa.provision` service) and stores it on the
-  `pending_provisions[user_id]` record.
+- `_provision_internal` gains a keyword-only `replaces_device_id` argument
+  (not read from service_data, so the `casa.provision` service can't set it)
+  and stores it on the `pending_provisions[user_id]` record. The reprovision
+  view reaches `_provision_internal` through `hass.data[DOMAIN]["provision_func"]`
+  via `_entry_func`, the same pattern the register/heartbeat views use.
 - When the window's listener records the redeeming token ids
   (`_record_provision_claims`), it also records
   `stored_data["replacement_claims"][token_id] = {replaces_device_id, at}`
-  (same TTL as provision claims). Keyed by refresh token — not by account —
+  (24 h TTL, `_CLAIM_WINDOW_SECONDS`). Keyed by refresh token — not by account —
   so a shared account can't route the replacement to the wrong device.
 - In `async_register_device`, pop `replacement_claims[refresh_token_id]`:
   - registering `device_id` == `replaces_device_id` → nothing extra (record
