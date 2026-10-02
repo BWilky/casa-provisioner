@@ -62,6 +62,7 @@ Keys are emitted in this order (the `profile` dict in `_provision_internal`).
 | `connect_wifi` | object | `ssid` (string), `password` (string). |
 | `location_zones` | object, optional | `anchors` (list), `config_version`; present only when zones are configured. |
 | `relay_url` | string, optional (26.10.01) | Push relay base URL without trailing slash, e.g. `https://relay.example`. Present only when the site uses a non-default relay; absent means `https://push.bonjour.casa`. `site_id` is only valid at this relay. |
+| `device_alias` | string, optional (26.10.03) | Name the admin gave the device in the wizard or a re-provision. Present only when set. Apps treat the device as named (no name prompt) and send it as the heartbeat `alias`; the server keeps any alias it already has. |
 
 `pin` (26.10.01): when non-empty, the app prompts for it before provisioning for every
 method (QR, deep link, manual, BLE) and for v1 and v2 payloads alike; a wrong PIN allows

@@ -833,6 +833,30 @@ async def _apply_device_replacement(hass, new_device_id: str, new_info: dict, re
     return old_device_id
 
 
+async def _apply_pending_provision(hass, user_id: str, device_info: dict, refresh_token_id: str | None) -> bool:
+    """Apply what _provision_internal stashed for user_id (template lineage,
+    session length, the name typed in the wizard) to this device record —
+    on whichever of register/heartbeat arrives first, and only from the
+    session that redeemed the window (on a shared account another device's
+    contact must not take it). Entries older than 30 min are dropped.
+    Returns True when it consumed the entry (a fresh provision)."""
+    pending_by_user = hass.data[DOMAIN].setdefault("pending_profile_by_user", {})
+    pending = pending_by_user.get(user_id)
+    if not pending or not await _has_fresh_claim(hass, user_id, refresh_token_id):
+        return False
+    pending_by_user.pop(user_id, None)
+    if time.time() - pending.get("set_at", 0) > 1800:
+        return False
+    device_info["provisioning_profile_id"] = pending.get("profile_id")
+    device_info["provisioning_profile_name"] = pending.get("profile_name")
+    if "expiration_hours" in pending:
+        device_info["provisioning_expiration_hours"] = pending["expiration_hours"]
+    alias = str(pending.get("device_alias") or "").strip()
+    if alias and not str(device_info.get("alias") or "").strip():
+        device_info["alias"] = alias[:DEVICE_ALIAS_MAX_LEN]
+    return True
+
+
 async def _end_provision_window(hass, user_id: str, provision_id: str, reason: str) -> None:
     """Close a provisioning window: scramble the password (the link dies),
     retire its QR file, forget the persisted record and stop its tasks.
@@ -4027,30 +4051,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "needs_reregister": final_reregister
         }
 
-        # "Originally provisioned from template" lineage — consume the pending
-        # record _provision_internal stashed by user_id (device_id wasn't
-        # known then). Purely informational under stamp-only semantics; it
-        # never re-syncs the device. Ignore stale entries (abandoned code,
-        # unrelated later registration) past the same 30-min TTL
-        # _login_listener caps at.
-        pending_by_user = hass.data[DOMAIN].get("pending_profile_by_user", {})
-        # Only the session that redeemed the window may consume it: on a
-        # shared account another device's first registration must not.
-        pending = pending_by_user.get(user_id)
-        if pending and await _has_fresh_claim(hass, user_id, refresh_token_id):
-            pending_by_user.pop(user_id, None)
-        else:
-            pending = None
-        if pending and (time.time() - pending.get("set_at", 0)) <= 1800:
-            devices[device_id]["provisioning_profile_id"] = pending.get("profile_id")
-            devices[device_id]["provisioning_profile_name"] = pending.get("profile_name")
-            if "expiration_hours" in pending:
-                devices[device_id]["provisioning_expiration_hours"] = pending["expiration_hours"]
-            # Alias typed at provision time; never overwrite one already set
-            # (same precedence as the heartbeat's device-submitted alias).
-            pending_alias = str(pending.get("device_alias") or "").strip()
-            if pending_alias and not str(devices[device_id].get("alias") or "").strip():
-                devices[device_id]["alias"] = pending_alias[:DEVICE_ALIAS_MAX_LEN]
+        # Fresh provision: template lineage, session length and the wizard's
+        # name — applied by whichever of register/heartbeat comes first.
+        await _apply_pending_provision(hass, user_id, devices[device_id], refresh_token_id)
 
         # QR re-provision redeemed by a different phone (wiped / replaced):
         # the new record takes over the old one's identity and the old record
@@ -4172,6 +4175,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         device_info = devices.setdefault(device_id, {
             "registered_at": now_iso
         })
+
+        # A fresh provision's first heartbeat can beat its registration;
+        # apply the wizard's name now so has_alias is true from the start.
+        await _apply_pending_provision(hass, user_id, device_info, refresh_token_id)
+        if _device_being_purged(hass, device_id):
+            raise HomeAssistantError("Device is being removed.")
 
         if last_12_token is not None:
             device_info["last_12_token"] = last_12_token
@@ -4785,6 +4794,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "password": connect_wifi_password,
                 },
             }
+            # Optional (26.10.03): the name typed in the wizard / re-provision,
+            # so the app knows it is named and never prompts.
+            payload_alias = str(service_data.get("device_alias", "") or "").strip()[:DEVICE_ALIAS_MAX_LEN]
+            if payload_alias:
+                profile["device_alias"] = payload_alias
             if lz_anchors:
                 profile["location_zones"] = {
                     "anchors": lz_anchors,
