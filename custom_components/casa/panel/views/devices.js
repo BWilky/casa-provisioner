@@ -456,13 +456,13 @@ export function createView(app) {
   function confirmReload(d) {
     ui.showConfirm({
       title: "Reload app",
-      message: `Send a silent reload push to "${deviceName(d)}"?`,
+      message: `Clear the cache and reload "${deviceName(d)}"? It's sent over push now, or applied when the device next checks in (within 24 h).`,
       confirmLabel: "Reload",
       confirmDanger: false,
       onConfirm: async () => {
         try {
           await api.reloadDevice(d.device_id);
-          ui.toast("Reload push sent.");
+          ui.toast("Reload queued.");
         } catch (err) {
           ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }
@@ -519,7 +519,7 @@ export function createView(app) {
     const CONFIRMS = {
       reload: {
         title: "Reload app",
-        message: `Send a silent reload push to ${n} ${plural}?`,
+        message: `Clear the cache and reload ${n} ${plural}? Sent over push now, or applied when each device next checks in (within 24 h).`,
         confirmLabel: "Reload",
         confirmDanger: false,
       },
@@ -551,7 +551,7 @@ export function createView(app) {
           }
         }
         const ok = n - failures.length;
-        const verb = kind === "reload" ? "reloaded" : kind === "delete" ? "deleted" : "deprovisioned";
+        const verb = kind === "reload" ? "queued for reload" : kind === "delete" ? "deleted" : "deprovisioned";
         ui.toast(
           failures.length ? `${ok} done, ${failures.length} failed: ${failures[0]}` : `${ok} ${verb}`,
           { error: failures.length > 0 }
