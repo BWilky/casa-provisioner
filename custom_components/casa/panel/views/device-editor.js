@@ -950,13 +950,13 @@ export function createView(app) {
   function confirmReload() {
     ui.showConfirm({
       title: "Reload app",
-      message: `Send a silent reload push to "${displayName(device)}"?`,
+      message: `Clear the cache and reload "${displayName(device)}"? It's sent over push now, or applied when the device next checks in (within 24 h).`,
       confirmLabel: "Reload",
       confirmDanger: false,
       onConfirm: async () => {
         try {
           await api.reloadDevice(device.device_id);
-          ui.toast("Reload push sent.");
+          ui.toast("Reload queued.");
         } catch (err) {
           ui.toast("Failed: " + ui.errMsg(err), { error: true });
         }

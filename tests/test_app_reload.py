@@ -83,3 +83,16 @@ def test_expired_reloads_are_dropped_on_pull():
     assert _drop_expired_app_reloads(qu_data, "D1") is True
     assert [e["id"] for e in qu_data["updates"]["D1"]] == ["new", "prof"]
     assert _drop_expired_app_reloads(qu_data, "D1") is False
+
+
+def test_prune_drops_expired_reloads_for_offline_devices():
+    from custom_components.casa import _prune_stale_queued_updates
+    now = datetime.now(timezone.utc)
+    hass = _hass()
+    hass.casa["qu_data"]["updates"]["D1"] = [
+        {"id": "old", "type": "app", "action": "clear_cache_reload", "payload": {}, "created_at": (now - timedelta(hours=25)).isoformat()},
+        {"id": "prof", "type": "profile", "action": "update", "payload": {}, "created_at": now.isoformat()},
+    ]
+    removed = asyncio.run(_prune_stale_queued_updates(hass))
+    assert removed == 1
+    assert [e["id"] for e in hass.casa["qu_data"]["updates"]["D1"]] == ["prof"]

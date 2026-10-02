@@ -1320,6 +1320,11 @@ async def _prune_stale_queued_updates(hass) -> int:
                 len(entries), device_id,
             )
             continue
+        # Expired clear-cache reloads: offline devices never pull, so drop here too.
+        before = len(entries)
+        if _drop_expired_app_reloads(qu_data, device_id):
+            entries = qu_data["updates"].get(device_id, [])
+            removed += before - len(entries)
         # A long-offline device must still get its WireGuard revoke (and its
         # latest WireGuard state), however old: never age/cap-prune those.
         wg_entries = [e for e in entries if e.get("type") == "wireguard"]
