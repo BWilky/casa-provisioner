@@ -2626,6 +2626,37 @@ def _normalize_reported_fields(fields: dict) -> dict:
     return out
 
 
+def _reprovision_service_data(hass, device_info: dict, fallback_host_url: str) -> dict:
+    """casa.provision service_data for a QR re-provision of an existing device.
+
+    Per-key precedence (applied by _provision_internal's get_field): the
+    device's own reported live settings, then its original template (only if
+    it still exists), then system defaults. host_url falls back to the
+    panel's origin only when neither source has one. get_field treats "" as
+    unset, so a reported empty string falls through to the template.
+    The caller adds user_id / username."""
+    data = {}
+    reported = device_info.get("provisioning_fields")
+    if isinstance(reported, dict) and reported:
+        data = {k: v for k, v in _normalize_reported_fields(reported).items() if k in LIVE_PROVISIONING_FIELDS}
+    template = None
+    profile_id = device_info.get("provisioning_profile_id")
+    if profile_id:
+        profiles = (hass.data[DOMAIN].get("pp_data") or {}).get("profiles", [])
+        template = next((p for p in profiles if p.get("id") == profile_id), None)
+    if template:
+        data["profile"] = template["id"]
+    template_host = str(((template or {}).get("fields") or {}).get("host_url") or "").strip()
+    if not str(data.get("host_url") or "").strip() and not template_host:
+        data["host_url"] = fallback_host_url
+    data["method"] = "qr"
+    data["deauthenticate_existing"] = False
+    alias = str(device_info.get("alias") or "").strip()
+    if alias:
+        data["device_alias"] = alias
+    return data
+
+
 def _split_wireguard_from_profile(fields: dict, wg_data: dict):
     """Translate WireGuard keys in a profile push into a separate update.
 
