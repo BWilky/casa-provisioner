@@ -1,7 +1,7 @@
 {
   "domain": "casa",
   "name": "Casa",
-  "version": "26.10.01",
+  "version": "26.10.02",
   "codeowners": ["@bdubsw"],
   "config_flow": true,
   "dependencies": ["http", "frontend"],
