@@ -972,6 +972,37 @@ def _find_device_record(stored_data: dict, device_id: str):
     return None, None, None
 
 
+def _ha_device_name(device_info: dict | None, username: str) -> str:
+    """Name for a device's Home Assistant device-registry entry: its alias
+    when set — several devices can share one account, so the account name
+    alone doesn't tell them apart — else "Casa Device (<username>)".
+    HA's async_get_or_create overwrites the name on every call, so every
+    registry write and every entity device_info must use this."""
+    alias = str((device_info or {}).get("alias") or "").strip()
+    return alias or f"Casa Device ({username})"
+
+
+async def _sync_ha_device_name(hass, device_id: str) -> None:
+    """Rename the device's registry entry after its alias changed. No-op when
+    registry devices are disabled (no entry) or the name already matches. A
+    name the user set in HA (name_by_user) still wins in HA's UI."""
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    device_info, owner_uid, username = _find_device_record(stored_data, device_id)
+    if device_info is None:
+        return
+    if username is None:  # native device — same label the setup loop uses
+        ha_user = await hass.auth.async_get_user(owner_uid)
+        username = (ha_user.name if ha_user else None) or f"Native User {owner_uid[:6]}"
+    from homeassistant.helpers import device_registry as dr
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+    if device is None:
+        return
+    name = _ha_device_name(device_info, username)
+    if device.name != name:
+        dev_reg.async_update_device(device.id, name=name)
+
+
 def _device_owned_by(stored_data: dict, user_id: str, device_id: str) -> bool:
     """True when device_id belongs to user_id (managed, not deleted; or native)."""
     users = stored_data.get("users", {}) if stored_data else {}
@@ -2277,6 +2308,7 @@ class CasaAdminDeviceView(HomeAssistantView):
         # one without clobbering the others.
         if "alias" in body:
             device_info["alias"] = str(body.get("alias") or "").strip()[:DEVICE_ALIAS_MAX_LEN]
+            await _sync_ha_device_name(self.hass, device_id)
 
         if "expires_at_override" in body:
             value = body.get("expires_at_override")
@@ -3839,7 +3871,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     dev_reg.async_get_or_create(
                         config_entry_id=entry.entry_id,
                         identifiers={(DOMAIN, device_id)},
-                        name=f"Casa Device ({username})",
+                        name=_ha_device_name(device_data, username),
                         model="Casa Push Client",
                         manufacturer="Casa Integration",
                         sw_version="1.0",
@@ -3856,7 +3888,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     dev_reg.async_get_or_create(
                         config_entry_id=entry.entry_id,
                         identifiers={(DOMAIN, device_id)},
-                        name=f"Casa Device ({username})",
+                        name=_ha_device_name(device_data, username),
                         model="Casa Push Client",
                         manufacturer="Casa Integration",
                         sw_version="1.0",
@@ -4018,7 +4050,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             dev_reg.async_get_or_create(
                 config_entry_id=entry.entry_id,
                 identifiers={(DOMAIN, device_id)},
-                name=f"Casa Device ({username})",
+                name=_ha_device_name(devices.get(device_id), username),
                 model="Casa Push Client",
                 manufacturer="Casa Integration",
                 sw_version="1.0",
@@ -4202,7 +4234,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             dev_reg.async_get_or_create(
                 config_entry_id=entry.entry_id,
                 identifiers={(DOMAIN, device_id)},
-                name=f"Casa Device ({username})",
+                name=_ha_device_name(device_info, username),
                 model="Casa Push Client",
                 manufacturer="Casa Integration",
                 sw_version="1.0",

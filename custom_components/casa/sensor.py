@@ -4,6 +4,7 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.util import dt as dt_util
 from .const import DOMAIN, CONF_CREATE_DEVICES
+from . import _find_device_record, _ha_device_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ class CasaDeviceSensorBase(SensorEntity):
         self._attr_unique_id = f"casa_{device_id}_{self.sensor_type}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, device_id)},
-            "name": f"Casa Device ({username})",
+            "name": _ha_device_name(_find_device_record(hass.data[DOMAIN]["stored_data"], device_id)[0], username),
             "model": "Casa Push Client",
             "manufacturer": "Casa Integration",
             "sw_version": "1.0",
