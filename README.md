@@ -147,7 +147,7 @@ Sends a push notification via the relay (`push.bonjour.casa`) to all registered 
 
 ### `casa.reload_device`
 
-Sends a silent background push to clear cache and reload the default URL on a specific device.
+Queues a clear-cache-and-reload for the device and delivers it over an encrypted silent push; if the device is offline it applies on its next check-in within 24 h. Only one reload is ever pending.
 
 | Field | Required | Description |
 |-------|----------|-------------|

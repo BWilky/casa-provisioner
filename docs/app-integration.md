@@ -136,7 +136,7 @@ chars) — an admin-set alias always wins and is never overwritten.
   "updates": [
     {
       "id": "<32 alphanumerics>",
-      "type": "wireguard | profile | auth | location",
+      "type": "wireguard | profile | auth | location | app",
       "action": "update | revoke",
       "payload": { ... },
       "created_at": "<iso8601>",
@@ -147,7 +147,7 @@ chars) — an admin-set alias always wins and is never overwritten.
 ```
 
 - `(type, action)` pairs: `wireguard/update`, `wireguard/revoke`, `profile/update`,
-  `auth/reauthenticate`, `location/update` (schemas in §4).
+  `auth/reauthenticate`, `location/update`, `app/clear_cache_reload` (schemas in §4).
 - `auth` / `reauthenticate` is never acked by the device (see the section after §4).
 - `location` / `update` carries the location-zone config and replaces any older `location` entries in the queue.
 - Ack every entry you cannot apply too (unknown type/action, malformed payload, a
@@ -206,6 +206,7 @@ The HA user account is never deleted; only this device's record and session are 
 | `wireguard` | `revoke`         | `{}`                                                           | remove the tunnel                  |
 | `profile`   | `update`         | `{ "profile_id": "...", "name": "...", "fields": { ... } }`     | apply `fields` (same as provisioning) |
 | `auth`      | `reauthenticate` | `{ "username": "...", "password": "..." }`                     | log out and auto-login as the new user (below) |
+| `app`       | `clear_cache_reload` | `{}` | clear the web cache and reload the WebView, then ack; the server drops it unpulled after 24 h and keeps at most one pending |
 | `location`  | `update`         | `{ "anchors": [ ... ], "config_version": "<string>" }`         | replace the zone config; empty `anchors` (`config_version: ""`) means tear down all regions and clear the config, without prompting for location permission |
 
 ### `profile` / `update` fields
@@ -335,13 +336,14 @@ as-is (no `command`, never routed through command dispatch). Keys the app acts o
 | `haptic` | string | `light`, `medium`, `heavy`, `success`, `warning`, `error` (`none` = off). |
 | `open_on_delivery` | bool | Act immediately when delivered in the foreground (banner suppressed) instead of on tap. |
 
-### Command pushes (`deprovision`, `clear_cache_and_reload`)
+### Command pushes (`deprovision`)
 
 Content-free silent pushes (`title`/`message` `""`) with `data: { "command": ... }`:
 
 - `deprovision` → wipe local provisioning state and sign out (the app may also call
   `POST /api/casa/deprovision`; see "Self-deprovision" above).
-- `clear_cache_and_reload` → clear the web cache and reload the WebView.
+
+(26.10.04) The plain `clear_cache_and_reload` command push is retired — reloads are the queued `app/clear_cache_reload` update.
 
 ### Check-in nudge pushes (`request_heartbeat` / `request_profile_report`)
 

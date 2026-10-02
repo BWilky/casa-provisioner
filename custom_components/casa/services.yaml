@@ -829,7 +829,7 @@ regenerate_site:
 
 reload_device:
   name: "Reload Casa Device"
-  description: "Sends a silent background push notification to clear cache and reload the default URL on a registered device."
+  description: "Queues a clear-cache-and-reload for the device and delivers it over an encrypted silent push; if the device is offline it applies on its next check-in within 24 h. Only one reload is ever pending."
   fields:
     device_id:
       name: "Device ID"

@@ -89,49 +89,6 @@ class CasaDeviceReloadButton(ButtonEntity):
 
     async def async_press(self) -> None:
         """Handle button press."""
-        # Find the device's push token
-        stored_data = self.hass.data[DOMAIN]["stored_data"]
-        device_info = {}
-        if not self.is_native:
-            for u in stored_data.get("users", {}).values():
-                if self.device_id in u.get("devices", {}):
-                    device_info = u["devices"][self.device_id]
-                    break
-        else:
-            for devs in stored_data.get("native_devices", {}).values():
-                if self.device_id in devs:
-                    device_info = devs[self.device_id]
-                    break
+        from . import _queue_app_reload
 
-        push_token = device_info.get("push_token")
-        if not push_token:
-            from homeassistant.exceptions import HomeAssistantError
-            raise HomeAssistantError(f"Cannot reload: No push notification token registered for this device.")
-
-        # Trigger reload via push relay
-        from homeassistant.helpers.aiohttp_client import async_get_clientsession
-        from . import _send_push_to_relay
-
-        session = async_get_clientsession(self.hass)
-        
-        payload = {
-            "title": "",
-            "message": "",
-            "target": push_token,
-            "site_id": stored_data.get("site_id"),
-            "site_key": stored_data.get("site_key"),
-            "data": {"command": "clear_cache_and_reload"}
-        }
-
-        _LOGGER.info(
-            "CASA: Sending silent reload push to device '%s' of user '%s'. Target (obfuscated): %s",
-            self.device_id, self.username, push_token[:10] + "..."
-        )
-
-        success = await _send_push_to_relay(self.hass, session, payload)
-        if success:
-            _LOGGER.info("CASA: Reload command successfully sent to token %s...", push_token[:10])
-
-        if not success:
-            from homeassistant.exceptions import HomeAssistantError
-            raise HomeAssistantError("Failed to deliver reload command via the Casa push relay.")
+        await _queue_app_reload(self.hass, self.device_id, created_by="HA button")

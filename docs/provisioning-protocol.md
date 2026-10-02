@@ -111,7 +111,6 @@ Sent through the relay as `data.command`.
 | `request_heartbeat` | Ask the device to check in. |
 | `request_profile_report` | Ask the device to send a profile report. |
 | `deprovision` | Tell the device to wipe itself. |
-| `clear_cache_and_reload` | Clear the web cache and reload. |
 | `wireguard_update` | Push a WireGuard configuration. |
 | `wireguard_revoke` | Revoke the WireGuard configuration. |
 

@@ -21,17 +21,17 @@ def test_button_module_imports():
     import custom_components.casa.button  # noqa: F401
 
 
-def test_reload_button_press_goes_through_send_push_to_relay(monkeypatch):
+def test_reload_button_press_queues_app_reload(monkeypatch):
     import custom_components.casa as casa
     from custom_components.casa.button import CasaDeviceReloadButton
 
-    sent = []
+    queued = []
 
-    async def fake_send(hass, session, payload):
-        sent.append(payload)
-        return True
+    async def fake_queue(hass, device_id, created_by):
+        queued.append((device_id, created_by))
+        return {"status": "queued"}
 
-    monkeypatch.setattr(casa, "_send_push_to_relay", fake_send)
+    monkeypatch.setattr(casa, "_queue_app_reload", fake_queue)
     stored = {
         "site_id": "S", "site_key": "K",
         "users": {"u1": {"devices": {"d1": {"push_token": "tok1234567890"}}}},
@@ -39,6 +39,4 @@ def test_reload_button_press_goes_through_send_push_to_relay(monkeypatch):
     hass = SimpleNamespace(data={"casa": {"stored_data": stored}})
     button = CasaDeviceReloadButton(hass, "d1", "alice", False)
     asyncio.run(button.async_press())
-    assert len(sent) == 1
-    assert sent[0]["target"] == "tok1234567890"
-    assert sent[0]["data"] == {"command": "clear_cache_and_reload"}
+    assert queued == [("d1", "HA button")]

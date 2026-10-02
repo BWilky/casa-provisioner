@@ -3037,6 +3037,8 @@ class CasaProfileUpdatesView(HomeAssistantView):
             return err
 
         qu_data = self.hass.data[DOMAIN]["qu_data"]
+        if _drop_expired_app_reloads(qu_data, device_id):
+            self.hass.data[DOMAIN]["qu_store"].async_delay_save(lambda: qu_data, 2.0)
         updates = qu_data.get("updates", {}).get(device_id, [])
         if any(e.get("type") == "auth" for e in updates):
             # Never hand a device credentials for a user that no longer
@@ -3180,6 +3182,65 @@ async def _enqueue_and_push_update(hass, stored_data, qu_data, session, device_i
         else:
             pushed = await _send_encrypted_update_push(hass, stored_data, session, device_id, device_info, update_id, update_type, action, payload)
     return update_id, pushed, skipped
+
+
+APP_RELOAD_MAX_AGE_SECONDS = 24 * 3600
+
+
+def _is_app_reload(entry: dict) -> bool:
+    return entry.get("type") == "app" and entry.get("action") == "clear_cache_reload"
+
+
+def _drop_expired_app_reloads(qu_data: dict, device_id: str) -> bool:
+    """Remove clear-cache reloads queued more than 24 h ago: a reload is only
+    useful soon after the admin asked for it. Other entry types untouched.
+    Returns True when something was removed (caller saves)."""
+    entries = (qu_data.get("updates") or {}).get(device_id) or []
+    cutoff = dt_util.now() - timedelta(seconds=APP_RELOAD_MAX_AGE_SECONDS)
+
+    def expired(entry):
+        if not _is_app_reload(entry):
+            return False
+        try:
+            return datetime.fromisoformat(str(entry.get("created_at"))) < cutoff
+        except (TypeError, ValueError):
+            return True  # unparseable timestamp: can't prove it's fresh
+
+    stale = [e for e in entries if expired(e)]
+    for entry in stale:
+        _dequeue_update(qu_data, device_id, entry.get("id"))
+    return bool(stale)
+
+
+async def _queue_app_reload(hass, device_id: str, created_by: str) -> dict:
+    """Clear the app's web cache and reload it — reliably: replace any still-
+    pending reload (only one is ever queued), queue a durable app/
+    clear_cache_reload update, then deliver it over an encrypted silent push
+    (or nudge a check-in when that can't go out). The device applies it from
+    either path and acks it; unpulled reloads expire after 24 h."""
+    data = hass.data[DOMAIN]
+    stored_data = data["stored_data"]
+    qu_data = data["qu_data"]
+    async with _lock_for(hass, "device", device_id):
+        device_info, _uid, username = _find_device_record(stored_data, device_id)
+        if device_info is None:
+            raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
+        for entry in [e for e in (qu_data.get("updates") or {}).get(device_id, []) if _is_app_reload(e)]:
+            _dequeue_update(qu_data, device_id, entry.get("id"))
+        update_id = _enqueue_update(qu_data, device_id, "app", "clear_cache_reload", {}, created_by)
+        data["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+    # Delivery accelerators run after the lock: relay calls can take seconds.
+    session = async_get_clientsession(hass)
+    pushed = await _send_encrypted_update_push(
+        hass, stored_data, session, device_id, device_info, update_id, "app", "clear_cache_reload", {},
+    )
+    if not pushed:
+        await _nudge_device_checkin(hass, session, stored_data, device_info)
+    _LOGGER.info(
+        "CASA: Queued clear-cache reload for device '%s' (%s) by %s (pushed=%s).",
+        device_id, username, created_by, pushed,
+    )
+    return {"status": "queued", "update_id": update_id, "pushed": pushed}
 
 
 async def _deliver_updates_in_background(hass, stored_data, jobs, update_type, action, payload, send_update_push, notify_push, title, message, created_by):
@@ -5634,76 +5695,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         }
 
     async def handle_reload_device(call: ServiceCall):
-        users = await _check_authorization(call)
+        await _check_authorization(call)
         device_id = str(call.data.get("device_id", "")).strip()
 
         if not device_id:
             raise HomeAssistantError("Missing device_id parameter.")
 
-        # Find the device in stored_data
-        stored_data = hass.data[DOMAIN]["stored_data"]
-        device_info = {}
-        username = "Unknown"
-        
-        # 1. Search in integration users
-        for uid, udata in stored_data.get("users", {}).items():
-            if device_id in udata.get("devices", {}):
-                device_info = udata["devices"][device_id]
-                username = udata.get("username", "Unknown")
-                break
-                
-        # 2. Search in native users if not found
-        if not device_info:
-            for uid, devices in stored_data.get("native_devices", {}).items():
-                if device_id in devices:
-                    device_info = devices[device_id]
-                    ha_user = next((u for u in users if u.id == uid), None)
-                    username = ha_user.name if ha_user else uid
-                    break
-
-        if not device_info:
-            raise HomeAssistantError(f"Device '{device_id}' not found in registered devices.")
-
-        push_token = device_info.get("push_token")
-        if not push_token:
-            raise HomeAssistantError(f"No push notification token registered for device '{device_id}'.")
-
-        # Send silent push
-        session = async_get_clientsession(hass)
-        payload = {
-            "title": "",
-            "message": "",
-            "target": push_token,
-            "site_id": stored_data.get("site_id"),
-            "site_key": stored_data.get("site_key"),
-            "push_type": "background",
-            "priority": 5,
-            "data": {"command": "clear_cache_and_reload"}
-        }
-
-        _LOGGER.info(
-            "CASA: Service called to send silent reload push to device '%s' of user '%s'. Target: %s",
-            device_id, username, push_token[:10] + "..."
-        )
-
-        success = False
-        url = relay_url(hass, "/send")
-        try:
-            _LOGGER.info("CASA: Posting reload payload to relay %s", url)
-            async with session.post(url, json=payload, timeout=ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    _LOGGER.info("CASA: Reload command successfully sent to token %s... via %s", push_token[:10], url)
-                    success = True
-                else:
-                    text = await response.text()
-                    _LOGGER.warning("CASA: Relay %s returned status %s: %s", url, response.status, text)
-        except Exception as err:
-            _LOGGER.warning("CASA: Failed to connect to relay %s: %s", url, err)
-
-        if not success:
-            raise HomeAssistantError("Failed to deliver reload command to any Casa push relay.")
-
-        return {"status": "success"}
+        return await _queue_app_reload(hass, device_id, created_by="service")
 
     async def handle_request_device_report(call: ServiceCall):
         """Silently ask a device to report its provisioning state right now,
