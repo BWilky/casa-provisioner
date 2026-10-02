@@ -171,3 +171,15 @@ def test_rejects_non_admin_unknown_native_and_bad_method():
     hass.casa["stored_data"]["native_devices"] = {"n1": {"N1": {"refresh_token_id": "rn"}}}
     status, resp = _post(hass, provision, {"device_id": "N1"})
     assert status == 400 and "Casa-managed" in resp["error"]
+
+
+from custom_components.casa import CasaAdminSummaryView
+
+
+def test_summary_accounts_carry_user_id():
+    hass = FakeHass()
+    hass.casa["stored_data"]["users"]["u1"] = {"username": "mobile-bryce", "name": "Mobile Bryce", "devices": {}}
+    view = bind_view(CasaAdminSummaryView(hass))
+    status, resp = asyncio.run(view.get(FakeRequest(make_user("admin", admin=True))))
+    assert status == 200
+    assert resp["accounts"][0]["user_id"] == "u1"

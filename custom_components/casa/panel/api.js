@@ -270,6 +270,18 @@ export class CasaApi {
     }
     return this._hass.callApi("POST", "casa/admin/reauth_device", body);
   }
+
+  // One-click re-provision of an existing device on its current account
+  // ({device_id, method: "auto" | "qr", host_url}). Push when registered,
+  // else a fresh QR/link — see CasaAdminReprovisionDeviceView.
+  reprovisionDevice(body) {
+    const backend = this.summary && this.summary.version;
+    if (this.panelVersion && backend && backend !== this.panelVersion) {
+      return Promise.reject(new Error("Casa was updated on disk — restart Home Assistant before re-provisioning devices."));
+    }
+    return this._hass.callApi("POST", "casa/admin/reprovision_device", body);
+  }
+
   deleteQueuedUpdate(deviceId, updateId) {
     return this._hass.callApi(
       "DELETE",

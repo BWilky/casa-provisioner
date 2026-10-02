@@ -1977,6 +1977,7 @@ class CasaAdminSummaryView(HomeAssistantView):
             if udata.get("deleted", False):
                 continue
             accounts.append({
+                "user_id": uid,
                 "name": udata.get("name"),
                 "username": udata.get("username"),
                 "created_at": udata.get("created_at"),
