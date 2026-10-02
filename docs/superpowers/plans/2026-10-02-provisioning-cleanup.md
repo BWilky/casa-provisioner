@@ -2341,3 +2341,174 @@ Deploying restarts HA Core on 192.168.1.21 — **ask the user first**, then run 
 6. *Re-provision* → "Show QR instead" → QR modal; the device is signed out immediately. Redeem the QR on a different phone/simulator → after it registers, the old device record is gone and the new one has the old alias.
 7. Native devices show no Re-provision in the row menu or Overview.
 8. `/casa/provision/guided` and `/casa/provision/user/mobile-bryce` still open the wizard (the latter with Mobile Bryce selected).
+
+---
+
+### Task 10: Name HA devices after their alias (user-requested addition, 2026-10-02)
+
+Shared accounts make every device on an account show up in Home Assistant as "Casa Device (<username>)", with entity ids suffixed `_2`, `_3`. Name the HA device-registry entry after the device's alias instead (fallback unchanged), and rename it when the alias changes. HA's `device_registry.async_get_or_create` overwrites `name` on every call (verified in HA 2025.1 source), and the entity platform calls it with each entity's `device_info` on every entity add — so **every** registry write and **every** entity `device_info` must compute the name the same way. Existing entity ids are not renamed (HA keeps them); new devices get readable ids.
+
+**Files:**
+- Modify: `custom_components/casa/__init__.py` — add `_ha_device_name` + `_sync_ha_device_name` right after `_find_device_record`; use `_ha_device_name` at the 3 `name=f"Casa Device ({username})"` registry calls (setup loop for managed users, setup loop for native users, `async_register_device`, `async_heartbeat` — grep `name=f"Casa Device (`); call `_sync_ha_device_name` in `CasaAdminDeviceView.put` after an alias change
+- Modify: `custom_components/casa/sensor.py` (`CasaDeviceSensorBase.__init__` device_info name), `custom_components/casa/button.py` (`CasaDeviceReloadButton.__init__` device_info name)
+- Test: `tests/test_ha_device_name.py` (create)
+
+**Interfaces:**
+- Produces: `_ha_device_name(device_info: dict | None, username: str) -> str`; `async _sync_ha_device_name(hass, device_id: str) -> None`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/test_ha_device_name.py`:
+
+```python
+import asyncio
+import sys
+import types
+from types import SimpleNamespace
+
+from custom_components.casa import CasaAdminDeviceView, _ha_device_name, _sync_ha_device_name
+from tests.fakes import FakeHass, FakeRequest, bind_view, make_user
+
+
+class FakeDeviceRegistry:
+    def __init__(self):
+        self.devices = {}  # identifier tuple -> SimpleNamespace(id, name)
+        self.updates = []
+
+    def add(self, device_id, name):
+        self.devices[("casa", device_id)] = SimpleNamespace(id="reg-" + device_id, name=name)
+
+    def async_get_device(self, identifiers):
+        (ident,) = tuple(identifiers)
+        return self.devices.get(ident)
+
+    def async_update_device(self, reg_id, name):
+        self.updates.append((reg_id, name))
+        for dev in self.devices.values():
+            if dev.id == reg_id:
+                dev.name = name
+
+
+def _install_registry(monkeypatch, registry):
+    mod = types.ModuleType("homeassistant.helpers.device_registry")
+    mod.async_get = lambda hass: registry
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers.device_registry", mod)
+    import homeassistant.helpers as helpers
+    monkeypatch.setattr(helpers, "device_registry", mod, raising=False)
+
+
+def test_name_prefers_alias():
+    assert _ha_device_name({"alias": " Kitchen iPad "}, "kiosk") == "Kitchen iPad"
+
+
+def test_name_falls_back_to_account():
+    assert _ha_device_name({"alias": ""}, "kiosk") == "Casa Device (kiosk)"
+    assert _ha_device_name(None, "kiosk") == "Casa Device (kiosk)"
+
+
+def _hass():
+    hass = FakeHass()
+    hass.casa["stored_data"]["users"]["u1"] = {"username": "kiosk", "devices": {"D1": {"alias": "Kitchen iPad"}}}
+    return hass
+
+
+def test_sync_renames_registry_entry(monkeypatch):
+    hass, reg = _hass(), FakeDeviceRegistry()
+    reg.add("D1", "Casa Device (kiosk)")
+    _install_registry(monkeypatch, reg)
+    asyncio.run(_sync_ha_device_name(hass, "D1"))
+    assert reg.updates == [("reg-D1", "Kitchen iPad")]
+
+
+def test_sync_is_noop_when_name_matches_or_device_missing(monkeypatch):
+    hass, reg = _hass(), FakeDeviceRegistry()
+    reg.add("D1", "Kitchen iPad")
+    _install_registry(monkeypatch, reg)
+    asyncio.run(_sync_ha_device_name(hass, "D1"))
+    asyncio.run(_sync_ha_device_name(hass, "NOPE"))
+    assert reg.updates == []
+
+
+def test_sync_native_device_uses_ha_user_name(monkeypatch):
+    hass, reg = FakeHass(), FakeDeviceRegistry()
+    hass.auth.add_user(make_user("n1", login="den", name="Den Tablet User"))
+    hass.casa["stored_data"]["native_devices"] = {"n1": {"N1": {"alias": ""}}}
+    reg.add("N1", "Old")
+    _install_registry(monkeypatch, reg)
+    asyncio.run(_sync_ha_device_name(hass, "N1"))
+    assert reg.updates == [("reg-N1", "Casa Device (Den Tablet User)")]
+
+
+def test_admin_alias_change_renames_registry_entry(monkeypatch):
+    hass, reg = _hass(), FakeDeviceRegistry()
+    reg.add("D1", "Kitchen iPad")
+    _install_registry(monkeypatch, reg)
+    view = bind_view(CasaAdminDeviceView(hass))
+    status, _ = asyncio.run(view.put(FakeRequest(make_user("admin", admin=True), {"device_id": "D1", "alias": "Hall iPad"})))
+    assert status == 200
+    assert reg.updates == [("reg-D1", "Hall iPad")]
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `python3 -m pytest -q tests/test_ha_device_name.py` → FAIL (`ImportError: cannot import name '_ha_device_name'`).
+
+- [ ] **Step 3: Implement the helpers**
+
+After `_find_device_record` in `__init__.py` add:
+
+```python
+def _ha_device_name(device_info: dict | None, username: str) -> str:
+    """Name for a device's Home Assistant device-registry entry: its alias
+    when set — several devices can share one account, so the account name
+    alone doesn't tell them apart — else "Casa Device (<username>)".
+    HA's async_get_or_create overwrites the name on every call, so every
+    registry write and every entity device_info must use this."""
+    alias = str((device_info or {}).get("alias") or "").strip()
+    return alias or f"Casa Device ({username})"
+
+
+async def _sync_ha_device_name(hass, device_id: str) -> None:
+    """Rename the device's registry entry after its alias changed. No-op when
+    registry devices are disabled (no entry) or the name already matches. A
+    name the user set in HA (name_by_user) still wins in HA's UI."""
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    device_info, owner_uid, username = _find_device_record(stored_data, device_id)
+    if device_info is None:
+        return
+    if username is None:  # native device — same label the setup loop uses
+        ha_user = await hass.auth.async_get_user(owner_uid)
+        username = (ha_user.name if ha_user else None) or f"Native User {owner_uid[:6]}"
+    from homeassistant.helpers import device_registry as dr
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
+    if device is None:
+        return
+    name = _ha_device_name(device_info, username)
+    if device.name != name:
+        dev_reg.async_update_device(device.id, name=name)
+```
+
+- [ ] **Step 4: Use the helper everywhere the name is written**
+
+- In `async_setup_entry`'s "Register all existing devices" block: managed loop → `name=_ha_device_name(device_data, username),`; native loop → `name=_ha_device_name(device_data, username),`.
+- In `async_register_device`'s registry call → `name=_ha_device_name(devices.get(device_id), username),`.
+- In `async_heartbeat`'s registry call → `name=_ha_device_name(device_info, username),`.
+- `grep -n 'name=f"Casa Device (' custom_components/casa/__init__.py` → no matches afterwards.
+- In `CasaAdminDeviceView.put`, right after `device_info["alias"] = str(body.get("alias") or "").strip()[:DEVICE_ALIAS_MAX_LEN]`, add `await _sync_ha_device_name(self.hass, device_id)`.
+- In `sensor.py` `CasaDeviceSensorBase.__init__` and `button.py` `CasaDeviceReloadButton.__init__`, replace `"name": f"Casa Device ({username})",` with `"name": _ha_device_name(_find_device_record(hass.data[DOMAIN]["stored_data"], device_id)[0], username),` and add `from . import _find_device_record, _ha_device_name` to each file's imports.
+
+- [ ] **Step 5: Run tests**
+
+Run: `python3 -m pytest -q tests` → 150 passed (144 + 6). `node --test tests/js/*.mjs` → 8 passed.
+
+- [ ] **Step 6: Bump the release**
+
+This lands after Task 9's 26.10.02 bump in the same release — no further bump. Add to README's device list sentence: `Home Assistant devices are named after the device alias (falling back to "Casa Device (<account>)").`
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add custom_components/casa/__init__.py custom_components/casa/sensor.py custom_components/casa/button.py tests/test_ha_device_name.py README.md
+git commit -m "feat: name Home Assistant devices after their alias so shared-account devices are distinguishable"
+```
