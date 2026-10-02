@@ -45,15 +45,13 @@ export async function openReprovisionModal(app, device) {
         onClick: async (btn) => {
           btn.disabled = true;
           btn.textContent = "Working…";
+          let res;
           try {
-            const res = await api.reprovisionDevice({
+            res = await api.reprovisionDevice({
               device_id: device.device_id,
               method: forceQr ? "qr" : "auto",
               host_url: window.location.origin,
             });
-            await showResult(app, label, res || {});
-            app.refresh();
-            return undefined; // close the confirm
           } catch (err) {
             const errEl = body.querySelector("[data-err]");
             errEl.hidden = false;
@@ -62,6 +60,12 @@ export async function openReprovisionModal(app, device) {
             btn.textContent = "Re-provision";
             return false;
           }
+          // Server side is done from here on — never report failure or re-enable.
+          showResult(app, label, res || {}).catch((err) => {
+            ui.toast(`Re-provisioned ${label}, but the result couldn't be shown: ${ui.errMsg(err)}. Re-provision again from the device to get a new link.`, { error: true });
+          });
+          app.refresh();
+          return undefined; // close the confirm
         },
       },
     ],
