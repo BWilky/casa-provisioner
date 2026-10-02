@@ -199,7 +199,7 @@ export function createView(app) {
     refs.tabs.innerHTML = STEPS.map((s, i) => `
       <button class="tab ${i === cur ? "tab--active" : ""} ${i < cur && !done ? "tab--done" : ""}"
         data-act="goto-step" data-step="${esc(s.id)}"
-        ${i >= cur || done ? "disabled" : ""}>
+        ${i >= cur || done || state.busy ? "disabled" : ""}>
         <span class="step-dot">${i < cur ? "✓" : i + 1}</span>${esc(s.label)}
       </button>`).join("");
   }
@@ -207,7 +207,7 @@ export function createView(app) {
   function footer(primaryLabel, primaryAct, { back = true } = {}) {
     return `
       <div style="display:flex; justify-content:space-between; gap:8px; margin-top:18px; padding-top:12px; border-top:1px solid var(--casa-divider);">
-        ${back ? `<button class="btn btn--text" data-act="back">Back</button>` : "<span></span>"}
+        ${back ? `<button class="btn btn--text" data-act="back" ${state.busy ? "disabled" : ""}>Back</button>` : "<span></span>"}
         <button class="btn btn--primary" data-act="${esc(primaryAct)}" ${state.busy ? "disabled" : ""}>
           ${state.busy ? "Working…" : esc(primaryLabel)}
         </button>
@@ -394,13 +394,21 @@ export function createView(app) {
         return choiceRow({ choice: p.id, title: p.name || "(unnamed)", chipsHtml: chips });
       })
       .join("");
-    const search = state.templates.length > SEARCH_THRESHOLD ? `
+    const noMatch = q && !rows && state.templates.length
+      ? `<div class="muted" style="margin:0 0 8px; font-size:13px;">No templates match "${esc(state.search.trim())}"</div>` : "";
+    return `${errHtml}${rows}${noMatch}
+      ${choiceRow({ choice: "manual", title: "Configure manually", desc: "Set every option yourself — optionally save it as a new template" })}`;
+  }
+
+  // Kept outside #pv-templates so typing (which re-renders only the rows)
+  // never destroys the focused input.
+  function templateSearchHtml() {
+    if (!state.templates || state.templates.length <= SEARCH_THRESHOLD) return "";
+    return `
       <div class="list-toolbar"><div class="search-field">
         <ha-icon icon="mdi:magnify"></ha-icon>
         <input class="input" id="pv-search" type="search" placeholder="Search templates…" value="${esc(state.search)}">
-      </div></div>` : "";
-    return `${errHtml}${search}${rows}
-      ${choiceRow({ choice: "manual", title: "Configure manually", desc: "Set every option yourself — optionally save it as a new template" })}`;
+      </div></div>`;
   }
 
   function customizeSectionDefs() {
@@ -475,6 +483,7 @@ export function createView(app) {
       ${accountSummaryChip()}
       ${state.deployError ? `<div class="errbar">${esc(state.deployError)}</div>` : ""}
       <h4 style="margin:0 0 10px; font-size:14px; font-weight:600;">Choose a template</h4>
+      ${templateSearchHtml()}
       <div id="pv-templates">${templateListHtml()}</div>
       ${ready ? `
         <div style="border-top:1px solid var(--casa-divider); margin-top:8px;">
@@ -587,7 +596,7 @@ export function createView(app) {
       lineage: logicMod.lineageFor({
         templateId: template && template.id,
         customized: changed.length > 0,
-        savedTemplateId: state.savedTemplateId,
+        savedTemplateId: state.saveAsTemplate ? state.savedTemplateId : null,
       }),
     });
     try {
@@ -658,6 +667,7 @@ export function createView(app) {
   function onBodyClick(e) {
     const el = e.target.closest("[data-act]");
     if (!el || el.disabled || !(refs.body.contains(el) || refs.tabs.contains(el))) return;
+    if (state.busy && (el.dataset.act === "goto-step" || el.dataset.act === "back")) return;
     switch (el.dataset.act) {
       case "goto-step":
         if (stepIndex(el.dataset.step) < stepIndex(state.step) && state.step !== "result") gotoStep(el.dataset.step);
@@ -712,7 +722,8 @@ export function createView(app) {
 
   // View-private inputs carry data-pv (shared-renderer fields use data-key and
   // are handled by fieldsMod.bindFieldEvents). Typing never re-renders the
-  // whole step, so focus is kept.
+  // whole step; the template search re-renders only the rows below its
+  // (separate) input, so focus is kept.
   function onBodyInput(e) {
     const t = e.target;
     if (t.id === "pv-search") {
@@ -817,7 +828,7 @@ export function createView(app) {
       }
 
       // Deep links can land before the first summary poll.
-      if (presetUsername && !app.summary()) await app.refresh();
+      if (!app.summary()) await app.refresh();
       if (token !== mountToken || !state) return;
       if (presetUsername) {
         if (casaAccounts().some((a) => a.username === presetUsername)) {
