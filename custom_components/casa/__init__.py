@@ -34,7 +34,7 @@ from .location import (
     decrypt_report_payload,
     validate_zone_config,
 )
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_time_interval, async_call_later
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.components import frontend
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -1042,6 +1042,10 @@ def _rename_casa_entity(registry, entry, alias: str) -> str | None:
     if not object_id.startswith("casa_device_") or not alias:
         return None
     label = entry.original_name or entry.name or ""
+    from homeassistant.util import slugify
+    preferred = slugify(f"{alias} {label}".strip())
+    if object_id == preferred or re.fullmatch(re.escape(preferred) + r"_\d+", object_id):
+        return None
     target = registry.async_generate_entity_id(domain, f"{alias} {label}".strip())
     if target == entry.entity_id:
         return None
@@ -1067,7 +1071,10 @@ def _rename_device_entities(hass, device_id: str) -> None:
     registry = er.async_get(hass)
     for entry in list(er.async_entries_for_device(registry, device.id, include_disabled_entities=True)):
         if getattr(entry, "platform", DOMAIN) == DOMAIN:
-            _rename_casa_entity(registry, entry, alias)
+            try:
+                _rename_casa_entity(registry, entry, alias)
+            except ValueError as err:
+                _LOGGER.warning("CASA: Could not rename entity '%s': %s", entry.entity_id, err)
 
 
 def _device_owned_by(stored_data: dict, user_id: str, device_id: str) -> bool:
@@ -6222,8 +6229,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         from homeassistant.helpers import device_registry as dr
         device = dr.async_get(hass).async_get(entry.device_id)
         ident = next((i for d, i in (device.identifiers if device else ()) if d == DOMAIN), None)
-        if ident:
+        if not ident:
+            return
+        # Defer: renaming inside HA's async_get_or_create would leave the live
+        # entity bound to the old id. One pass covers the whole creation burst.
+        scheduled = hass.data[DOMAIN].setdefault("entity_rename_scheduled", set())
+        if ident in scheduled:
+            return
+        scheduled.add(ident)
+
+        @callback
+        def _run(_now, ident=ident):
+            scheduled.discard(ident)
             _rename_device_entities(hass, ident)
+
+        async_call_later(hass, 5, _run)
 
     hass.data[DOMAIN]["entity_rename_unsub"] = hass.bus.async_listen(
         er.EVENT_ENTITY_REGISTRY_UPDATED, _on_entity_registry_updated

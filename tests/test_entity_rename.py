@@ -93,3 +93,9 @@ def test_rename_device_entities_after_window_is_noop(monkeypatch):
     _install(monkeypatch, reg)
     _rename_device_entities(_hass(time.time() - 1), "D1")
     assert reg.updates == []
+
+
+def test_already_slugged_name_is_noop_even_with_casa_device_alias():
+    reg = FakeEntityRegistry([_entry("sensor.casa_device_guest_ip_address", "IP Address")])
+    assert _rename_casa_entity(reg, reg.entries["sensor.casa_device_guest_ip_address"], "Casa Device Guest") is None
+    assert reg.updates == []

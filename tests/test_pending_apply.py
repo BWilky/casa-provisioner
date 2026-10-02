@@ -63,3 +63,19 @@ def test_stale_pending_is_dropped_without_applying():
     info = {}
     assert asyncio.run(_apply_pending_provision(hass, "u1", info, "t-new")) is False
     assert info == {}
+
+
+def test_stamps_entity_rename_window_only_with_alias():
+    from custom_components.casa import ENTITY_RENAME_WINDOW_SECONDS
+    hass = _hass()
+    _record_provision_claims(hass, "u1", {"t-new"})
+    info = {}
+    asyncio.run(_apply_pending_provision(hass, "u1", info, "t-new"))
+    assert abs(info["entity_rename_until"] - (time.time() + ENTITY_RENAME_WINDOW_SECONDS)) < 5
+
+    hass = _hass()
+    hass.casa["pending_profile_by_user"]["u1"].pop("device_alias")
+    _record_provision_claims(hass, "u1", {"t-new"})
+    info = {}
+    assert asyncio.run(_apply_pending_provision(hass, "u1", info, "t-new")) is True
+    assert "entity_rename_until" not in info

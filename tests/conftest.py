@@ -66,12 +66,18 @@ def _install_homeassistant_stubs() -> None:
     _ensure_module(
         "homeassistant.helpers.event",
         async_track_time_interval=lambda *a, **kw: None,
+        async_call_later=lambda *a, **kw: (lambda: None),
     )
     _ensure_module(
         "homeassistant.helpers.aiohttp_client",
         async_get_clientsession=lambda *a, **kw: None,
     )
-    _ensure_module("homeassistant.util")
+    import re as _re
+
+    def _slugify(text, *, separator="_"):
+        return _re.sub(r"[^a-z0-9]+", separator, str(text).lower()).strip(separator)
+
+    _ensure_module("homeassistant.util", slugify=_slugify)
     import datetime as _datetime
     _ensure_module(
         "homeassistant.util.dt",
