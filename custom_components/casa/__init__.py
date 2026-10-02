@@ -736,10 +736,16 @@ _CLAIM_WINDOW_SECONDS = 24 * 3600
 _CLAIM_TOKEN_MAX_AGE_SECONDS = 1800
 
 
-def _record_provision_claims(hass, user_id: str, token_ids) -> None:
+def _record_provision_claims(hass, user_id: str, token_ids, replaces_device_id: str | None = None) -> None:
     """Remember the refresh tokens that redeemed a provisioning window for
     user_id: proof that the session came from that user's provisioning link,
-    which lets it take over its device record from a previous owner."""
+    which lets it take over its device record from a previous owner.
+
+    replaces_device_id (QR re-provision only): the device record the window
+    was issued for. Recorded per redeeming token so the registration that
+    follows can tell a replacement phone (new device_id) apart — keyed by
+    token, not account, so a shared account can't route it to the wrong
+    record (see _apply_device_replacement)."""
     if not token_ids:
         return
     stored_data = hass.data[DOMAIN]["stored_data"]
@@ -749,6 +755,12 @@ def _record_provision_claims(hass, user_id: str, token_ids) -> None:
         claims[tid] = now
     for tid in [t for t, ts in claims.items() if now - ts > _CLAIM_TTL_SECONDS]:
         claims.pop(tid, None)
+    if replaces_device_id:
+        rclaims = stored_data.setdefault("replacement_claims", {})
+        for tid in token_ids:
+            rclaims[tid] = {"replaces_device_id": replaces_device_id, "at": now}
+        for tid in [t for t, c in rclaims.items() if now - c.get("at", 0) > _CLAIM_WINDOW_SECONDS]:
+            rclaims.pop(tid, None)
     _save_stored_data(hass)
 
 
@@ -779,6 +791,46 @@ def _consume_provision_claim(hass, user_id: str, refresh_token_id: str | None) -
     claims = (hass.data[DOMAIN]["stored_data"].get("provision_claims") or {}).get(user_id)
     if claims and claims.pop(refresh_token_id, None) is not None:
         _save_stored_data(hass)
+
+
+def _consume_replacement_claim(hass, refresh_token_id: str | None) -> str | None:
+    """Pop the replacement claim (if any) a QR re-provision left for this
+    session token. Single use; claims older than _CLAIM_WINDOW_SECONDS are
+    dropped without effect. Returns the device id to replace, or None."""
+    if not refresh_token_id:
+        return None
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    claims = stored_data.get("replacement_claims") or {}
+    claim = claims.pop(refresh_token_id, None)
+    if not claim:
+        return None
+    _save_stored_data(hass)
+    if time.time() - claim.get("at", 0) > _CLAIM_WINDOW_SECONDS:
+        return None
+    return claim.get("replaces_device_id") or None
+
+
+async def _apply_device_replacement(hass, new_device_id: str, new_info: dict, refresh_token_id: str | None) -> str | None:
+    """A QR re-provision redeemed by a different phone (wiped or replaced, so
+    a new device_id): the new record inherits the old one's alias (only if
+    it has none) and template lineage, and the old record is purged the way
+    "Delete record" does it. Same device_id → nothing to do (the normal
+    register merge already rebinds the token). Returns the purged device id."""
+    old_device_id = _consume_replacement_claim(hass, refresh_token_id)
+    if not old_device_id or old_device_id == new_device_id:
+        return None
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    old_info, _old_uid, _old_name = _find_device_record(stored_data, old_device_id)
+    if not old_info:
+        return None
+    if not str(new_info.get("alias") or "").strip() and str(old_info.get("alias") or "").strip():
+        new_info["alias"] = old_info["alias"]
+    for key in ("provisioning_profile_id", "provisioning_profile_name"):
+        if not new_info.get(key) and old_info.get(key):
+            new_info[key] = old_info[key]
+    await _purge_device(hass, old_device_id)
+    _LOGGER.info("CASA: Device '%s' replaced '%s' after a QR re-provision.", new_device_id, old_device_id)
+    return old_device_id
 
 
 async def _end_provision_window(hass, user_id: str, provision_id: str, reason: str) -> None:
