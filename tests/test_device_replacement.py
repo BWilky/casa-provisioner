@@ -97,3 +97,35 @@ def test_replacement_noop_when_old_record_gone():
     _devices(hass).pop("OLD")
     _record_provision_claims(hass, "u1", {"r-new"}, replaces_device_id="OLD")
     assert asyncio.run(_apply_device_replacement(hass, "NEW", _devices(hass)["NEW"], "r-new")) is None
+
+
+import custom_components.casa as casa
+from custom_components.casa import _arm_pending_provision
+
+
+def test_armed_window_forwards_replaces_device_id(monkeypatch):
+    hass = _hass()
+    now = time.time()
+    hass.casa["stored_data"]["pending_provisions"] = {"u1": {
+        "provision_id": "p1", "login_username": "kitchen", "method": "qr", "single_use": True,
+        "scramble_at": now + 300, "window_ends_at": now + 300, "listen_until": now + 330,
+        "known_token_ids": ["r-old"], "qr_file": None, "qr_expire_mode": "delete",
+        "created_at": now, "replaces_device_id": "OLD",
+    }}
+    captured = {}
+
+    def fake_listener(*args, **kwargs):
+        captured.update(kwargs)
+
+        async def noop():
+            return None
+        return noop()
+
+    monkeypatch.setattr(casa, "_login_listener", fake_listener)
+
+    async def scenario():
+        _arm_pending_provision(hass, "u1")
+        captured["on_tokens"]({"r-new"})
+
+    asyncio.run(scenario())
+    assert hass.casa["stored_data"]["replacement_claims"]["r-new"]["replaces_device_id"] == "OLD"

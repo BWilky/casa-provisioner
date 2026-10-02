@@ -937,7 +937,9 @@ def _arm_pending_provision(hass, user_id: str) -> None:
             hass, rec.get("login_username"), user_id, set(rec.get("known_token_ids") or []), ttl,
             rec.get("method"), on_redeemed=_on_redeemed if rec.get("single_use") else None,
             provision_id=provision_id,
-            on_tokens=lambda tids: _record_provision_claims(hass, user_id, tids),
+            on_tokens=lambda tids: _record_provision_claims(
+                hass, user_id, tids, replaces_device_id=rec.get("replaces_device_id"),
+            ),
         ),
         name=f"casa provisioning listener {user_id}",
     )
@@ -3854,6 +3856,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if pending_alias and not str(devices[device_id].get("alias") or "").strip():
                 devices[device_id]["alias"] = pending_alias[:DEVICE_ALIAS_MAX_LEN]
 
+        # QR re-provision redeemed by a different phone (wiped / replaced):
+        # the new record takes over the old one's identity and the old record
+        # is purged. No claim (the normal case) → no-op.
+        replaced_device_id = await _apply_device_replacement(hass, device_id, devices[device_id], refresh_token_id)
+        if replaced_device_id:
+            _remove_registry_device(hass, replaced_device_id)
+
         _save_stored_data(hass)
         
         # Register in Home Assistant Device Registry if enabled
@@ -4205,7 +4214,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ==========================================
     # UNIFIED SERVICE: PROVISION (QR & BLE)
     # ==========================================
-    async def _provision_internal(service_data: dict, users: list = None) -> dict:
+    async def _provision_internal(service_data: dict, users: list = None, *, replaces_device_id: str | None = None) -> dict:
+        # replaces_device_id is keyword-only and never read from service_data,
+        # so the casa.provision service can't set it — only the admin
+        # reprovision view passes it (see _apply_device_replacement).
         method = str(service_data.get("method", "qr")).strip().lower()
         if method not in ("qr", "ble", "deep_link", "manual"):
             return {"error": f"Invalid method: {method}"}
@@ -4667,6 +4679,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "qr_file": qr_file,
             "qr_expire_mode": qr_expire_mode,
             "created_at": now_ts,
+            "replaces_device_id": replaces_device_id or None,
         }
         _save_stored_data(hass)
         _arm_pending_provision(hass, target_user.id)
@@ -4741,6 +4754,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "expires_at": expiration_unix,
                 "pin_required": bool(target_pin)
             }
+
+    # The admin reprovision view (registered once per process) reaches the
+    # current entry's provision closure through hass.data, like register/heartbeat.
+    hass.data[DOMAIN]["provision_func"] = _provision_internal
 
     async def handle_provision(call: ServiceCall):
         users = await _check_authorization(call)
