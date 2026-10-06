@@ -7,6 +7,8 @@ import {
   templateFieldsToSave,
   lineageFor,
   buildProvisionRequest,
+  LINK_WINDOW_OPTIONS,
+  DEFAULT_LINK_MINUTES,
 } from "../../custom_components/casa/panel/views/provision-logic.js";
 import { setupResultHtml } from "../../custom_components/casa/panel/views/provision-result.js";
 
@@ -51,6 +53,17 @@ test("buildProvisionRequest — existing account sends no password", () => {
   });
 });
 
+test("buildProvisionRequest — the admin's link window rides as timeout_minutes; omitted otherwise", () => {
+  const base = { fields: {}, form: {}, account: { username: "u" }, deviceName: "D", lineage: null };
+  assert.equal(buildProvisionRequest({ ...base, linkMinutes: 1440 }).timeout_minutes, 1440);
+  assert.equal(buildProvisionRequest({ ...base, linkMinutes: "60" }).timeout_minutes, 60);
+  assert.equal("timeout_minutes" in buildProvisionRequest(base), false);
+  assert.equal("timeout_minutes" in buildProvisionRequest({ ...base, linkMinutes: 0 }), false);
+  assert.equal("timeout_minutes" in buildProvisionRequest({ ...base, linkMinutes: "soon" }), false);
+  assert.equal(DEFAULT_LINK_MINUTES, 1440);
+  assert.ok(LINK_WINDOW_OPTIONS.every((o) => o.minutes <= 1440));
+});
+
 test("buildProvisionRequest — new account carries its password, wifi and deauth", () => {
   const data = buildProvisionRequest({
     fields: {},
@@ -75,7 +88,18 @@ test("setupResultHtml renders QR, both links and validity, escaped", () => {
   assert.match(html, /Universal Link/);
   assert.match(html, /hascasa:\/\/s/);
   assert.match(html, /&quot;x/);
-  assert.match(html, /valid until 11:20 PM/);
+  assert.match(html, /Link valid until 11:20 PM/);
+});
+
+test("setupResultHtml labels link validity and session length apart", () => {
+  const html = setupResultHtml({ deep_link: "hascasa://s", expires_at: 1, session_expiration_hours: 336 }, { esc, fmtExpiry: () => "4:31 PM" });
+  assert.match(html, /Link valid until 4:31 PM/);
+  assert.match(html, /Session: 14 days after setup/);
+  const perm = setupResultHtml({ deep_link: "hascasa://s", expires_at: 0, session_expiration_hours: 0 }, { esc, fmtExpiry: () => "" });
+  assert.match(perm, /Link never expires/);
+  assert.match(perm, /Session: permanent/);
+  const none = setupResultHtml({ deep_link: "hascasa://s" }, { esc, fmtExpiry: () => "" });
+  assert.doesNotMatch(none, /Session:/);
 });
 
 test("setupResultHtml marks the QR as zoomable", () => {

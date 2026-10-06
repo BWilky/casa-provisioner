@@ -5,7 +5,8 @@
 //   Casa account; the device name is required either way.
 // ② Template — a saved template or "Configure manually". Per-device tweaks
 //   live behind "Customize for this device" (with an optional "Also save as
-//   new template"); PIN / Wi-Fi join / sign-out-others behind "Advanced".
+//   new template"); PIN / Wi-Fi join / sign-out-others behind "Advanced";
+//   "Link valid for" (default 24 h) sizes the single-use provisioning window.
 // ③ Done — QR + setup links.
 // Re-provisioning an existing device is a device action
 // (views/reprovision.js), not part of this flow.
@@ -77,6 +78,7 @@ export function createView(app) {
       saveAsTemplate: false,
       newTemplateName: "",
       savedTemplateId: null, // retry guard
+      linkMinutes: 1440, // "Link valid for" (DEFAULT_LINK_MINUTES once logicMod loads)
       wgProfiles: null,
       deployError: "",
       busy: false,
@@ -493,8 +495,23 @@ export function createView(app) {
         <div style="border-top:1px solid var(--casa-divider);">
           ${expander("toggle-advanced", state.advancedOpen, "Advanced (PIN, Wi-Fi join, sign out other devices)")}
           <div ${state.advancedOpen ? "" : "hidden"}>${advancedHtml()}</div>
-        </div>` : ""}
+        </div>
+        ${linkWindowHtml()}` : ""}
       ${footer("Generate setup", "generate")}`;
+  }
+
+  // Per-ceremony choice, not template policy: how long the QR / links can be
+  // used. Single-use either way — the first sign-in scrambles the password.
+  function linkWindowHtml() {
+    const opts = logicMod.LINK_WINDOW_OPTIONS.map(
+      (o) => `<option value="${o.minutes}"${o.minutes === state.linkMinutes ? " selected" : ""}>${esc(o.label)}</option>`
+    ).join("");
+    return `
+      <div class="field" style="border-top:1px solid var(--casa-divider); margin-top:8px; padding-top:12px;">
+        <label>Link valid for</label>
+        <select class="select" data-pv="linkMinutes">${opts}</select>
+        <div class="field__help">How long the QR code and setup links can be used. The link is single-use: it stops working as soon as the device signs in. Unredeemed links appear under Devices as "awaiting setup" until then.</div>
+      </div>`;
   }
 
   function rerenderTemplateList() {
@@ -598,6 +615,7 @@ export function createView(app) {
         customized: changed.length > 0,
         savedTemplateId: state.saveAsTemplate ? state.savedTemplateId : null,
       }),
+      linkMinutes: state.linkMinutes,
     });
     try {
       const resp = unwrap(await api.provision(data));
@@ -629,7 +647,7 @@ export function createView(app) {
       ${resultMod.setupResultHtml(r, { esc, fmtExpiry: ui.fmtExpiry })}
       <div style="display:flex; gap:8px; align-items:center; margin-top:14px; padding:10px 12px; border-radius:var(--casa-radius-sm); background:var(--casa-bg-2); font-size:13px;">
         <ha-icon icon="mdi:tag-outline" style="--mdc-icon-size:18px; flex:none; color:var(--casa-text-2);"></ha-icon>
-        <span>The device will be named <strong>${esc(trim(state.deviceName))}</strong> automatically when it connects (within 30 minutes).</span>
+        <span>The device will be named <strong>${esc(trim(state.deviceName))}</strong> automatically when it connects, as long as the link is still valid. Until then it is listed under Devices as awaiting setup, where you can show this link again, revoke it, or make a new one.</span>
       </div>
       <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px; padding-top:12px; border-top:1px solid var(--casa-divider);">
         <button class="btn btn--outlined" data-act="another">Provision another</button>
@@ -761,6 +779,9 @@ export function createView(app) {
     switch (t.dataset && t.dataset.pv) {
       case "existingUsername":
         state.existingUsername = t.value;
+        return;
+      case "linkMinutes":
+        state.linkMinutes = Number(t.value) || logicMod.DEFAULT_LINK_MINUTES;
         return;
       case "saveAsTemplate":
         state.saveAsTemplate = !!t.checked;

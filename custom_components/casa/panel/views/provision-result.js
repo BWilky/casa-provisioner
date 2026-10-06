@@ -1,7 +1,9 @@
 // Casa admin panel — shared "setup is ready" block: QR image (click to enlarge),
-// universal + deep link with Copy buttons, and the validity chip. Used by the
-// provision wizard's Done step (views/provision.js) and the re-provision result
-// modal (views/reprovision.js). Loaded lazily via app.loadModule.
+// universal + deep link with Copy buttons, and the validity chips (link
+// window vs. session length). Used by the provision wizard's Done step
+// (views/provision.js), the re-provision result modal (views/reprovision.js)
+// and the pending-link modal (views/pending-provision.js). Loaded lazily via
+// app.loadModule.
 
 function linkRow(label, value, esc) {
   return `
@@ -28,7 +30,30 @@ export function setupResultHtml(r, { esc, fmtExpiry }) {
       </div>` : ""}
     ${r.universal_link ? linkRow("Universal Link (opens from Safari / iMessage)", r.universal_link, esc) : ""}
     ${r.deep_link ? linkRow("Setup Deep Link", r.deep_link, esc) : ""}
-    ${r.expires_at ? `<div style="margin-top:6px;"><span class="chip chip--warn">valid until ${esc(fmtExpiry(r.expires_at))}</span></div>` : ""}`;
+    ${validityHtml(r, { esc, fmtExpiry })}`;
+}
+
+// Two different clocks, labelled apart: how long the link itself can be
+// used (expires_at — the provisioning window), and how long the session it
+// sets up lasts (session_expiration_hours — the template's policy).
+export function validityHtml(r, { esc, fmtExpiry }) {
+  const chips = [];
+  if (r.expires_at) chips.push(`<span class="chip chip--warn">Link valid until ${esc(fmtExpiry(r.expires_at))}</span>`);
+  else if (r.expires_at === 0) chips.push(`<span class="chip chip--warn">Link never expires</span>`);
+  const hours = Number(r.session_expiration_hours);
+  if (r.session_expiration_hours != null && Number.isFinite(hours)) {
+    chips.push(`<span class="chip chip--neutral">Session: ${hours === 0 ? "permanent" : esc(humanizeHours(hours)) + " after setup"}</span>`);
+  }
+  if (!chips.length) return "";
+  return `<div style="margin-top:6px; display:flex; gap:6px; flex-wrap:wrap;">${chips.join("")}</div>`;
+}
+
+function humanizeHours(h) {
+  if (h % 24 === 0) {
+    const d = h / 24;
+    return d === 1 ? "1 day" : `${d} days`;
+  }
+  return h === 1 ? "1 hour" : `${h} hours`;
 }
 
 export function bindCopyButtons(root, ui) {

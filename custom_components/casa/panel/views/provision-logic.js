@@ -5,6 +5,18 @@
 
 export const USERNAME_PREFIX = "casa-";
 
+// How long a setup link made in the wizard stays valid (casa.provision's
+// timeout_minutes). The server default of 5 minutes suits a QR on a shared
+// kiosk screen; a link texted to one person may sit unread for hours. 24 h is
+// the ceiling: the redemption listener that scrambles the password on first
+// use lives at most that long.
+export const LINK_WINDOW_OPTIONS = [
+  { minutes: 15, label: "15 minutes" },
+  { minutes: 60, label: "1 hour" },
+  { minutes: 1440, label: "24 hours" },
+];
+export const DEFAULT_LINK_MINUTES = 1440;
+
 // "Kitchen iPad" → "casa-kitchen-ipad"; a name with nothing slug-able
 // suggests "" so the form shows "required" rather than a bare prefix.
 export function suggestUsername(deviceName, slugify) {
@@ -42,12 +54,15 @@ export function lineageFor({ templateId, customized, savedTemplateId }) {
 
 // casa.provision service_data. A new account's generated password is sent
 // explicitly so a retry never rotates it; an existing account sends none
-// and the server rotates it. Process-only inputs ride along only when set.
-export function buildProvisionRequest({ fields, form, account, deviceName, lineage }) {
+// and the server rotates it. Process-only inputs ride along only when set;
+// linkMinutes (the admin's "Link valid for" choice) becomes timeout_minutes.
+export function buildProvisionRequest({ fields, form, account, deviceName, lineage, linkMinutes }) {
   const data = { method: "qr", ...fields, username: account.username };
   if (account.user_id) data.user_id = account.user_id;
   if (account.password) data.password = account.password;
   data.device_alias = deviceName;
+  const minutes = Number(linkMinutes);
+  if (Number.isInteger(minutes) && minutes > 0) data.timeout_minutes = minutes;
   const pin = String(form.pin ?? "").trim();
   if (pin) data.pin = pin;
   const ssid = String(form.connect_wifi_ssid ?? "").trim();
