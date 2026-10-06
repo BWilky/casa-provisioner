@@ -222,3 +222,49 @@ def test_long_lived_tasks_are_background_tasks(tmp_path):
 
     asyncio.run(scenario())
     assert hass.background == ["casa provisioning timer u1", "casa provisioning listener u1"]
+
+
+# ---- "link expired" tombstones (shown in the Devices list) ----
+
+def _expired(hass):
+    return hass.casa["stored_data"].get("expired_provisions") or {}
+
+
+def test_timer_close_without_redemption_leaves_expired_row(tmp_path):
+    past = time.time() - 10
+    hass = _hass(tmp_path, _record(scramble_at=past, listen_until=past, device_alias="Host - Christoph",
+                                   profile_name="Owners", regen={"host_url": "https://h", "username": "kitchen"}))
+
+    async def scenario():
+        await _end_provision_window(hass, "u1", "p1", "timer")
+
+    asyncio.run(scenario())
+    assert hass.casa["stored_data"]["pending_provisions"] == {}
+    row = _expired(hass)["u1"]
+    assert row["device_alias"] == "Host - Christoph"
+    assert row["profile_name"] == "Owners"
+    assert row["login_username"] == "kitchen"
+    assert row["regen"] == {"host_url": "https://h", "username": "kitchen"}
+    assert "deep_link" not in row and "universal_link" not in row
+    assert abs(row["expired_at"] - time.time()) < 5
+
+
+def test_timer_close_after_redemption_leaves_no_expired_row(tmp_path):
+    past = time.time() - 10
+    hass = _hass(tmp_path, _record(scramble_at=past, listen_until=past))
+    user = hass.auth.users["u1"]
+    user.refresh_tokens["t-phone"] = FakeToken("t-phone")  # the phone signed in during the window
+
+    asyncio.run(_end_provision_window(hass, "u1", "p1", "timer"))
+    assert hass.casa["stored_data"]["pending_provisions"] == {}
+    assert "u1" not in _expired(hass)
+    assert "t-phone" in hass.casa["stored_data"]["provision_claims"]["u1"]
+
+
+def test_revoke_leaves_no_expired_row_and_scrambles(tmp_path):
+    hass = _hass(tmp_path, _record())
+
+    asyncio.run(_end_provision_window(hass, "u1", "p1", "revoked"))
+    assert hass.casa["stored_data"]["pending_provisions"] == {}
+    assert "u1" not in _expired(hass)
+    assert hass.auth.provider.data.passwords["kitchen"] != "link-pw"

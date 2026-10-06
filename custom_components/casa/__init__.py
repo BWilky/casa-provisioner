@@ -833,20 +833,63 @@ async def _apply_device_replacement(hass, new_device_id: str, new_info: dict, re
     return old_device_id
 
 
+# Grace after a provisioning window closes during which the redeeming device's
+# first register/heartbeat may still claim the stashed profile (login → the
+# app's first server contact).
+_PENDING_PROFILE_GRACE_SECONDS = 1800
+
+
+def _pending_profile_valid_until(now: float, *, scramble_at, window_ends_at, listen_until) -> float:
+    """How long the wizard's stashed name/template stays claimable: until the
+    link itself dies (scramble, else the listener deadline) plus a grace, or
+    a fixed grace when nothing ever closes the window."""
+    end = scramble_at or listen_until or window_ends_at or now
+    return float(end) + _PENDING_PROFILE_GRACE_SECONDS
+
+
+def _stash_pending_profile(hass, user_id: str, *, profile_id, profile_name, device_alias, expiration_hours, valid_until) -> None:
+    """Persist what a provision should stamp on the device that redeems it
+    (template lineage, session length, the typed name). Keyed by HA user id —
+    the one thing provision time and registration time share. Stored, so it
+    survives a restart within a long link window."""
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    stored_data.setdefault("pending_profiles", {})[user_id] = {
+        "profile_id": profile_id or None,
+        "profile_name": profile_name or None,
+        "device_alias": (str(device_alias or "").strip()[:DEVICE_ALIAS_MAX_LEN] or None),
+        "expiration_hours": expiration_hours,
+        "set_at": time.time(),
+        "valid_until": float(valid_until),
+    }
+    _save_stored_data(hass)
+
+
+def _clear_expired_provision(hass, user_id: str) -> None:
+    """Drop the 'link expired' tombstone for user_id (a new link was made, the
+    device showed up, or the admin dismissed it)."""
+    stored_data = (hass.data.get(DOMAIN) or {}).get("stored_data") or {}
+    if (stored_data.get("expired_provisions") or {}).pop(user_id, None) is not None:
+        _save_stored_data(hass)
+
+
 async def _apply_pending_provision(hass, user_id: str, device_info: dict, refresh_token_id: str | None) -> bool:
     """Apply what _provision_internal stashed for user_id (template lineage,
     session length, the name typed in the wizard) to this device record —
     on whichever of register/heartbeat arrives first, and only from the
     session that redeemed the window (on a shared account another device's
-    contact must not take it). Entries older than 30 min are dropped.
-    Returns True when it consumed the entry (a fresh provision)."""
-    pending_by_user = hass.data[DOMAIN].setdefault("pending_profile_by_user", {})
+    contact must not take it). Entries past their valid_until (the link's
+    life + a grace) are dropped. Returns True when it consumed the entry."""
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    pending_by_user = stored_data.setdefault("pending_profiles", {})
     pending = pending_by_user.get(user_id)
     if not pending or not await _has_fresh_claim(hass, user_id, refresh_token_id):
         return False
     pending_by_user.pop(user_id, None)
-    if time.time() - pending.get("set_at", 0) > 1800:
+    _save_stored_data(hass)
+    valid_until = pending.get("valid_until") or (pending.get("set_at", 0) + _PENDING_PROFILE_GRACE_SECONDS)
+    if time.time() > valid_until:
         return False
+    _clear_expired_provision(hass, user_id)
     device_info["provisioning_profile_id"] = pending.get("profile_id")
     device_info["provisioning_profile_name"] = pending.get("profile_name")
     if "expiration_hours" in pending:
@@ -871,6 +914,7 @@ async def _end_provision_window(hass, user_id: str, provision_id: str, reason: s
     login_username = rec.get("login_username")
     user = await hass.auth.async_get_user(user_id)
     provider = next((p for p in hass.auth.auth_providers if p.type == "homeassistant"), None)
+    redeemed = False
     if user is None or provider is None:
         _LOGGER.info("CASA: Provisioning window for '%s' closed (%s); user no longer exists.", login_username, reason)
     else:
@@ -879,8 +923,10 @@ async def _end_provision_window(hass, user_id: str, provision_id: str, reason: s
                 return
             # Sessions born during the window (also catches a redemption
             # the listener missed, e.g. across a restart).
+            new_tokens = set(user.refresh_tokens.keys()) - set(rec.get("known_token_ids") or [])
+            redeemed = bool(new_tokens)
             _record_provision_claims(
-                hass, user_id, set(user.refresh_tokens.keys()) - set(rec.get("known_token_ids") or []),
+                hass, user_id, new_tokens,
                 replaces_device_id=rec.get("replaces_device_id"),
             )
             try:
@@ -892,7 +938,24 @@ async def _end_provision_window(hass, user_id: str, provision_id: str, reason: s
         return
     await _retire_provision_qr(hass, rec)
     if _pending_provision(hass, user_id, provision_id) is not None:
-        hass.data[DOMAIN]["stored_data"]["pending_provisions"].pop(user_id, None)
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        stored_data["pending_provisions"].pop(user_id, None)
+        if reason == "timer" and not redeemed and user is not None:
+            # Ran out unredeemed: leave a "link expired" row the admin can
+            # regenerate or dismiss from the Devices list. No links — they
+            # are dead and embedded the temporary password.
+            stored_data.setdefault("expired_provisions", {})[user_id] = {
+                "provision_id": provision_id,
+                "login_username": login_username,
+                "method": rec.get("method"),
+                "device_alias": rec.get("device_alias"),
+                "profile_name": rec.get("profile_name"),
+                "created_at": rec.get("created_at"),
+                "expired_at": time.time(),
+                "regen": rec.get("regen"),
+                "host_url": rec.get("host_url"),
+                "replaces_device_id": rec.get("replaces_device_id"),
+            }
         _save_stored_data(hass)
     _cancel_provision_tasks(hass, user_id)
 
@@ -4759,20 +4822,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("CASA ERROR: Attempted to provision an admin user '%s'. Blocked.", target_username)
             return {"error": "Cannot provision an admin user"}
 
-        # Bridge for the device-editor's "Originally provisioned from" display.
-        # The device_id doesn't exist yet at provision time (see
-        # async_register_device below) — stash which profile (if any) was
-        # used, keyed by the one thing both moments share: the HA user_id.
-        # In-memory only; self-heals on the next provision if lost to a
-        # reload.
-        hass.data[DOMAIN].setdefault("pending_profile_by_user", {})[target_user.id] = {
-            "profile_id": profile_key or None,
-            "profile_name": matched_profile.get("name") if matched_profile else None,
-            "device_alias": str(service_data.get("device_alias", "")).strip()[:DEVICE_ALIAS_MAX_LEN] or None,
-            "expiration_hours": expiration_hours,
-            "set_at": time.time(),
-        }
-
         login_username = None
         for cred in target_user.credentials:
             if cred.auth_provider_type == "homeassistant":
@@ -5020,21 +5069,56 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # When this user last had a window opened: a session created at or
         # after it (and still young) may take over its device record.
         stored_data.setdefault("provision_opened", {})[target_user.id] = now_ts
+        scramble_at = now_ts + scramble_timeout_secs if password_scramble else None
+        window_ends_at = now_ts + timeout_secs if (method == "qr" and timeout_secs > 0) else None
+        listen_until = now_ts + listener_ttl
+        device_alias = str(service_data.get("device_alias", "") or "").strip()[:DEVICE_ALIAS_MAX_LEN] or None
+        # What "Regenerate link" re-sends for this account: the request as
+        # made, minus the account password (the server rotates it anyway).
+        regen = {k: v for k, v in dict(service_data).items() if k != "password"}
         pending_provisions[target_user.id] = {
             "provision_id": provision_id,
             "login_username": login_username,
             "method": method,
             "single_use": single_use,
-            "scramble_at": now_ts + scramble_timeout_secs if password_scramble else None,
-            "window_ends_at": now_ts + timeout_secs if (method == "qr" and timeout_secs > 0) else None,
-            "listen_until": now_ts + listener_ttl,
+            "scramble_at": scramble_at,
+            "window_ends_at": window_ends_at,
+            "listen_until": listen_until,
             "known_token_ids": sorted(target_user.refresh_tokens.keys()),
             "qr_file": qr_file,
             "qr_expire_mode": qr_expire_mode,
             "created_at": now_ts,
             "replaces_device_id": replaces_device_id or None,
+            # Shown again from the Devices list while the link is live. The
+            # links embed the (encrypted) temporary password, so they go when
+            # the window closes and never into the expired tombstone.
+            "deep_link": deep_link,
+            "universal_link": universal_link,
+            "expires_at": expiration_unix,
+            "device_alias": device_alias,
+            "profile_id": profile_key or None,
+            "profile_name": matched_profile.get("name") if matched_profile else None,
+            "expiration_hours": expiration_hours,
+            "host_url": final_server_url,
+            "regen": regen,
         }
+        # A fresh link supersedes any "link expired" row for this account.
+        (stored_data.get("expired_provisions") or {}).pop(target_user.id, None)
         _save_stored_data(hass)
+        # Bridge for the device record that redeems this link: template
+        # lineage, session length and the typed name. The device_id doesn't
+        # exist yet (see async_register_device) — keyed by the HA user_id, the
+        # one thing both moments share, and valid for the life of the link.
+        _stash_pending_profile(
+            hass, target_user.id,
+            profile_id=profile_key or None,
+            profile_name=matched_profile.get("name") if matched_profile else None,
+            device_alias=device_alias,
+            expiration_hours=expiration_hours,
+            valid_until=_pending_profile_valid_until(
+                now_ts, scramble_at=scramble_at, window_ends_at=window_ends_at, listen_until=listen_until,
+            ),
+        )
         _arm_pending_provision(hass, target_user.id)
 
         if method == "manual":
@@ -5044,6 +5128,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "method": "manual",
                 "provision_id": provision_id,
                 "expires_at": expiration_unix,
+                "session_expiration_hours": expiration_hours,
                 "fields": {
                     "server_url": final_server_url,
                     "username": login_username,
@@ -5079,6 +5164,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "url_path_deprecated": True,
                 "qr_data_uri": qr_data_uri,
                 "expires_at": expiration_unix,
+                "session_expiration_hours": expiration_hours,
                 "deep_link": deep_link,
                 "universal_link": universal_link
             }
@@ -5092,7 +5178,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "provision_id": provision_id,
                 "deep_link": deep_link,
                 "universal_link": universal_link,
-                "expires_at": expiration_unix
+                "expires_at": expiration_unix,
+                "session_expiration_hours": expiration_hours,
             }
             if esphome_targets:
                 result["successful_targets"] = successful_targets
@@ -5105,6 +5192,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "status": "success",
                 "successful_targets": successful_targets,
                 "expires_at": expiration_unix,
+                "session_expiration_hours": expiration_hours,
                 "pin_required": bool(target_pin)
             }
 

@@ -8,11 +8,15 @@ from tests.fakes import FakeHass, make_user
 def _hass():
     hass = FakeHass()
     hass.auth.add_user(make_user("u1", login="casa-bryce-mobile", tokens=["t-new", "t-other"]))
-    hass.casa["pending_profile_by_user"] = {"u1": {
+    hass.casa["stored_data"]["pending_profiles"] = {"u1": {
         "profile_id": "t1", "profile_name": "Mobile Owners", "device_alias": "Bryce Mobile",
-        "expiration_hours": 0, "set_at": time.time(),
+        "expiration_hours": 0, "set_at": time.time(), "valid_until": time.time() + 1800,
     }}
     return hass
+
+
+def _pending(hass):
+    return hass.casa["stored_data"]["pending_profiles"]
 
 
 def test_redeeming_session_applies_name_lineage_expiration():
@@ -24,7 +28,7 @@ def test_redeeming_session_applies_name_lineage_expiration():
     assert info["provisioning_profile_id"] == "t1"
     assert info["provisioning_profile_name"] == "Mobile Owners"
     assert info["provisioning_expiration_hours"] == 0
-    assert "u1" not in hass.casa["pending_profile_by_user"]
+    assert "u1" not in _pending(hass)
 
 
 def test_second_contact_is_a_noop():
@@ -45,7 +49,7 @@ def test_other_device_on_shared_account_does_not_consume():
     hass.casa["stored_data"]["provision_opened"] = {"u1": time.time() + 60}
     assert asyncio.run(_apply_pending_provision(hass, "u1", other, "t-other")) is False
     assert other == {}
-    assert "u1" in hass.casa["pending_profile_by_user"]
+    assert "u1" in _pending(hass)
 
 
 def test_existing_alias_is_not_overwritten():
@@ -58,7 +62,7 @@ def test_existing_alias_is_not_overwritten():
 
 def test_stale_pending_is_dropped_without_applying():
     hass = _hass()
-    hass.casa["pending_profile_by_user"]["u1"]["set_at"] = time.time() - 3600
+    _pending(hass)["u1"]["valid_until"] = time.time() - 1
     _record_provision_claims(hass, "u1", {"t-new"})
     info = {}
     assert asyncio.run(_apply_pending_provision(hass, "u1", info, "t-new")) is False
@@ -74,7 +78,7 @@ def test_stamps_entity_rename_window_only_with_alias():
     assert abs(info["entity_rename_until"] - (time.time() + ENTITY_RENAME_WINDOW_SECONDS)) < 5
 
     hass = _hass()
-    hass.casa["pending_profile_by_user"]["u1"].pop("device_alias")
+    _pending(hass)["u1"].pop("device_alias")
     _record_provision_claims(hass, "u1", {"t-new"})
     info = {}
     assert asyncio.run(_apply_pending_provision(hass, "u1", info, "t-new")) is True
