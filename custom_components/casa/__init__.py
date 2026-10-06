@@ -872,6 +872,62 @@ def _clear_expired_provision(hass, user_id: str) -> None:
         _save_stored_data(hass)
 
 
+# "Link expired" rows are kept this long for the admin to regenerate/dismiss.
+_EXPIRED_PROVISION_TTL_SECONDS = 7 * 86400
+
+
+def _pending_provision_rows(stored_data: dict, now: float) -> list:
+    """Slim, link-free rows for the Devices list: every open provisioning
+    window ("awaiting") and every expired-unredeemed tombstone ("expired"),
+    skipping accounts the integration has since deleted. Tombstones past
+    their TTL are dropped in place (caller saves)."""
+    users = stored_data.get("users") or {}
+
+    def _deleted(uid):
+        u = users.get(uid)
+        return bool(u and u.get("deleted", False))
+
+    rows = []
+    for uid, rec in (stored_data.get("pending_provisions") or {}).items():
+        if not isinstance(rec, dict) or _deleted(uid):
+            continue
+        expires_at = rec.get("expires_at")
+        if expires_at is None:  # record from before links were kept
+            expires_at = int(rec["scramble_at"]) if rec.get("scramble_at") else 0
+        rows.append({
+            "user_id": uid,
+            "username": rec.get("login_username"),
+            "name": rec.get("device_alias"),
+            "profile_name": rec.get("profile_name"),
+            "method": rec.get("method"),
+            "created_at": rec.get("created_at"),
+            "expires_at": expires_at,
+            "state": "awaiting",
+            "has_links": bool(rec.get("deep_link") or rec.get("universal_link")),
+            "replaces_device_id": rec.get("replaces_device_id"),
+        })
+    expired = stored_data.get("expired_provisions") or {}
+    for uid in [u for u, t in expired.items() if now - (t.get("expired_at") or 0) > _EXPIRED_PROVISION_TTL_SECONDS]:
+        expired.pop(uid, None)
+    for uid, rec in expired.items():
+        if _deleted(uid) or uid in (stored_data.get("pending_provisions") or {}):
+            continue
+        rows.append({
+            "user_id": uid,
+            "username": rec.get("login_username"),
+            "name": rec.get("device_alias"),
+            "profile_name": rec.get("profile_name"),
+            "method": rec.get("method"),
+            "created_at": rec.get("created_at"),
+            "expires_at": None,
+            "expired_at": rec.get("expired_at"),
+            "state": "expired",
+            "has_links": False,
+            "replaces_device_id": rec.get("replaces_device_id"),
+        })
+    return rows
+
+
 async def _apply_pending_provision(hass, user_id: str, device_info: dict, refresh_token_id: str | None) -> bool:
     """Apply what _provision_internal stashed for user_id (template lineage,
     session length, the name typed in the wizard) to this device record —
@@ -2167,6 +2223,11 @@ class CasaAdminSummaryView(HomeAssistantView):
                 "device_count": len(udata.get("devices", {})),
             })
 
+        expired_before = len(stored_data.get("expired_provisions") or {})
+        pending_rows = _pending_provision_rows(stored_data, time.time())
+        if len(stored_data.get("expired_provisions") or {}) != expired_before:
+            _save_stored_data(self.hass)  # pruned old tombstones
+
         device_key = stored_data.get("device_key")
         from .const import CASA_VERSION
         return self.json({
@@ -2185,9 +2246,11 @@ class CasaAdminSummaryView(HomeAssistantView):
                 "orphaned": sum(1 for d in devices if d["orphaned"]),
                 "stale": sum(1 for d in devices if d["stale"]),
                 "pending_updates": sum(d.get("pending_updates", 0) for d in devices),
+                "awaiting_setup": sum(1 for r in pending_rows if r["state"] == "awaiting"),
             },
             "devices": devices,
             "accounts": accounts,
+            "pending_provisions": pending_rows,
         })
 
 
@@ -3930,6 +3993,128 @@ class CasaAdminReprovisionDeviceView(HomeAssistantView):
         return self.json({**result, "method": "qr"})
 
 
+class CasaAdminPendingProvisionView(HomeAssistantView):
+    """Admin-only access to one account's unredeemed provisioning link.
+
+    GET ?user_id=   the open window's QR (rendered on demand) and links, so
+                    the Devices list can show a link again after the wizard
+                    was closed. 404 once it is redeemed, revoked or expired.
+    POST {user_id, action}:
+      revoke      close the window now (password scrambled → the link dies).
+      dismiss     drop a "link expired" row.
+      regenerate  make a fresh link for the same account from the request the
+                  window (or its expired tombstone) was made with; the server
+                  rotates the password. Returns the provision result.
+    """
+
+    url = "/api/casa/admin/pending_provision"
+    name = "api:casa:admin:pending_provision"
+
+    def __init__(self, hass: HomeAssistant, provision_func):
+        self.hass = hass
+        self.provision_func = provision_func
+
+    async def get(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+        user_id = str(request.query.get("user_id", "") or "").strip()
+        if not user_id:
+            return self.json({"error": "user_id is required"}, status_code=400)
+        rec = _pending_provision(self.hass, user_id)
+        if rec is None:
+            return self.json({"error": "No open provisioning link for this account"}, status_code=404)
+        deep_link = rec.get("deep_link")
+        qr_data_uri = None
+        if deep_link:
+            qr_data_uri = await self.hass.async_add_executor_job(_qr_png_data_uri, deep_link)
+        expires_at = rec.get("expires_at")
+        if expires_at is None:
+            expires_at = int(rec["scramble_at"]) if rec.get("scramble_at") else 0
+        return self.json({
+            "user_id": user_id,
+            "provision_id": rec.get("provision_id"),
+            "username": rec.get("login_username"),
+            "name": rec.get("device_alias"),
+            "profile_name": rec.get("profile_name"),
+            "method": rec.get("method"),
+            "created_at": rec.get("created_at"),
+            "expires_at": expires_at,
+            "session_expiration_hours": rec.get("expiration_hours"),
+            "deep_link": deep_link,
+            "universal_link": rec.get("universal_link"),
+            "qr_data_uri": qr_data_uri,
+            "replaces_device_id": rec.get("replaces_device_id"),
+        })
+
+    async def post(self, request):
+        user = request.get("hass_user")
+        if not user or not getattr(user, "is_admin", False):
+            return self.json_message("Admin access required", status_code=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+        user_id = str(body.get("user_id", "") or "").strip()
+        action = str(body.get("action", "") or "").strip().lower()
+        if not user_id:
+            return self.json({"error": "user_id is required"}, status_code=400)
+        if action not in ("revoke", "dismiss", "regenerate"):
+            return self.json({"error": "action must be 'revoke', 'dismiss' or 'regenerate'"}, status_code=400)
+
+        hass = self.hass
+        stored_data = hass.data[DOMAIN]["stored_data"]
+        rec = _pending_provision(hass, user_id)
+        expired = (stored_data.get("expired_provisions") or {}).get(user_id)
+
+        if action == "revoke":
+            if rec is None:
+                return self.json({"error": "No open provisioning link for this account"}, status_code=404)
+            await _end_provision_window(hass, user_id, rec.get("provision_id"), "revoked")
+            _clear_expired_provision(hass, user_id)
+            return self.json({"status": "revoked", "user_id": user_id})
+
+        if action == "dismiss":
+            if expired is None:
+                return self.json({"error": "No expired link for this account"}, status_code=404)
+            _clear_expired_provision(hass, user_id)
+            return self.json({"status": "dismissed", "user_id": user_id})
+
+        source = rec or expired
+        if source is None:
+            return self.json({"error": "Nothing to regenerate for this account"}, status_code=404)
+        udata = (stored_data.get("users") or {}).get(user_id)
+        if not udata or udata.get("deleted", False):
+            return self.json({"error": "Regenerate is only available for Casa-managed accounts"}, status_code=400)
+        owner = await hass.auth.async_get_user(user_id)
+        if not owner or getattr(owner, "is_admin", False):
+            return self.json({"error": "Cannot provision an admin account"}, status_code=400)
+        if not getattr(owner, "is_active", True):
+            return self.json({"error": "Target user is inactive"}, status_code=400)
+
+        service_data = dict(source.get("regen") or {})
+        service_data.pop("password", None)
+        service_data.setdefault("method", source.get("method") or "qr")
+        if not str(service_data.get("host_url") or "").strip():
+            host_url = str(body.get("host_url", "") or source.get("host_url") or "").strip()
+            if host_url:
+                service_data["host_url"] = host_url
+        service_data["user_id"] = user_id
+        service_data["username"] = source.get("login_username") or service_data.get("username") or ""
+        if source.get("device_alias") and not service_data.get("device_alias"):
+            service_data["device_alias"] = source["device_alias"]
+        try:
+            result = await self.provision_func(service_data, replaces_device_id=source.get("replaces_device_id"))
+        except Exception as err:
+            return self.json({"error": str(err) or "Provisioning failed"}, status_code=400)
+        if not isinstance(result, dict) or result.get("error"):
+            return self.json({"error": (result or {}).get("error") or "Provisioning failed"}, status_code=400)
+        _clear_expired_provision(hass, user_id)
+        result = dict(result)
+        result.pop("password", None)
+        return self.json(result)
+
+
 class CasaAdminRegenerateKeyView(HomeAssistantView):
     """Admin-only, non-destructive rotation of the site device_key.
 
@@ -4522,6 +4707,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(CasaAdminQueueUpdateView(hass))
         hass.http.register_view(CasaAdminReauthDeviceView(hass))
         hass.http.register_view(CasaAdminReprovisionDeviceView(hass, _entry_func(hass, "provision_func")))
+        hass.http.register_view(CasaAdminPendingProvisionView(hass, _entry_func(hass, "provision_func")))
         hass.http.register_view(CasaAdminRegenerateKeyView(hass))
         hass.data[_VIEWS_REGISTERED_KEY] = True
 
@@ -5523,6 +5709,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Perform deletion
         await hass.auth.async_remove_user(target_user)
         _LOGGER.info("CASA: Local user '%s' (ID: %s) removed.", target_username, user_id)
+
+        # Any open provisioning link, stashed profile or "link expired" row
+        # for this account is meaningless now.
+        _cancel_provision_tasks(hass, user_id)
+        gone_window = stored_data.get("pending_provisions", {}).pop(user_id, None)
+        if gone_window:
+            await _retire_provision_qr(hass, gone_window)
+        stored_data.get("pending_profiles", {}).pop(user_id, None)
+        stored_data.get("expired_provisions", {}).pop(user_id, None)
 
         # Remove from Home Assistant Device Registry
         from homeassistant.helpers import device_registry as dr
