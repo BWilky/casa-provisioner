@@ -80,6 +80,8 @@ When `password_scramble` is on, the login password in a link is scrambled on fir
 
 Listener TTL: while single use is armed, the listener runs for the scramble window plus 30 s (`password_scramble_in`, or the scanning window when that is 0), capped at 24 h. It polls every 2 s for the first 30 minutes, then every 10 s. Without single use the listener keeps its 30-minute cap.
 
+(26.10.06) The window also keeps the deep/universal links, the link expiry (`expires_at`), the device name and template, and a password-less copy of the request, so the admin panel can list an unredeemed link under Devices ("awaiting setup"), show its QR again, revoke it (close the window now) or regenerate it (a fresh window for the same account, same request; the server rotates the password). The links are dropped with the window. A window that runs out unredeemed leaves a link-free "expired" record for 7 days (regenerate / dismiss); a redeemed or revoked one does not. The name and template stashed for the device that redeems the link are now persisted too and stay claimable until the link dies plus 30 min (previously an in-memory entry that forgot after 30 min). Results carry `session_expiration_hours` next to `expires_at` so clients can label the link window and the session length apart.
+
 BLE is excluded: for `method: ble` the password is not scrambled on redemption (a scrambled password would strand the beacon still broadcasting it); the timer alone scrambles it. With `password_scramble` off, the link stays multi-use until its window ends.
 
 ## 7. QR delivery (26.09.30)

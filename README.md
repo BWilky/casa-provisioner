@@ -50,7 +50,7 @@ Generates an encrypted provisioning payload. Supports four methods: `qr`, `ble`,
 | `host_url` | ✅ | — | HA URL the device connects to (e.g., `http://192.168.1.100:8123`) |
 | `username` | ✅ | — | Target HA guest user account (matched by display name or login username) |
 | `password` | | auto-generated | Specific password (otherwise random 12-char) |
-| `device_alias` | | — | Alias auto-applied when the device first registers (within 30 min); never overwrites an existing alias |
+| `device_alias` | | — | Alias auto-applied when the device first registers (for as long as the setup link is valid, plus 30 min); never overwrites an existing alias |
 | `pin` | | — | Max 6-digit PIN required before provisioning completes |
 
 **App UI**
@@ -86,7 +86,7 @@ Generates an encrypted provisioning payload. Supports four methods: `qr`, `ble`,
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `timeout_minutes` | `5` | QR/BLE scanning window in minutes. `0` = permanent |
+| `timeout_minutes` | `5` | How long the QR / setup link can be used, in minutes. `0` = permanent. The service default suits a QR on a shared screen; the admin panel's wizard sends its own "Link valid for" choice (15 min / 1 h / 24 h, default 24 h) |
 | `expiration_hours` | `336` | App session duration in hours (14 days). `0` = permanent |
 | `password_scramble` | `true` | Scramble the user's password on first redemption (the link works once), with the `password_scramble_in` timer as the fallback for links nobody uses. BLE beacons scramble on the timer only |
 | `password_scramble_in` | `0` | Minutes until scramble. `0` = inherit from timeout |
@@ -305,7 +305,7 @@ These are called by the Casa iOS app directly (authenticated via HA long-lived o
 | `POST` | `/api/casa/location_report` | Encrypted location-state report; unauthenticated at the HTTP layer, body encrypted with the device key |
 | `POST` | `/api/casa/deprovision` | Device removes its own record and session (`{device_id}`) |
 
-Admin-only endpoints (used by the panel): `/api/casa/admin/summary`, `/api/casa/admin/device` (alias + `expires_at_override`), `/api/casa/admin/wireguard_profiles`, `/api/casa/admin/provision_profiles`, `/api/casa/admin/queue_update`, `/api/casa/admin/regenerate_device_key`, `/api/casa/admin/location_zones`, `/api/casa/admin/settings`, `/api/casa/admin/sessions`, `/api/casa/admin/check_username`, `/api/casa/admin/reauth_device`, `/api/casa/admin/reprovision_device` (one-click re-provision of a device on its current account: over push when the device is push-registered, else a fresh QR).
+Admin-only endpoints (used by the panel): `/api/casa/admin/summary`, `/api/casa/admin/device` (alias + `expires_at_override`), `/api/casa/admin/wireguard_profiles`, `/api/casa/admin/provision_profiles`, `/api/casa/admin/queue_update`, `/api/casa/admin/regenerate_device_key`, `/api/casa/admin/location_zones`, `/api/casa/admin/settings`, `/api/casa/admin/sessions`, `/api/casa/admin/check_username`, `/api/casa/admin/reauth_device`, `/api/casa/admin/reprovision_device` (one-click re-provision of a device on its current account: over push when the device is push-registered, else a fresh QR), `/api/casa/admin/pending_provision` (an account's unredeemed setup link: `GET ?user_id=` returns the links and a freshly rendered QR; `POST {user_id, action}` with `revoke`, `regenerate` or `dismiss`). The summary lists unredeemed links as `pending_provisions` (state `awaiting`, or `expired` for a link that ran out unused — kept 7 days), without the links themselves.
 
 **Protocol:** see [`docs/provisioning-protocol.md`](docs/provisioning-protocol.md).
 

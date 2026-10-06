@@ -268,6 +268,30 @@ export class CasaApi {
     return this._hass.callApi("POST", "casa/admin/reprovision_device", body);
   }
 
+  // An account's unredeemed setup link (Devices list "awaiting setup" rows):
+  // GET renders the QR on demand; POST action = "revoke" | "dismiss" |
+  // "regenerate" (see CasaAdminPendingProvisionView).
+  getPendingProvision(userId) {
+    return this._hass.callApi("GET", `casa/admin/pending_provision?user_id=${encodeURIComponent(userId)}`);
+  }
+  async pendingProvisionAction(userId, action, extra = {}) {
+    const res = await this._hass.callApi("POST", "casa/admin/pending_provision", { user_id: userId, action, ...extra });
+    if (action !== "regenerate") this._dropPendingLocal(userId);
+    return res;
+  }
+  _dropPendingLocal(userId) {
+    const s = this.summary;
+    if (!s || !Array.isArray(s.pending_provisions)) return;
+    const before = s.pending_provisions.length;
+    s.pending_provisions = s.pending_provisions.filter((p) => p.user_id !== userId);
+    if (s.pending_provisions.length !== before) {
+      if (s.stats && typeof s.stats.awaiting_setup === "number") {
+        s.stats.awaiting_setup = s.pending_provisions.filter((p) => p.state === "awaiting").length;
+      }
+      this._notify();
+    }
+  }
+
   deleteQueuedUpdate(deviceId, updateId) {
     return this._hass.callApi(
       "DELETE",

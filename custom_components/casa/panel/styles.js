@@ -124,6 +124,7 @@ const CSS = `
 .status-dot--online { background: var(--casa-success); }
 .status-dot--offline { background: var(--casa-error); }
 .status-dot--warn { background: var(--casa-warning); }
+.status-dot--pending { background: var(--casa-primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--casa-primary) 25%, transparent); }
 
 /* ---------- Buttons ---------- */
 .btn {

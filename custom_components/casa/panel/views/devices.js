@@ -2,6 +2,12 @@
 // with search, sort, filters, column picker, pagination, multi-select bulk
 // actions, and a per-device kebab menu. Everything arrives via the `app`
 // context (no static sibling imports).
+//
+// Besides registered devices the list shows the accounts whose setup link is
+// still unredeemed ("awaiting setup") or ran out unused ("link expired") —
+// summary.pending_provisions, one per account, with a synthetic
+// device_id "pending:<user_id>" so the row plumbing is shared. They can't be
+// selected for bulk actions; their actions live in views/pending-provision.js.
 
 const ONLINE_WINDOW_MS = 11 * 60 * 1000;
 const PAGE_SIZES = [10, 25, 50, 100];
@@ -46,12 +52,26 @@ export function createView(app) {
   /* ---------- pure helpers ---------- */
 
   const devices = () => (app.summary() && app.summary().devices) || [];
-  const byId = (id) => devices().find((d) => d.device_id === id);
-  const deviceName = (d) => d.alias || d.device_id;
+  const pendingRows = () =>
+    ((app.summary() && app.summary().pending_provisions) || []).map((p) => ({
+      ...p,
+      pending: true,
+      device_id: "pending:" + p.user_id,
+      native: false,
+      alias: p.name || "",
+    }));
+  const allRows = () => [...devices(), ...pendingRows()];
+  const byId = (id) => allRows().find((d) => d.device_id === id);
+  const deviceName = (d) => (d.pending ? d.name || d.username || "Pending setup" : d.alias || d.device_id);
   const shortId = (d) => String(d.device_id || "").slice(0, 8);
   const effExpiry = (d) => (d.expires_at_override != null ? d.expires_at_override : d.expires_at);
 
   function statusInfo(d) {
+    if (d.pending) {
+      return d.state === "expired"
+        ? { cls: "status-dot--offline", label: "Link expired" }
+        : { cls: "status-dot--pending", label: "Awaiting setup" };
+    }
     if (d.orphaned) return { cls: "status-dot--warn", label: "Orphaned" };
     const t = Date.parse(d.last_seen || "");
     const online = !isNaN(t) && Date.now() - t < ONLINE_WINDOW_MS;
@@ -60,6 +80,7 @@ export function createView(app) {
       : { cls: "status-dot--offline", label: "Offline" };
   }
   function statusRank(d) {
+    if (d.pending) return d.state === "expired" ? 2.5 : -1;
     if (d.orphaned) return 2;
     if (d.stale) return 1;
     return statusInfo(d).label === "Online" ? 0 : 3;
@@ -100,7 +121,7 @@ export function createView(app) {
     const q = search.trim().toLowerCase();
     return list.filter((d) => {
       if (q) {
-        const hay = [d.alias, d.device_id, d.username, d.ip, d.app_version]
+        const hay = [d.alias, d.name, d.device_id, d.username, d.ip, d.app_version]
           .map((v) => String(v || "").toLowerCase())
           .join(" ");
         if (!hay.includes(q)) return false;
@@ -108,7 +129,10 @@ export function createView(app) {
       if (filters.status.length) {
         const label = statusInfo(d).label.toLowerCase();
         const hit = filters.status.some((s) =>
-          s === "stale" ? !!d.stale : s === "orphaned" ? !!d.orphaned || label === "orphaned" : label === s
+          s === "awaiting" ? !!d.pending
+            : s === "stale" ? !!d.stale
+            : s === "orphaned" ? !!d.orphaned || label === "orphaned"
+            : label === s
         );
         if (!hit) return false;
       }
@@ -123,6 +147,15 @@ export function createView(app) {
   /* ---------- render: fragments ---------- */
 
   function nameHtml(d) {
+    if (d.pending) {
+      const name = d.name
+        ? `<strong>${ui.esc(d.name)}</strong>`
+        : `<span class="muted">Unnamed device</span>`;
+      const badge = d.state === "expired"
+        ? `<span class="badge badge--orphan" title="The setup link ran out before the device signed in">link expired</span>`
+        : `<span class="badge badge--pending" title="Setup link made${d.profile_name ? ` from template '${ui.esc(d.profile_name)}'` : ""}; waiting for the device to sign in">awaiting setup</span>`;
+      return `${name} ${badge}`;
+    }
     const name = d.alias
       ? `<strong>${ui.esc(d.alias)}</strong>`
       : `<span class="mono">${ui.esc(shortId(d))}…</span>`;
@@ -150,6 +183,13 @@ export function createView(app) {
   }
 
   function expiresHtml(d) {
+    if (d.pending) {
+      if (d.state === "expired") {
+        const when = d.expired_at ? new Date(Number(d.expired_at) * 1000).toISOString() : "";
+        return `<span style="color:var(--casa-error);" title="Link expired">Link expired ${ui.esc(when ? ui.relTime(when) : "")}</span>`;
+      }
+      return `<span title="Link valid until">${ui.esc(ui.fmtExpiry(d.expires_at))} <span class="muted">(link)</span></span>`;
+    }
     const eff = effExpiry(d);
     const n = Number(eff) || 0;
     const past = n && n * 1000 < Date.now();
@@ -161,9 +201,11 @@ export function createView(app) {
     return `${ui.esc(d.username || "—")}${d.native ? ' <span class="chip chip--neutral">native</span>' : ""}`;
   }
   function appHtml(d) {
+    if (d.pending) return "—";
     return d.app_version ? `<span class="chip chip--app">${ui.esc(d.app_version)}</span>` : "—";
   }
   function zoneHtml(d) {
+    if (d.pending) return "—";
     const state = d.location_state;
     if (state && state.includes(": ")) return `<span class="chip chip--ok">${ui.esc(state)}</span>`;
     if (state === "away") return `<span class="chip chip--neutral">Away</span>`;
@@ -172,7 +214,8 @@ export function createView(app) {
   }
   function dotHtml(d) {
     const s = statusInfo(d);
-    return `<span class="status-dot ${s.cls}" title="${ui.esc(ui.fmtTime(d.last_seen))}"></span>`;
+    const title = d.pending ? s.label : ui.fmtTime(d.last_seen);
+    return `<span class="status-dot ${s.cls}" title="${ui.esc(title)}"></span>`;
   }
 
   function cellHtml(d, key) {
@@ -192,7 +235,7 @@ export function createView(app) {
       case "expires":
         return `<td>${expiresHtml(d)}</td>`;
       case "last_seen":
-        return `<td>${ui.esc(ui.relTime(d.last_seen))}</td>`;
+        return `<td>${d.pending ? "—" : ui.esc(ui.relTime(d.last_seen))}</td>`;
       default:
         return "<td></td>";
     }
@@ -200,7 +243,8 @@ export function createView(app) {
 
   function renderTable(rows) {
     const cols = COLUMNS.filter((c) => c.always || columns.has(c.key));
-    const allChecked = rows.length > 0 && rows.every((r) => selected.has(r.device_id));
+    const selectable = rows.filter((r) => !r.pending);
+    const allChecked = selectable.length > 0 && selectable.every((r) => selected.has(r.device_id));
     const ths = cols
       .map((c) => {
         const arrow =
@@ -214,10 +258,14 @@ export function createView(app) {
       .map((d) => {
         const id = ui.esc(d.device_id);
         return `<tr data-id="${id}">
-          ${selectMode ? `<td class="col-check"><input type="checkbox" data-act="check"${selected.has(d.device_id) ? " checked" : ""}></td>` : ""}
+          ${selectMode ? `<td class="col-check">${d.pending ? "" : `<input type="checkbox" data-act="check"${selected.has(d.device_id) ? " checked" : ""}>`}</td>` : ""}
           ${cols.map((c) => cellHtml(d, c.key)).join("")}
           <td class="col-actions">
-            <button class="btn btn--icon" data-act="edit" title="Edit device"><ha-icon icon="mdi:pencil"></ha-icon></button>
+            ${d.pending
+              ? (d.state === "expired"
+                ? `<button class="btn btn--icon" data-act="pending-regen" title="Make a new setup link"><ha-icon icon="mdi:qrcode-plus"></ha-icon></button>`
+                : `<button class="btn btn--icon" data-act="pending-show" title="Show QR code and setup links"${d.has_links ? "" : " disabled"}><ha-icon icon="mdi:qrcode"></ha-icon></button>`)
+              : `<button class="btn btn--icon" data-act="edit" title="Edit device"><ha-icon icon="mdi:pencil"></ha-icon></button>`}
             <button class="btn btn--icon" data-act="kebab" title="More actions"><ha-icon icon="mdi:dots-vertical"></ha-icon></button>
           </td>
         </tr>`;
@@ -241,7 +289,7 @@ export function createView(app) {
         return `<div class="card card--clickable" data-id="${id}" data-act="open">
           <div class="card__body">
             <div style="display:flex; align-items:center; gap:8px; min-width:0;">
-              ${selectMode ? `<input type="checkbox" data-act="check"${selected.has(d.device_id) ? " checked" : ""}>` : ""}
+              ${selectMode && !d.pending ? `<input type="checkbox" data-act="check"${selected.has(d.device_id) ? " checked" : ""}>` : ""}
               ${dotHtml(d)}
               <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${nameHtml(d)}</span>
               <span class="spacer"></span>
@@ -272,13 +320,19 @@ export function createView(app) {
         <button class="btn btn--text" data-act="bulk-cancel">Cancel</button>
       </div>`;
     }
-    const n = filtered.length;
-    const online = filtered.filter((d) => statusInfo(d).label === "Online").length;
-    const stale = filtered.filter((d) => d.stale).length;
-    const orphaned = filtered.filter((d) => d.orphaned).length;
+    const real = filtered.filter((d) => !d.pending);
+    const n = real.length;
+    const online = real.filter((d) => statusInfo(d).label === "Online").length;
+    const stale = real.filter((d) => d.stale).length;
+    const orphaned = real.filter((d) => d.orphaned).length;
+    const awaiting = filtered.filter((d) => d.pending && d.state !== "expired").length;
+    const expired = filtered.filter((d) => d.pending && d.state === "expired").length;
+    const extra =
+      (awaiting ? ` · <span style="color:var(--casa-primary);">${awaiting} awaiting setup</span>` : "") +
+      (expired ? ` · <span style="color:var(--casa-error);">${expired} expired link${expired === 1 ? "" : "s"}</span>` : "");
     const selectBtn = n ? `<button class="btn btn--text" data-act="select-multiple">Select multiple</button>` : "";
     return `<div class="list-meta">
-      <span>${n} device${n === 1 ? "" : "s"} · ${online} online · ${stale} stale · ${orphaned} orphaned</span>
+      <span>${n} device${n === 1 ? "" : "s"} · ${online} online · ${stale} stale · ${orphaned} orphaned${extra}</span>
       ${selectBtn}
     </div>`;
   }
@@ -301,7 +355,7 @@ export function createView(app) {
     refs.err.innerHTML = api.lastError ? `<div class="errbar">${ui.esc(api.lastError)}</div>` : "";
 
     const summary = app.summary();
-    const all = devices();
+    const all = allRows();
     const filtered = sortDevices(applyFilters(all));
     const total = filtered.length;
     const pages = Math.max(1, Math.ceil(total / pageSize));
@@ -413,6 +467,38 @@ export function createView(app) {
         { icon: "mdi:delete-outline", label: "Delete record", danger: true, onSelect: () => confirmDeviceAction(d, "delete") },
         { icon: "mdi:cellphone-remove", label: "Deprovision", danger: true, onSelect: () => confirmDeviceAction(d, "deprovision") },
       ],
+    });
+  }
+
+  // Unredeemed-link rows. Actions live in views/pending-provision.js.
+  async function pendingAction(kind, p) {
+    const mod = await app.loadModule("views/pending-provision.js");
+    if (kind === "show") return mod.openPendingModal(app, p);
+    if (kind === "copy") return mod.copyUniversalLink(app, p);
+    if (kind === "regenerate") return mod.confirmRegenerate(app, p);
+    if (kind === "revoke") return mod.confirmRevoke(app, p);
+    if (kind === "dismiss") return mod.confirmDismiss(app, p);
+  }
+
+  function openPendingMenu(anchor, p) {
+    const expired = p.state === "expired";
+    const noLinks = !expired && !p.has_links;
+    const noLinksTitle = noLinks ? "This link was made before links were kept — make a new one to show it" : undefined;
+    ui.openMenu({
+      anchor,
+      items: expired
+        ? [
+            { icon: "mdi:qrcode-plus", label: "New setup link", onSelect: () => pendingAction("regenerate", p) },
+            "divider",
+            { icon: "mdi:close-circle-outline", label: "Dismiss", onSelect: () => pendingAction("dismiss", p) },
+          ]
+        : [
+            { icon: "mdi:qrcode", label: "Show QR & links", disabled: noLinks, title: noLinksTitle, onSelect: () => pendingAction("show", p) },
+            { icon: "mdi:content-copy", label: "Copy setup link", disabled: noLinks, title: noLinksTitle, onSelect: () => pendingAction("copy", p) },
+            { icon: "mdi:qrcode-plus", label: "Replace with new link", onSelect: () => pendingAction("regenerate", p) },
+            "divider",
+            { icon: "mdi:link-off", label: "Revoke link", danger: true, onSelect: () => pendingAction("revoke", p) },
+          ],
     });
   }
 
@@ -567,7 +653,7 @@ export function createView(app) {
 
   function openFiltersPopover(anchor) {
     const c = document.createElement("div");
-    const usernames = [...new Set(devices().map((d) => d.username).filter(Boolean))].sort();
+    const usernames = [...new Set(allRows().map((d) => d.username).filter(Boolean))].sort();
     const statusRow = (val, label) =>
       `<label class="toggle"><input type="checkbox" data-f-status="${val}"${filters.status.includes(val) ? " checked" : ""}> ${label}</label>`;
     c.innerHTML = `
@@ -576,6 +662,7 @@ export function createView(app) {
       ${statusRow("offline", "Offline")}
       ${statusRow("stale", "Stale")}
       ${statusRow("orphaned", "Orphaned")}
+      ${statusRow("awaiting", "Awaiting setup / expired link")}
       <div class="popover__section">User</div>
       <div style="padding:2px 14px 6px;">
         <select class="select" data-f-user>
@@ -652,11 +739,23 @@ export function createView(app) {
         break;
       case "open":
       case "edit":
-        if (id) gotoEdit(id);
+        if (d && d.pending) {
+          if (d.state === "expired") pendingAction("regenerate", d);
+          else if (d.has_links) pendingAction("show", d);
+        } else if (id) gotoEdit(id);
+        break;
+      case "pending-show":
+        e.stopPropagation();
+        if (d) pendingAction("show", d);
+        break;
+      case "pending-regen":
+        e.stopPropagation();
+        if (d) pendingAction("regenerate", d);
         break;
       case "kebab":
         e.stopPropagation();
-        if (d) openDeviceMenu(el, d);
+        if (d && d.pending) openPendingMenu(el, d);
+        else if (d) openDeviceMenu(el, d);
         break;
       case "check":
         e.stopPropagation();
@@ -668,6 +767,7 @@ export function createView(app) {
         break;
       case "check-all":
         for (const r of lastPageRows) {
+          if (r.pending) continue;
           if (el.checked) selected.add(r.device_id);
           else selected.delete(r.device_id);
         }
