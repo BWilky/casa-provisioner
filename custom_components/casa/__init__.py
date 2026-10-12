@@ -1122,6 +1122,7 @@ def _find_device_record(stored_data: dict, device_id: str):
 
 def _save_notification_actions(hass) -> None:
     data = hass.data[DOMAIN]
+    prune_pending(data["na_data"])
     data["na_store"].async_delay_save(lambda: data["na_data"], 2.0)
 
 

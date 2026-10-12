@@ -158,3 +158,19 @@ def test_parse_notify_data_without_actions_returns_none_actions():
     assert _parse_notify_data("x") == ("x", None)
     assert _parse_notify_data({"a": 1}) == ({"a": 1}, None)
     assert _parse_notify_data([1]) == ([1], None)
+
+
+# --- every write prunes expired / long-consumed records ---
+from custom_components.casa import _save_notification_actions
+from custom_components.casa.actions import create_pending
+
+
+def test_save_prunes_before_scheduling_write():
+    hass = FakeHass()
+    na = hass.casa["na_data"]
+    old = create_pending(na, device_id="D1", user_id="u1", username="a", actions=SERVICE_ACTIONS)
+    na["pending"][old]["created_at"] -= 24 * 3600 + 1
+    fresh = create_pending(na, device_id="D1", user_id="u1", username="a", actions=SERVICE_ACTIONS)
+    _save_notification_actions(hass)
+    assert set(na["pending"]) == {fresh}
+    assert hass.casa["na_store"].delayed == 1
