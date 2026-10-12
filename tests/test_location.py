@@ -147,3 +147,16 @@ def test_allowed_reasons_include_needs_always():
     # 1.8+ apps report When-In-Use-only permission as needs_always; older
     # servers would coerce it to no_fix, so it must stay accepted here.
     assert {"permission_denied", "needs_always", "no_fix", "stale"} <= ALLOWED_REASONS
+
+
+def test_report_info_strings_are_separate_channels():
+    from custom_components.casa.location import ACTION_INFO
+    blob = encrypt_report_payload(json.dumps({"a": 1}), "deadbeef" * 8, "DEV-1", info=ACTION_INFO)
+    assert decrypt_report_payload(blob, "deadbeef" * 8, "DEV-1", info=ACTION_INFO) == {"a": 1}
+    with pytest.raises(ValueError):
+        decrypt_report_payload(blob, "deadbeef" * 8, "DEV-1")  # default casa-report-v1 must not open it
+
+
+def test_action_info_constant_value():
+    from custom_components.casa.location import ACTION_INFO
+    assert ACTION_INFO == b"casa-action-v1"

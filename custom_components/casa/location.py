@@ -22,6 +22,7 @@ RESERVED_LABELS = frozenset({"away", "unknown"})
 ALLOWED_REASONS = frozenset({"permission_denied", "needs_always", "no_fix", "stale"})
 ALLOWED_REPORT_KEYS = frozenset({"state", "reason", "config_version", "ts"})
 _REPORT_INFO = b"casa-report-v1"
+ACTION_INFO = b"casa-action-v1"  # notification-action presses; distinct channel from reports
 
 
 def validate_zone_config(config: dict) -> list[str]:
@@ -114,32 +115,32 @@ def compute_config_version(anchors: list) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
 
 
-def _derive_report_key(device_key: str, device_id: str) -> bytes:
+def _derive_report_key(device_key: str, device_id: str, info: bytes = _REPORT_INFO) -> bytes:
     return HKDF(
         algorithm=hashes.SHA256(),
         length=32,
         salt=device_id.encode("utf-8"),
-        info=_REPORT_INFO,
+        info=info,
     ).derive(device_key.encode("utf-8"))
 
 
-def encrypt_report_payload(plaintext: str, device_key: str, device_id: str) -> str:
+def encrypt_report_payload(plaintext: str, device_key: str, device_id: str, info: bytes = _REPORT_INFO) -> str:
     """Encrypt a report the way the iOS app does (used by tests; the app has
     the Swift mirror). base64(nonce || ciphertext || tag)."""
-    key = _derive_report_key(device_key, device_id)
+    key = _derive_report_key(device_key, device_id, info)
     nonce = secrets.token_bytes(12)
     ciphertext = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
     return base64.b64encode(nonce + ciphertext).decode("utf-8")
 
 
-def decrypt_report_payload(payload_b64: str, device_key: str, device_id: str) -> dict:
+def decrypt_report_payload(payload_b64: str, device_key: str, device_id: str, info: bytes = _REPORT_INFO) -> dict:
     """Decrypt and JSON-parse a device report. Raises ValueError on any
     failure (bad base64, wrong key/device, tampered, non-JSON, non-object)."""
     try:
         raw = base64.b64decode(payload_b64, validate=True)
         if len(raw) < 12 + 16:
             raise ValueError("payload too short")
-        key = _derive_report_key(device_key, device_id)
+        key = _derive_report_key(device_key, device_id, info)
         plaintext = AESGCM(key).decrypt(raw[:12], raw[12:], None)
         inner = json.loads(plaintext.decode("utf-8"))
     except ValueError:
