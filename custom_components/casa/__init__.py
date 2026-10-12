@@ -27,7 +27,9 @@ import qrcode
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from .const import CASA_VERSION, DOMAIN, QUEUE_MAX_AGE_DAYS, QUEUE_MAX_PER_DEVICE, CONF_ADMIN_SYSTEM_ONLY, RELAY_BASE_URL, CONF_RELAY_BASE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
+from .actions import CATEGORY, consume_pending, create_pending, device_actions, prune_pending, validate_actions, validate_press
 from .location import (
+    ACTION_INFO,
     ALLOWED_REASONS,
     ALLOWED_REPORT_KEYS,
     compute_config_version,
@@ -1116,6 +1118,26 @@ def _find_device_record(stored_data: dict, device_id: str):
         if device_id in devices:
             return devices[device_id], uid, None
     return None, None, None
+
+
+def _save_notification_actions(hass) -> None:
+    data = hass.data[DOMAIN]
+    data["na_store"].async_delay_save(lambda: data["na_data"], 2.0)
+
+
+def _action_push_fields(hass, *, device_id: str, user_id: str, username, parsed_data: dict, actions: list) -> dict:
+    """Create the pending record for one device and return the `data` dict
+    that goes to the relay: caller keys + notification_id + device-safe actions."""
+    nid = create_pending(
+        hass.data[DOMAIN]["na_data"],
+        device_id=device_id, user_id=user_id, username=username, actions=actions,
+        tag=parsed_data.get("tag"), action_data=parsed_data.get("action_data"),
+    )
+    _save_notification_actions(hass)
+    out = {k: v for k, v in parsed_data.items() if k != "actions"}
+    out["notification_id"] = nid
+    out["actions"] = device_actions(actions)
+    return out
 
 
 def _ha_device_name(device_info: dict | None, username: str) -> str:
@@ -4244,6 +4266,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN]["lz_store"] = lz_store
     hass.data[DOMAIN]["lz_data"] = lz_data
 
+    # Pending actionable-notification records (separate .storage file).
+    # Shape: {"pending": {notification_id: record}}; see actions.py.
+    na_store = Store(hass, 1, "casa_notification_actions")
+    na_data = await na_store.async_load()
+    if na_data is None:
+        na_data = {"pending": {}}
+    if prune_pending(na_data):
+        await na_store.async_save(na_data)
+    hass.data[DOMAIN]["na_store"] = na_store
+    hass.data[DOMAIN]["na_data"] = na_data
+
     # One record per device_id: collapse duplicates older versions could
     # leave under two live owners (idempotent, so safe on every startup).
     records_migrated = bool(_collapse_duplicate_device_records(stored_data, await hass.auth.async_get_users()))
@@ -5863,6 +5896,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             else:
                 parsed_data = custom_data
 
+        actions = None
+        if isinstance(parsed_data, dict) and "actions" in parsed_data:
+            try:
+                actions = validate_actions(parsed_data)
+            except ValueError as err:
+                raise HomeAssistantError(f"Invalid actions: {err}") from err
+
         if not (username or device_id) or not title or not message:
             raise HomeAssistantError("Missing username or device_id, title, or message.")
 
@@ -5886,6 +5926,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if not found:
                 raise HomeAssistantError(f"Device '{device_id}' not found.")
             uid, device_data, username = found
+            target_uid = uid
             devices = {device_id: device_data}
         else:
             target_user = next((u for u in users if u.name and u.name.casefold() == username.casefold()), None)
@@ -5902,6 +5943,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 raise HomeAssistantError(f"User '{username}' not found.")
 
             user_id = target_user.id
+            target_uid = user_id
             if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
                 devices = stored_data["users"][user_id].get("devices", {})
             else:
@@ -5929,7 +5971,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "site_id": stored_data.get("site_id"),
                 "site_key": stored_data.get("site_key")
             }
-            if parsed_data is not None:
+            if actions is not None:
+                payload["category"] = CATEGORY
+                payload["data"] = _action_push_fields(
+                    hass, device_id=device_id, user_id=target_uid, username=username,
+                    parsed_data=parsed_data, actions=actions,
+                )
+            elif parsed_data is not None:
                 payload["data"] = parsed_data
 
             _LOGGER.info(
@@ -6522,6 +6570,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, _scheduled_reconcile, timedelta(days=1)
     )
 
+    async def _scheduled_action_prune(now):
+        if prune_pending(hass.data[DOMAIN]["na_data"]):
+            _save_notification_actions(hass)
+
+    hass.data[DOMAIN]["na_prune_unsub"] = async_track_time_interval(
+        hass, _scheduled_action_prune, timedelta(hours=1)
+    )
+
     from homeassistant.helpers import entity_registry as er
 
     @callback
@@ -6999,6 +7055,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if lz_stale_unsub:
         lz_stale_unsub()
 
+    na_prune_unsub = hass.data[DOMAIN].get("na_prune_unsub")
+    if na_prune_unsub:
+        na_prune_unsub()
+
     entity_rename_unsub = hass.data[DOMAIN].get("entity_rename_unsub")
     if entity_rename_unsub:
         entity_rename_unsub()
@@ -7021,7 +7081,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = hass.data[DOMAIN]
     for store_key, data_key in (
         ("store", "stored_data"), ("qu_store", "qu_data"), ("wg_store", "wg_data"),
-        ("pp_store", "pp_data"), ("lz_store", "lz_data"),
+        ("pp_store", "pp_data"), ("lz_store", "lz_data"), ("na_store", "na_data"),
     ):
         if data.get(store_key) is not None and data.get(data_key) is not None:
             try:
