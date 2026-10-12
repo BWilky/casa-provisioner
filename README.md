@@ -147,7 +147,7 @@ Sends a push notification via the relay (`push.bonjour.casa`) to all registered 
 
 Add `data.actions` (1–10 entries) to show buttons on the notification. Each entry has `action` (id, unique) and `title`, plus optionally `service` + `target` + `data` (run by HA when pressed), `nav_path` (opens the app there), `text_input: true` (typed text returns as `reply_text`), `destructive`, `auth_required`. `data.tag` and `data.action_data` are echoed back.
 
-A press fires `casa_notification_action` with `action`, `notification_id`, `device_id`, `username`, `user_id`, and `tag` / `action_data` / `reply_text` when present. Only buttons fire the event; a plain tap does not. Presses are accepted for 24 hours.
+A press fires `casa_notification_action` with `action`, `notification_id`, `device_id`, `username`, `user_id`, and `tag` / `action_data` / `reply_text` when present. Only buttons fire the event; a plain tap does not. Presses are accepted for 24 hours after the notification was sent. Only an administrator, or an automation / script, can attach a `service` to an action; other users can still send buttons that only fire the event.
 
 ```yaml
 - action: casa.notify_user
@@ -326,6 +326,7 @@ These are called by the Casa iOS app directly (authenticated via HA long-lived o
 | `GET`/`POST` | `/api/casa/profile_updates` | Pull / acknowledge queued profile & WireGuard updates |
 | `POST` | `/api/casa/profile_report` | Device reports its current provisioning fields (`{device_id, fields}`) |
 | `POST` | `/api/casa/location_report` | Encrypted location-state report; unauthenticated at the HTTP layer, body encrypted with the device key |
+| `POST` | `/api/casa/notification_action` | Encrypted notification-action press callback; no bearer token, body encrypted with the device key (see [docs/app-integration.md](docs/app-integration.md)) |
 | `POST` | `/api/casa/deprovision` | Device removes its own record and session (`{device_id}`) |
 
 Admin-only endpoints (used by the panel): `/api/casa/admin/summary`, `/api/casa/admin/device` (alias + `expires_at_override`), `/api/casa/admin/wireguard_profiles`, `/api/casa/admin/provision_profiles`, `/api/casa/admin/queue_update`, `/api/casa/admin/regenerate_device_key`, `/api/casa/admin/location_zones`, `/api/casa/admin/settings`, `/api/casa/admin/sessions`, `/api/casa/admin/check_username`, `/api/casa/admin/reauth_device`, `/api/casa/admin/reprovision_device` (one-click re-provision of a device on its current account: over push when the device is push-registered, else a fresh QR), `/api/casa/admin/pending_provision` (an account's unredeemed setup link: `GET ?user_id=` returns the links and a freshly rendered QR; `POST {user_id, action}` with `revoke`, `regenerate` or `dismiss`). The summary lists unredeemed links as `pending_provisions` (state `awaiting`, or `expired` for a link that ran out unused — kept 7 days), without the links themselves.

@@ -820,7 +820,8 @@ notify_user:
         (e.g. script.turn_on, with `target`/`data`) to run when pressed, `nav_path` to
         open the app at a path, `text_input: true` to ask for text, `destructive` or
         `auth_required`. Presses fire the `casa_notification_action` event with the
-        action id, device_id, username, and any `tag` / `action_data` you include.
+        action id, notification_id, device_id, username, user_id, any `tag` /
+        `action_data` you include, and `reply_text` for text-input actions.
         Example: {"tag": "door", "actions": [{"action": "UNLOCK", "title": "Unlock",
         "service": "lock.unlock", "target": {"entity_id": "lock.front"}},
         {"action": "IGNORE", "title": "Ignore", "destructive": true}]}

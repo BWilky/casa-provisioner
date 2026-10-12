@@ -9,7 +9,7 @@ integration. Two channels deliver the same updates:
   app can apply it without waiting for the next heartbeat. If it can't be decrypted, the
   pull path is the safety net — nothing is ever lost.
 
-All endpoints are authenticated with the device's normal HA bearer token, except `/api/casa/location_report`, which is unauthenticated at the HTTP layer and relies on the device-key-encrypted body.
+All endpoints are authenticated with the device's normal HA bearer token, except `/api/casa/location_report` and `/api/casa/notification_action`, which are unauthenticated at the HTTP layer and rely on the device-key-encrypted body.
 
 ---
 
@@ -342,7 +342,7 @@ Pushes that carry `actions` also set `aps.category = "CASA_DYNAMIC"`.
 
 ### Notification action presses (`/api/casa/notification_action`)
 
-`POST` with `{"device_id": "<id>", "payload": "<b64>"}`; no bearer token. `payload` is AES-256-GCM (`nonce12 || ciphertext || tag16`, base64) under `HKDF-SHA256(ikm=utf8(device_key), salt=utf8(device_id), info="casa-action-v1")` — the location-report scheme with a different info string. Inner JSON: `{"notification_id", "action", "reply_text"?, "ts"}` (`ts` unix seconds, ±300 s). Any failure is `403 {"error": "Rejected"}`; a repeat of an accepted press is `200 {"status": "ok", "duplicate": true}`. Presses older than 24 h are rejected. Treat 403 as final; retry only transport errors and 5xx.
+`POST` with `{"device_id": "<id>", "payload": "<b64>"}`; no bearer token. `payload` is AES-256-GCM (`nonce12 || ciphertext || tag16`, base64) under `HKDF-SHA256(ikm=utf8(device_key), salt=utf8(device_id), info="casa-action-v1")` — the location-report scheme with a different info string. Inner JSON: `{"notification_id", "action", "reply_text"?, "ts"}` (`ts` unix seconds, ±300 s). A malformed body (invalid JSON, a non-object body, or a missing `device_id` / `payload`) is `400`; any rejected press is `403 {"error": "Rejected"}`; a repeat of an accepted press is `200 {"status": "ok", "duplicate": true}`. Presses are accepted for 24 hours after the notification was sent. While the integration is reloading the endpoint returns `503 {"error": "Unavailable"}`. Treat 400 and 403 as final; retry only transport errors and 5xx (including that 503).
 
 ### Command pushes (`deprovision`)
 
