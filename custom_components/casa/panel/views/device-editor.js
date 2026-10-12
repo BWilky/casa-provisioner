@@ -185,6 +185,7 @@ export function createView(app) {
   let provisioningBaseline = null; // the reported values the draft started from
   let provisioningSubSection = "connection"; // sub-nav within the Provisioning section
   let msgs = freshMsgs();
+  let pushDataText = ""; // Data (JSON) box text; survives renderSection(), reset per mount
 
   function freshMsgs() {
     return { alias: {}, session: {}, push: {}, vpn: {}, updates: {}, pending: {}, danger: {}, provisioning: {} };
@@ -306,21 +307,21 @@ export function createView(app) {
   }
 
   async function init() {
-    if (!shellMod) {
-      try {
-        shellMod = await app.loadModule("editor-shell.js");
-        pushDataMod = await app.loadModule("views/push-data.js");
-      } catch (err) {
-        if (mounted && host)
-          host.innerHTML = `<div class="page"><div class="errbar">Failed to load editor shell: ${esc(ui.errMsg(err))}</div></div>`;
-        return;
-      }
+    let loading = "editor shell";
+    try {
+      if (!shellMod) shellMod = await app.loadModule("editor-shell.js");
+      loading = "push helpers";
+      if (!pushDataMod) pushDataMod = await app.loadModule("views/push-data.js");
+    } catch (err) {
+      if (mounted && host)
+        host.innerHTML = `<div class="page"><div class="errbar">Failed to load ${loading}: ${esc(ui.errMsg(err))}</div></div>`;
+      return;
     }
     if (mounted) tryBuild();
   }
 
   function tryBuild() {
-    if (shell || !mounted || !shellMod) return;
+    if (shell || !mounted || !shellMod || !pushDataMod) return;
     if (!app.summary()) {
       host.innerHTML = `<div class="page"><div class="empty-state"><span class="muted">Loading…</span></div></div>`;
       return; // onSummary will retry
@@ -889,9 +890,6 @@ export function createView(app) {
     if (mounted && active === "session") renderSection();
   }
 
-  // Text of the Data (JSON) box; survives renderSection() re-renders.
-  let pushDataText = "";
-
   function renderPush() {
     const { actionsExampleText, PUSH_DATA_HELP } = pushDataMod;
     const d = device;
@@ -1256,6 +1254,7 @@ export function createView(app) {
       provisioningBaseline = null;
       provisioningSubSection = "connection";
       msgs = freshMsgs();
+      pushDataText = "";
       host = document.createElement("div");
       host.className = "page--flush";
       el.appendChild(host);
