@@ -56,6 +56,7 @@ def _install_homeassistant_stubs() -> None:
         "homeassistant.core",
         HomeAssistant=_Stub,
         ServiceCall=_Stub,
+        Context=_Stub,
         SupportsResponse=_SupportsResponse,
         callback=lambda f: f,
     )

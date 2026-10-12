@@ -13,7 +13,7 @@ import urllib.parse
 import re
 from datetime import datetime, timedelta
 
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback, Context
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt as dt_util
@@ -2511,6 +2511,85 @@ class CasaLocationReportView(HomeAssistantView):
         return self.json({"status": "ok"})
 
 
+class CasaNotificationActionView(HomeAssistantView):
+    """Device-facing 'notification action pressed' endpoint. No HA session:
+    the device_key encryption (HKDF info casa-action-v1) is the
+    authentication, as for location_report. The press must name a
+    notification HA sent to this device_id and an action from that list;
+    HA runs the stored service call, never one the device names."""
+
+    url = "/api/casa/notification_action"
+    name = "api:casa:notification_action"
+    requires_auth = False
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def post(self, request):
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"error": "Invalid JSON"}, status_code=400)
+
+        device_id = str(body.get("device_id", "")).strip()
+        payload_b64 = body.get("payload")
+        if not device_id or not isinstance(payload_b64, str):
+            return self.json({"error": "device_id and payload are required"}, status_code=400)
+
+        data = self.hass.data.get(DOMAIN, {})
+        stored_data = data.get("stored_data", {})
+        device_key = stored_data.get("device_key")
+        device_info, _uid, _uname = _find_device_record(stored_data, device_id)
+        if device_info is None or not device_key:
+            return self.json({"error": "Rejected"}, status_code=403)
+
+        try:
+            inner = validate_press(decrypt_report_payload(payload_b64, device_key, device_id, info=ACTION_INFO))
+        except ValueError as err:
+            _LOGGER.info("CASA: Rejected notification action from device '%s' (%s).", device_id, err)
+            return self.json({"error": "Rejected"}, status_code=403)
+
+        try:
+            record, entry = consume_pending(
+                data["na_data"], notification_id=inner["notification_id"],
+                device_id=device_id, action=inner["action"],
+            )
+        except LookupError as err:
+            _LOGGER.info("CASA: Rejected notification action from device '%s' (%s).", device_id, err)
+            return self.json({"error": "Rejected"}, status_code=403)
+
+        _save_notification_actions(self.hass)
+        if entry is None:
+            return self.json({"status": "ok", "duplicate": True})
+
+        event = {
+            "action": inner["action"],
+            "notification_id": inner["notification_id"],
+            "device_id": device_id,
+            "username": record.get("username"),
+            "user_id": record.get("user_id"),
+        }
+        if "tag" in record:
+            event["tag"] = record["tag"]
+        if "action_data" in record:
+            event["action_data"] = record["action_data"]
+        if entry.get("text_input") and "reply_text" in inner:
+            event["reply_text"] = inner["reply_text"]
+        self.hass.bus.async_fire("casa_notification_action", event)
+
+        service = entry.get("service")
+        if service:
+            domain, name = service.split(".", 1)
+            try:
+                await self.hass.services.async_call(
+                    domain, name, entry.get("data") or {},
+                    blocking=False, context=Context(), target=entry.get("target"),
+                )
+            except Exception as err:  # the event already fired; never fail the press
+                _LOGGER.warning("CASA: Notification action '%s' service %s failed: %s", inner["action"], service, err)
+        return self.json({"status": "ok"})
+
+
 class CasaAdminDeviceView(HomeAssistantView):
     """Admin-only API to inspect/update registered devices."""
 
@@ -4731,6 +4810,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(CasaWireGuardProfilesView(hass))
         hass.http.register_view(CasaLocationZonesView(hass))
         hass.http.register_view(CasaLocationReportView(hass))
+        hass.http.register_view(CasaNotificationActionView(hass))
         hass.http.register_view(CasaProvisionProfilesView(hass))
         hass.http.register_view(CasaAdminDeviceView(hass))
         hass.http.register_view(CasaAdminSettingsView(hass))

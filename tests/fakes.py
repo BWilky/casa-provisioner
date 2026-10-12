@@ -185,6 +185,8 @@ class FakeHass:
         self.bus = SimpleNamespace(async_fire=lambda name, data: self.fired.append((name, data)))
         self.tasks = []
         self.background = []
+        self.service_calls = []
+        self.services = SimpleNamespace(async_call=self._async_call)
         self.config = SimpleNamespace(path=lambda *p: "/nonexistent/" + "/".join(p))
         self.data = {
             "casa": {
@@ -202,6 +204,11 @@ class FakeHass:
                 "na_store": FakeStore(),
             }
         }
+
+    async def _async_call(self, domain, service, data=None, blocking=False, context=None, target=None):
+        self.service_calls.append((domain, service, data, target))
+        if getattr(self, "service_raises", None):
+            raise self.service_raises
 
     def async_create_task(self, coro, name=None, eager_start=True):
         task = asyncio.ensure_future(coro)
