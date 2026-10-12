@@ -284,8 +284,12 @@ created_at, consumed_at?}`.
   location reports.
 - `service` no longer exists at press time → warning logged; event already
   fired.
-- Payload size: caps in §1.1 keep 10 actions well under the 4 KB APNs limit
-  and the relay's 10 KB body cap.
+- Payload size: the per-field caps in §1.1 alone do not (10 actions at the
+  64/64/512 caps exceed 4 KB), so `validate_actions` also rejects any list
+  whose device-safe copy (`device_actions`, compact JSON) is over 2 KB
+  ("actions are too large to push"). That keeps the push well under the 4 KB
+  APNs limit and the relay's 10 KB body cap; server-only keys (`service`,
+  `target`, `data`) never leave HA and do not count.
 - Foreground press uses the same path as a background press.
 - Security note (carried from `location_report`): the device key is
   site-wide, so another provisioned device on the same site could forge a

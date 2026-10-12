@@ -169,3 +169,18 @@ def test_consumed_record_still_enforces_device_and_action():
         consume_pending(na, notification_id=nid, device_id="D1", action="EXPLODE", now=1_000_020.0)
     rec2, entry2 = consume_pending(na, notification_id=nid, device_id="D1", action="UNLOCK", now=1_000_030.0)
     assert rec2 is rec and entry2 is None
+
+
+def test_actions_at_every_cap_are_too_large_to_push():
+    acts = [{"action": f"{i}" + "A" * 63, "title": "T" * 64, "nav_path": "/" + "p" * 511,
+             "destructive": True, "auth_required": True, "text_input": True} for i in range(10)]
+    with pytest.raises(ValueError, match="too large to push"):
+        validate_actions({"actions": acts})
+
+
+def test_realistic_ten_actions_fit():
+    acts = [{"action": f"ACTION_{i:02d}", "title": f"Do thing number {i}", "nav_path": f"/lovelace/room-{i}",
+             "service": "script.turn_on", "target": {"entity_id": "script." + "x" * 200},
+             "data": {"variables": {"blob": "y" * 500}}} for i in range(10)]
+    out = validate_actions({"actions": acts})
+    assert len(out) == 10

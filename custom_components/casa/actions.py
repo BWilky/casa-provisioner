@@ -5,6 +5,7 @@ so plain pytest can exercise everything."""
 from __future__ import annotations
 
 import copy
+import json
 import math
 import re
 import secrets
@@ -27,6 +28,7 @@ MAX_ACTION_ID = 64
 MAX_TITLE = 64
 MAX_NAV_PATH = 512
 MAX_TAG = 128
+MAX_DEVICE_ACTIONS_BYTES = 2048  # keeps the whole push well under APNs' 4 KB
 
 _SERVICE_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 
@@ -97,6 +99,8 @@ def validate_actions(data: dict) -> list[dict]:
                     raise ValueError(f"actions[{i}].{key} must be true or false")
                 norm[key] = entry[key]
         out.append(norm)
+    if len(json.dumps(device_actions(out), separators=(",", ":"))) > MAX_DEVICE_ACTIONS_BYTES:
+        raise ValueError("actions are too large to push (max 2 KB on the wire)")
     return out
 
 
