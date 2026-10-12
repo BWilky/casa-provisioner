@@ -1183,6 +1183,13 @@ def _parse_notify_data(custom_data):
     return parsed_data, actions
 
 
+def _notify_target_username(stored_data: dict, user) -> str:
+    """Canonical username for a notify_user target addressed by username, so
+    the press event matches the device_id path: the stored Casa username,
+    else the HA user's name (never the caller's raw input)."""
+    return (stored_data.get("users", {}).get(user.id) or {}).get("username") or user.name
+
+
 def _notify_relay_body(hass, *, push_token, title, message, stored_data, parsed_data, actions,
                        device_id, user_id, username) -> dict:
     """The body notify_user posts to the relay for one device. With actions,
@@ -6081,6 +6088,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             user_id = target_user.id
             target_uid = user_id
+            username = _notify_target_username(stored_data, target_user) or username
             if user_id in stored_data["users"] and not stored_data["users"][user_id].get("deleted", False):
                 devices = stored_data["users"][user_id].get("devices", {})
             else:

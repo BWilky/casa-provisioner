@@ -174,3 +174,16 @@ def test_save_prunes_before_scheduling_write():
     _save_notification_actions(hass)
     assert set(na["pending"]) == {fresh}
     assert hass.casa["na_store"].delayed == 1
+
+
+# --- the event's username is canonical, however the notification was addressed ---
+from custom_components.casa import _notify_target_username
+
+
+def test_target_username_prefers_stored_casa_username():
+    stored = {"users": {"u1": {"username": "alice"}}}
+    assert _notify_target_username(stored, make_user("u1", login="alice", name="Alice Smith")) == "alice"
+
+
+def test_target_username_falls_back_to_ha_user_name():
+    assert _notify_target_username({"users": {}}, make_user("u2", name="Bob")) == "Bob"
