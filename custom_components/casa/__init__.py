@@ -1158,6 +1158,52 @@ def _action_push_fields(hass, *, device_id: str, user_id: str, username, parsed_
     return out
 
 
+def _parse_notify_data(custom_data):
+    """notify_user's `data` field: a JSON string is parsed (a non-JSON string
+    is passed through as-is), anything else is used directly. Returns
+    (parsed_data, actions); actions is the validated list when the data is an
+    object carrying `actions`, else None."""
+    parsed_data = None
+    if custom_data is not None:
+        if isinstance(custom_data, str):
+            try:
+                parsed_data = json.loads(custom_data)
+            except ValueError:
+                parsed_data = custom_data
+        else:
+            parsed_data = custom_data
+
+    actions = None
+    if isinstance(parsed_data, dict) and "actions" in parsed_data:
+        try:
+            actions = validate_actions(parsed_data)
+        except ValueError as err:
+            raise HomeAssistantError(f"Invalid actions: {err}") from err
+    return parsed_data, actions
+
+
+def _notify_relay_body(hass, *, push_token, title, message, stored_data, parsed_data, actions,
+                       device_id, user_id, username) -> dict:
+    """The body notify_user posts to the relay for one device. With actions,
+    this also creates that device's pending record."""
+    payload = {
+        "title": title,
+        "message": message,
+        "target": push_token,
+        "site_id": stored_data.get("site_id"),
+        "site_key": stored_data.get("site_key")
+    }
+    if actions is not None:
+        payload["category"] = CATEGORY
+        payload["data"] = _action_push_fields(
+            hass, device_id=device_id, user_id=user_id, username=username,
+            parsed_data=parsed_data, actions=actions,
+        )
+    elif parsed_data is not None:
+        payload["data"] = parsed_data
+    return payload
+
+
 def _ha_device_name(device_info: dict | None, username: str) -> str:
     """Name for a device's Home Assistant device-registry entry: its alias
     when set — several devices can share one account, so the account name
@@ -5983,23 +6029,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         message = str(call.data.get("message", "")).strip()
         custom_data = call.data.get("data")
 
-        parsed_data = None
-        if custom_data is not None:
-            if isinstance(custom_data, str):
-                import json
-                try:
-                    parsed_data = json.loads(custom_data)
-                except ValueError:
-                    parsed_data = custom_data
-            else:
-                parsed_data = custom_data
-
-        actions = None
-        if isinstance(parsed_data, dict) and "actions" in parsed_data:
-            try:
-                actions = validate_actions(parsed_data)
-            except ValueError as err:
-                raise HomeAssistantError(f"Invalid actions: {err}") from err
+        parsed_data, actions = _parse_notify_data(custom_data)
         await _assert_may_attach_service(hass, call.context.user_id, actions)
 
         if not (username or device_id) or not title or not message:
@@ -6063,21 +6093,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.warning("CASA: Device '%s' for user '%s' has no push token registered.", device_id, username)
                 continue
 
-            payload = {
-                "title": title,
-                "message": message,
-                "target": push_token,
-                "site_id": stored_data.get("site_id"),
-                "site_key": stored_data.get("site_key")
-            }
-            if actions is not None:
-                payload["category"] = CATEGORY
-                payload["data"] = _action_push_fields(
-                    hass, device_id=device_id, user_id=target_uid, username=username,
-                    parsed_data=parsed_data, actions=actions,
-                )
-            elif parsed_data is not None:
-                payload["data"] = parsed_data
+            payload = _notify_relay_body(
+                hass, push_token=push_token, title=title, message=message,
+                stored_data=stored_data, parsed_data=parsed_data, actions=actions,
+                device_id=device_id, user_id=target_uid, username=username,
+            )
 
             _LOGGER.info(
                 "CASA: Attempting to send push notification to user '%s' device '%s'. Target (obfuscated): %s, Site ID: %s",

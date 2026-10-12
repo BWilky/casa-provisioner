@@ -77,3 +77,84 @@ def test_system_context_may_attach_service():
 
 def test_no_actions_is_always_ok():
     asyncio.run(_assert_may_attach_service(_guard_hass(), "kid", None))
+
+
+# --- handler wiring: the relay body built per device, and data parsing ---
+import json
+
+from custom_components.casa import _notify_relay_body, _parse_notify_data
+
+STORED = {"site_id": "S1", "site_key": "K1", "users": {}, "native_devices": {}}
+BASE = {"title": "T", "message": "M", "target": "tok", "site_id": "S1", "site_key": "K1"}
+
+
+def _body(hass, raw):
+    parsed, actions = _parse_notify_data(raw)
+    return _notify_relay_body(
+        hass, push_token="tok", title="T", message="M", stored_data=STORED,
+        parsed_data=parsed, actions=actions, device_id="D1", user_id="u1", username="alice",
+    )
+
+
+def test_no_actions_body_without_data_is_the_old_shape():
+    hass = FakeHass()
+    assert _body(hass, None) == BASE
+    assert hass.casa["na_data"]["pending"] == {} and hass.casa["na_store"].delayed == 0
+
+
+def test_no_actions_body_with_dict_data_passes_it_through():
+    hass = FakeHass()
+    assert _body(hass, {"nav_path": "/x", "tag": "t"}) == {**BASE, "data": {"nav_path": "/x", "tag": "t"}}
+    assert hass.casa["na_data"]["pending"] == {}
+
+
+def test_no_actions_body_with_non_json_string_passes_the_string():
+    hass = FakeHass()
+    assert _body(hass, "not json") == {**BASE, "data": "not json"}
+
+
+def test_no_actions_body_with_json_string_is_parsed():
+    hass = FakeHass()
+    assert _body(hass, '{"nav_path": "/x"}') == {**BASE, "data": {"nav_path": "/x"}}
+
+
+def _assert_action_body(hass, body):
+    assert body["category"] == "CASA_DYNAMIC"
+    assert {k: body[k] for k in BASE} == BASE
+    data = body["data"]
+    nid = data["notification_id"]
+    assert data["actions"] == [{"action": "UNLOCK", "title": "Unlock"},
+                               {"action": "IGNORE", "title": "Ignore", "destructive": True}]
+    assert data["tag"] == "door" and data["nav_path"] == "/x"
+    rec = hass.casa["na_data"]["pending"][nid]
+    assert rec["device_id"] == "D1" and rec["user_id"] == "u1" and rec["username"] == "alice"
+    assert rec["actions"][0]["service"] == "lock.unlock"
+
+
+def test_actions_body_has_category_notification_id_and_stripped_actions():
+    hass = FakeHass()
+    _assert_action_body(hass, _body(hass, DATA))
+
+
+def test_actions_given_as_json_string_take_the_same_path():
+    hass = FakeHass()
+    _assert_action_body(hass, _body(hass, json.dumps(DATA)))
+
+
+def test_parse_notify_data_invalid_actions_raises():
+    with pytest.raises(HomeAssistantError) as exc:
+        _parse_notify_data({"actions": [{"action": "A"}]})
+    assert str(exc.value).startswith("Invalid actions:")
+
+
+def test_parse_notify_data_invalid_actions_in_json_string_raises():
+    with pytest.raises(HomeAssistantError) as exc:
+        _parse_notify_data(json.dumps({"actions": []}))
+    assert str(exc.value).startswith("Invalid actions:")
+
+
+def test_parse_notify_data_without_actions_returns_none_actions():
+    assert _parse_notify_data(None) == (None, None)
+    assert _parse_notify_data("x") == ("x", None)
+    assert _parse_notify_data({"a": 1}) == ({"a": 1}, None)
+    assert _parse_notify_data([1]) == ([1], None)
