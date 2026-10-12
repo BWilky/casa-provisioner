@@ -121,3 +121,51 @@ def test_bad_body_is_400():
     view = bind_view(CasaNotificationActionView(hass))
     status, _ = asyncio.run(view.post(FakeRequest(None, {"device_id": "D1"})))
     assert status == 400
+
+
+def test_unavailable_during_reload_is_503_and_nothing_fires():
+    hass, nid = _hass()
+    hass.casa.pop("na_data")
+    status, body = _press(hass, "D1", {"notification_id": nid, "action": "UNLOCK"})
+    assert status == 503 and body == {"error": "Unavailable"}
+    assert hass.fired == [] and hass.service_calls == []
+
+
+def test_non_object_body_is_400():
+    hass, _ = _hass()
+    view = bind_view(CasaNotificationActionView(hass))
+    req = FakeRequest(None)
+    req._body = []  # FakeRequest maps a falsy body to {}
+    status, body = asyncio.run(view.post(req))
+    assert status == 400 and body == {"error": "Invalid JSON"}
+
+
+def test_location_report_non_object_body_is_400():
+    from custom_components.casa import CasaLocationReportView
+
+    hass, _ = _hass()
+    view = bind_view(CasaLocationReportView(hass))
+    req = FakeRequest(None)
+    req._body = []  # FakeRequest maps a falsy body to {}
+    status, body = asyncio.run(view.post(req))
+    assert status == 400 and body == {"error": "Invalid JSON"}
+
+
+def test_duplicate_press_on_service_action_runs_service_once():
+    hass, nid = _hass()
+    _press(hass, "D1", {"notification_id": nid, "action": "UNLOCK"})
+    status, body = _press(hass, "D1", {"notification_id": nid, "action": "UNLOCK"})
+    assert status == 200 and body == {"status": "ok", "duplicate": True}
+    assert len(hass.service_calls) == 1 and len(hass.fired) == 1
+
+
+def test_event_fires_before_service_call():
+    hass, nid = _hass()
+    fired_at_call = []
+
+    async def recording_call(domain, service, data=None, blocking=False, context=None, target=None):
+        fired_at_call.append(len(hass.fired))
+
+    hass.services.async_call = recording_call
+    _press(hass, "D1", {"notification_id": nid, "action": "UNLOCK"})
+    assert fired_at_call == [1]

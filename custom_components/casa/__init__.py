@@ -2542,6 +2542,8 @@ class CasaLocationReportView(HomeAssistantView):
             body = await request.json()
         except Exception:
             return self.json({"error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return self.json({"error": "Invalid JSON"}, status_code=400)
 
         device_id = str(body.get("device_id", "")).strip()
         payload_b64 = body.get("payload")
@@ -2595,6 +2597,8 @@ class CasaNotificationActionView(HomeAssistantView):
             body = await request.json()
         except Exception:
             return self.json({"error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return self.json({"error": "Invalid JSON"}, status_code=400)
 
         device_id = str(body.get("device_id", "")).strip()
         payload_b64 = body.get("payload")
@@ -2602,6 +2606,9 @@ class CasaNotificationActionView(HomeAssistantView):
             return self.json({"error": "device_id and payload are required"}, status_code=400)
 
         data = self.hass.data.get(DOMAIN, {})
+        if "na_data" not in data:
+            # Integration unloading/reloading: let the app retry the press.
+            return self.json({"error": "Unavailable"}, status_code=503)
         stored_data = data.get("stored_data", {})
         device_key = stored_data.get("device_key")
         device_info, _uid, _uname = _find_device_record(stored_data, device_id)
