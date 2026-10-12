@@ -5,6 +5,8 @@
 // ported faithfully from the legacy Device Inspector. Everything arrives via
 // the `app` context (no static sibling imports).
 
+import { actionsExampleText, parsePushData, PUSH_DATA_HELP } from "./push-data.js";
+
 // Record keys in the summary's documented order — the code pane and the
 // change detector both use this so the JSON rendering is stable.
 const RECORD_KEYS = [
@@ -887,6 +889,9 @@ export function createView(app) {
     if (mounted && active === "session") renderSection();
   }
 
+  // Text of the Data (JSON) box; survives renderSection() re-renders.
+  let pushDataText = "";
+
   function renderPush() {
     const d = device;
     const dis = d.push_registered ? "" : " disabled";
@@ -913,6 +918,9 @@ export function createView(app) {
         }
         <div class="field"><label>Title</label><input class="input" id="dev-push-title" value="Test Notification"${dis}></div>
         <div class="field"><label>Message</label><input class="input" id="dev-push-message" value="Hello from Home Assistant!"${dis}></div>
+        <div class="field"><label>Data (JSON) <a href="#" id="dev-push-example">Insert actions example</a></label>
+          <textarea class="input" id="dev-push-data" rows="8" spellcheck="false"${dis}>${esc(pushDataText)}</textarea>
+          <p class="field__help">${PUSH_DATA_HELP}</p></div>
         <button class="btn btn--primary" id="dev-send-push"${dis}>Send Notification</button>
         ${msgHtml(msgs.push)}
       </div></div>
@@ -922,6 +930,12 @@ export function createView(app) {
         <button class="btn btn--outlined" id="dev-reload">Reload app</button>
       </div></div>`;
 
+    shell.formEl.querySelector("#dev-push-example").addEventListener("click", (e) => {
+      e.preventDefault();
+      if (!d.push_registered) return;
+      pushDataText = actionsExampleText();
+      shell.formEl.querySelector("#dev-push-data").value = pushDataText;
+    });
     shell.formEl.querySelector("#dev-send-push").addEventListener("click", sendTestPush);
     shell.formEl.querySelector("#dev-reload").addEventListener("click", confirmReload);
   }
@@ -932,14 +946,18 @@ export function createView(app) {
     if (!titleEl || !msgEl) return;
     const title = titleEl.value.trim();
     const message = msgEl.value.trim();
+    const dataText = shell.formEl.querySelector("#dev-push-data")?.value ?? "";
+    pushDataText = dataText;
     if (!title || !message) {
       msgs.push = { error: "Title and message are required." };
       renderSection();
       return;
     }
+    const parsed = parsePushData(dataText);
+    if (parsed.error) { msgs.push = { error: parsed.error }; renderSection(); return; }
     msgs.push = {};
     try {
-      await api.notifyUser({ deviceId: device.device_id, title, message });
+      await api.notifyUser({ deviceId: device.device_id, title, message, data: parsed.data });
       msgs.push = { success: "Push notification command sent." };
     } catch (err) {
       msgs.push = { error: "Failed to send: " + ui.errMsg(err) };

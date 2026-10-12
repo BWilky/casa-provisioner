@@ -9,6 +9,8 @@
 // device_id "pending:<user_id>" so the row plumbing is shared. They can't be
 // selected for bulk actions; their actions live in views/pending-provision.js.
 
+import { actionsExampleText, parsePushData, PUSH_DATA_HELP } from "./push-data.js";
+
 const ONLINE_WINDOW_MS = 11 * 60 * 1000;
 const PAGE_SIZES = [10, 25, 50, 100];
 
@@ -507,7 +509,14 @@ export function createView(app) {
     body.innerHTML = `
       <div class="field"><label>Title</label><input class="input" id="tp-title" value="Test Notification"></div>
       <div class="field"><label>Message</label><input class="input" id="tp-message" value="Hello from Home Assistant!"></div>
+      <div class="field"><label>Data (JSON) <a href="#" id="tp-example">Insert actions example</a></label>
+        <textarea class="input" id="tp-data" rows="8" spellcheck="false"></textarea>
+        <p class="field__help">${PUSH_DATA_HELP}</p></div>
       <div class="field__error" id="tp-err" hidden></div>`;
+    body.querySelector("#tp-example").addEventListener("click", (e) => {
+      e.preventDefault();
+      body.querySelector("#tp-data").value = actionsExampleText();
+    });
     ui.openModal({
       title: `Test push — ${deviceName(d)}`,
       bodyEl: body,
@@ -525,8 +534,10 @@ export function createView(app) {
               err.textContent = "Title and message are required.";
               return false;
             }
+            const parsed = parsePushData(body.querySelector("#tp-data").value);
+            if (parsed.error) { err.hidden = false; err.textContent = parsed.error; return false; }
             try {
-              await api.notifyUser({ deviceId: d.device_id, title, message });
+              await api.notifyUser({ deviceId: d.device_id, title, message, data: parsed.data });
               ui.toast("Push notification command sent.");
             } catch (e) {
               err.hidden = false;
