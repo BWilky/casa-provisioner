@@ -102,3 +102,87 @@ def validate_actions(data: dict) -> list[dict]:
 def device_actions(actions: list[dict]) -> list[dict]:
     """The copy that leaves HA: everything except the server-side keys."""
     return [{k: copy.deepcopy(v) for k, v in a.items() if k not in SERVER_ONLY_KEYS} for a in actions]
+
+
+def _now(now):
+    return time.time() if now is None else now
+
+
+def create_pending(na_data: dict, *, device_id: str, user_id: str, username: str | None,
+                   actions: list[dict], tag: str | None = None, action_data: dict | None = None,
+                   now: float | None = None) -> str:
+    pending = na_data.setdefault("pending", {})
+    nid = secrets.token_urlsafe(24)
+    while nid in pending:
+        nid = secrets.token_urlsafe(24)
+    record = {
+        "device_id": device_id,
+        "user_id": user_id,
+        "username": username,
+        "actions": copy.deepcopy(actions),
+        "created_at": _now(now),
+    }
+    if tag is not None:
+        record["tag"] = tag
+    if action_data is not None:
+        record["action_data"] = copy.deepcopy(action_data)
+    pending[nid] = record
+    return nid
+
+
+def prune_pending(na_data: dict, now: float | None = None) -> int:
+    t = _now(now)
+    pending = na_data.setdefault("pending", {})
+    doomed = [
+        nid for nid, rec in pending.items()
+        if t - rec.get("created_at", 0) > PENDING_TTL_SECONDS
+        or ("consumed_at" in rec and t - rec["consumed_at"] > CONSUMED_TTL_SECONDS)
+    ]
+    for nid in doomed:
+        pending.pop(nid, None)
+    return len(doomed)
+
+
+def consume_pending(na_data: dict, *, notification_id: str, device_id: str, action: str,
+                    now: float | None = None) -> tuple[dict, dict | None]:
+    """Returns (record, entry). entry is None when the record was already
+    consumed (duplicate press). Raises LookupError when the press cannot be
+    matched to something HA sent to this device."""
+    t = _now(now)
+    rec = na_data.setdefault("pending", {}).get(notification_id)
+    if rec is None:
+        raise LookupError("unknown notification")
+    if t - rec.get("created_at", 0) > PENDING_TTL_SECONDS:
+        raise LookupError("expired")
+    if rec.get("device_id") != device_id:
+        raise LookupError("device mismatch")
+    entry = next((a for a in rec.get("actions", []) if a.get("action") == action), None)
+    if entry is None:
+        raise LookupError("unknown action")
+    if "consumed_at" in rec:
+        return rec, None
+    rec["consumed_at"] = t
+    return rec, entry
+
+
+def validate_press(inner: dict, now: float | None = None) -> dict:
+    if not isinstance(inner, dict):
+        raise ValueError("press is not an object")
+    if set(inner) - ALLOWED_PRESS_KEYS:
+        raise ValueError("unexpected keys")
+    nid = inner.get("notification_id")
+    action = inner.get("action")
+    ts = inner.get("ts")
+    if not isinstance(nid, str) or not nid:
+        raise ValueError("notification_id")
+    if not isinstance(action, str) or not action:
+        raise ValueError("action")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or abs(_now(now) - ts) > 300:
+        raise ValueError("ts")
+    out = {"notification_id": nid, "action": action, "ts": ts}
+    if "reply_text" in inner:
+        rt = inner["reply_text"]
+        if not isinstance(rt, str) or len(rt) > MAX_REPLY_TEXT:
+            raise ValueError("reply_text")
+        out["reply_text"] = rt
+    return out

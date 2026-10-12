@@ -198,6 +198,8 @@ class FakeHass:
                 "lz_store": FakeStore(),
                 "listeners": {},
                 "timers": {},
+                "na_data": {"pending": {}},
+                "na_store": FakeStore(),
             }
         }
 
