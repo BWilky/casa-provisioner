@@ -32,3 +32,48 @@ def test_two_devices_two_records():
 
 def test_category_constant_is_what_the_app_registers():
     assert CATEGORY == "CASA_DYNAMIC"
+
+
+# --- send-time guard: only admins (or system/automation contexts) may attach a service ---
+import asyncio
+
+import pytest
+
+from custom_components.casa import HomeAssistantError, _assert_may_attach_service
+from tests.fakes import make_user
+
+SERVICE_ACTIONS = validate_actions(DATA)
+PLAIN_ACTIONS = validate_actions({"actions": [{"action": "OK", "title": "OK"}]})
+
+
+def _guard_hass():
+    hass = FakeHass()
+    hass.auth.add_user(make_user("kid", login="kid"))
+    hass.auth.add_user(make_user("boss", login="boss", admin=True))
+    return hass
+
+
+def test_non_admin_cannot_attach_service():
+    with pytest.raises(HomeAssistantError, match="Only administrators can attach a service"):
+        asyncio.run(_assert_may_attach_service(_guard_hass(), "kid", SERVICE_ACTIONS))
+
+
+def test_unknown_user_cannot_attach_service():
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(_assert_may_attach_service(_guard_hass(), "ghost", SERVICE_ACTIONS))
+
+
+def test_non_admin_may_send_actions_without_service():
+    asyncio.run(_assert_may_attach_service(_guard_hass(), "kid", PLAIN_ACTIONS))
+
+
+def test_admin_may_attach_service():
+    asyncio.run(_assert_may_attach_service(_guard_hass(), "boss", SERVICE_ACTIONS))
+
+
+def test_system_context_may_attach_service():
+    asyncio.run(_assert_may_attach_service(_guard_hass(), None, SERVICE_ACTIONS))
+
+
+def test_no_actions_is_always_ok():
+    asyncio.run(_assert_may_attach_service(_guard_hass(), "kid", None))

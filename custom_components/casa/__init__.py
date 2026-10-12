@@ -1125,6 +1125,24 @@ def _save_notification_actions(hass) -> None:
     data["na_store"].async_delay_save(lambda: data["na_data"], 2.0)
 
 
+async def _assert_may_attach_service(hass, context_user_id, actions) -> None:
+    """Send-time guard: a stored service call runs with a system Context()
+    when pressed, so only an admin (or a system/automation context, where
+    user_id is None) may attach one. Non-admin users can still send actions
+    that only fire the casa_notification_action event."""
+    if not actions or not any(a.get("service") for a in actions):
+        return
+    if context_user_id is None:
+        return
+    user = await hass.auth.async_get_user(context_user_id)
+    if user is None or not getattr(user, "is_admin", False):
+        _LOGGER.warning(
+            "CASA SECURITY: Blocked notify_user with a service-bearing action from non-admin user '%s' (ID: %s).",
+            getattr(user, "name", "Unknown") if user else "Unknown", context_user_id,
+        )
+        raise HomeAssistantError("Only administrators can attach a service to a notification action.")
+
+
 def _action_push_fields(hass, *, device_id: str, user_id: str, username, parsed_data: dict, actions: list) -> dict:
     """Create the pending record for one device and return the `data` dict
     that goes to the relay: caller keys + notification_id + device-safe actions."""
@@ -5982,6 +6000,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 actions = validate_actions(parsed_data)
             except ValueError as err:
                 raise HomeAssistantError(f"Invalid actions: {err}") from err
+        await _assert_may_attach_service(hass, call.context.user_id, actions)
 
         if not (username or device_id) or not title or not message:
             raise HomeAssistantError("Missing username or device_id, title, or message.")
