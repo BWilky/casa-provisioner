@@ -243,7 +243,10 @@ created_at, consumed_at?}`.
 7. Mark consumed, save, fire `casa_notification_action` (§1.5), then if the
    entry has `service`: `hass.services.async_call(domain, name, data,
    target=target, blocking=False, context=Context())`, catching and logging
-   any exception. Return 200.
+   any exception. Return 200. The system `Context()` is safe because
+   `notify_user` refuses, at send time, any action carrying `service` when
+   the call came from a non-admin user (`call.context.user_id` set and not an
+   admin); automations, scripts and system calls (`user_id` None) are allowed.
 
 ### 3.4 Crypto helper refactor (`location.py`)
 
