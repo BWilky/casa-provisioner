@@ -151,3 +151,21 @@ def test_validate_press_ok_and_optional_reply():
 def test_validate_press_rejects(inner):
     with pytest.raises(ValueError):
         validate_press(inner, now=1_000_000.0)
+
+
+def test_validate_press_rejects_non_finite_ts():
+    for bad_ts in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            validate_press({"notification_id": "n", "action": "A", "ts": bad_ts}, now=1_000_000.0)
+
+
+def test_consumed_record_still_enforces_device_and_action():
+    na, nid = _na()
+    rec, entry = consume_pending(na, notification_id=nid, device_id="D1", action="UNLOCK", now=1_000_010.0)
+    assert entry is not None
+    with pytest.raises(LookupError):
+        consume_pending(na, notification_id=nid, device_id="D2", action="UNLOCK", now=1_000_020.0)
+    with pytest.raises(LookupError):
+        consume_pending(na, notification_id=nid, device_id="D1", action="EXPLODE", now=1_000_020.0)
+    rec2, entry2 = consume_pending(na, notification_id=nid, device_id="D1", action="UNLOCK", now=1_000_030.0)
+    assert rec2 is rec and entry2 is None

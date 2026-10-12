@@ -5,6 +5,7 @@ so plain pytest can exercise everything."""
 from __future__ import annotations
 
 import copy
+import math
 import re
 import secrets
 import time
@@ -177,7 +178,8 @@ def validate_press(inner: dict, now: float | None = None) -> dict:
         raise ValueError("notification_id")
     if not isinstance(action, str) or not action:
         raise ValueError("action")
-    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or abs(_now(now) - ts) > 300:
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts) \
+            or abs(_now(now) - ts) > 300:
         raise ValueError("ts")
     out = {"notification_id": nid, "action": action, "ts": ts}
     if "reply_text" in inner:
