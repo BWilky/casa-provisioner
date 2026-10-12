@@ -5,8 +5,6 @@
 // ported faithfully from the legacy Device Inspector. Everything arrives via
 // the `app` context (no static sibling imports).
 
-import { actionsExampleText, parsePushData, PUSH_DATA_HELP } from "./push-data.js";
-
 // Record keys in the summary's documented order — the code pane and the
 // change detector both use this so the JSON rendering is stable.
 const RECORD_KEYS = [
@@ -173,6 +171,7 @@ export function createView(app) {
   let device = null;
   let host = null; // .page--flush container
   let shellMod = null; // editor-shell module
+  let pushDataMod = null; // views/push-data.js (pure helpers for the Push section)
   let fieldsMod = null; // profile-fields.js — shared field schema/renderer, loaded lazily
   let fieldsModLoading = false;
   let shell = null; // editor shell handle
@@ -310,6 +309,7 @@ export function createView(app) {
     if (!shellMod) {
       try {
         shellMod = await app.loadModule("editor-shell.js");
+        pushDataMod = await app.loadModule("views/push-data.js");
       } catch (err) {
         if (mounted && host)
           host.innerHTML = `<div class="page"><div class="errbar">Failed to load editor shell: ${esc(ui.errMsg(err))}</div></div>`;
@@ -893,6 +893,7 @@ export function createView(app) {
   let pushDataText = "";
 
   function renderPush() {
+    const { actionsExampleText, PUSH_DATA_HELP } = pushDataMod;
     const d = device;
     const dis = d.push_registered ? "" : " disabled";
     shell.formEl.innerHTML = `
@@ -953,7 +954,7 @@ export function createView(app) {
       renderSection();
       return;
     }
-    const parsed = parsePushData(dataText);
+    const parsed = pushDataMod.parsePushData(dataText);
     if (parsed.error) { msgs.push = { error: parsed.error }; renderSection(); return; }
     msgs.push = {};
     try {

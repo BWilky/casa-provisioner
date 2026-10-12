@@ -9,8 +9,6 @@
 // device_id "pending:<user_id>" so the row plumbing is shared. They can't be
 // selected for bulk actions; their actions live in views/pending-provision.js.
 
-import { actionsExampleText, parsePushData, PUSH_DATA_HELP } from "./push-data.js";
-
 const ONLINE_WINDOW_MS = 11 * 60 * 1000;
 const PAGE_SIZES = [10, 25, 50, 100];
 
@@ -504,7 +502,15 @@ export function createView(app) {
     });
   }
 
-  function openTestPushModal(d) {
+  async function openTestPushModal(d) {
+    let pushData;
+    try {
+      pushData = await app.loadModule("views/push-data.js");
+    } catch (e) {
+      ui.toast("Failed to load push form: " + ui.errMsg(e));
+      return;
+    }
+    const { actionsExampleText, parsePushData, PUSH_DATA_HELP } = pushData;
     const body = document.createElement("div");
     body.innerHTML = `
       <div class="field"><label>Title</label><input class="input" id="tp-title" value="Test Notification"></div>
