@@ -102,6 +102,7 @@ All use the device's HA bearer token unless noted. Queue and update mechanics ar
 | `/api/casa/profile_report` | POST | Device reports its current profile fields. |
 | `/api/casa/location_report` | POST | No bearer token. The body is encrypted with the device key, and that encryption is the authentication. |
 | `/api/casa/deprovision` (26.09.30) | POST | Body `{"device_id": "<id>"}`. The device must belong to the calling user, otherwise 404 `{"error": "Device not found"}`; missing `device_id` is 400. Removes the device record and revokes its access; the HA user account stays. Response `{"status": "success", "access_revoked": bool}`. The app treats any 2xx, 4xx, or timeout as done and continues its local wipe. |
+| `/api/casa/notification_action` (26.10.07) | POST | No bearer token. Encrypted press callback (`casa-action-v1`); see app-integration.md. |
 
 ## 9. Push commands
 
@@ -116,7 +117,7 @@ Sent through the relay as `data.command`.
 | `wireguard_update` | Push a WireGuard configuration. |
 | `wireguard_revoke` | Revoke the WireGuard configuration. |
 
-Visible notifications from `casa.notify_user` carry no `data.command`; any `data` is caller-supplied and the app must not route them through command dispatch. `wireguard_update` / `wireguard_revoke` may be sent as visible alerts (push_type alert) when not silent.
+Visible notifications from `casa.notify_user` carry no `data.command`; any `data` is caller-supplied and the app must not route them through command dispatch. `wireguard_update` / `wireguard_revoke` may be sent as visible alerts (push_type alert) when not silent. Pushes with `category: CASA_DYNAMIC` are `notify_user` visibles with `data.actions`; still no `data.command`, still never command dispatch.
 
 ## 10. Relay
 

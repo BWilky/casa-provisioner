@@ -143,6 +143,29 @@ Sends a push notification via the relay (`push.bonjour.casa`) to all registered 
 | `message` | ✅ | Notification body |
 | `data` | | Custom payload object/dictionary to pass with the notification |
 
+#### Action buttons
+
+Add `data.actions` (1–10 entries) to show buttons on the notification. Each entry has `action` (id, unique) and `title`, plus optionally `service` + `target` + `data` (run by HA when pressed), `nav_path` (opens the app there), `text_input: true` (typed text returns as `reply_text`), `destructive`, `auth_required`. `data.tag` and `data.action_data` are echoed back.
+
+A press fires `casa_notification_action` with `action`, `notification_id`, `device_id`, `username`, `user_id`, and `tag` / `action_data` / `reply_text` when present. Only buttons fire the event; a plain tap does not. Presses are accepted for 24 hours.
+
+```yaml
+- action: casa.notify_user
+  data:
+    username: bryce
+    title: Garage
+    message: Closing in 60 s
+    data: {tag: garage_close, actions: [{action: CANCEL, title: Keep open}]}
+- wait_for_trigger:
+    - trigger: event
+      event_type: casa_notification_action
+      event_data: {tag: garage_close, action: CANCEL}
+  timeout: "00:01:00"
+  continue_on_timeout: true
+- if: "{{ wait.trigger is none }}"
+  then: {action: cover.close_cover, target: {entity_id: cover.garage}}
+```
+
 ---
 
 ### `casa.reload_device`

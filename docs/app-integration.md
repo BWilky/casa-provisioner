@@ -335,6 +335,14 @@ as-is (no `command`, never routed through command dispatch). Keys the app acts o
 | `timeout` | number (s) | Auto-dismiss the sheet / stream after this long. |
 | `haptic` | string | `light`, `medium`, `heavy`, `success`, `warning`, `error` (`none` = off). |
 | `open_on_delivery` | bool | Act immediately when delivered in the foreground (banner suppressed) instead of on tap. |
+| `notification_id` | string | Present when the push carries actions; echo it in the press callback. |
+| `actions` | array | Buttons: `{action, title, nav_path?, text_input?, destructive?, auth_required?}`. Server-side keys are never sent. |
+
+Pushes that carry `actions` also set `aps.category = "CASA_DYNAMIC"`.
+
+### Notification action presses (`/api/casa/notification_action`)
+
+`POST` with `{"device_id": "<id>", "payload": "<b64>"}`; no bearer token. `payload` is AES-256-GCM (`nonce12 || ciphertext || tag16`, base64) under `HKDF-SHA256(ikm=utf8(device_key), salt=utf8(device_id), info="casa-action-v1")` — the location-report scheme with a different info string. Inner JSON: `{"notification_id", "action", "reply_text"?, "ts"}` (`ts` unix seconds, ±300 s). Any failure is `403 {"error": "Rejected"}`; a repeat of an accepted press is `200 {"status": "ok", "duplicate": true}`. Presses older than 24 h are rejected. Treat 403 as final; retry only transport errors and 5xx.
 
 ### Command pushes (`deprovision`)
 

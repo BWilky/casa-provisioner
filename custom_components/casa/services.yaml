@@ -814,7 +814,16 @@ notify_user:
         text: {}
     data:
       name: "Data"
-      description: "Additional custom dictionary/JSON data to send with the push notification."
+      description: >-
+        Optional JSON object passed to the app. Add `actions` (1–10) for buttons on the
+        notification; each needs `action` (id) and `title`, and may set `service`
+        (e.g. script.turn_on, with `target`/`data`) to run when pressed, `nav_path` to
+        open the app at a path, `text_input: true` to ask for text, `destructive` or
+        `auth_required`. Presses fire the `casa_notification_action` event with the
+        action id, device_id, username, and any `tag` / `action_data` you include.
+        Example: {"tag": "door", "actions": [{"action": "UNLOCK", "title": "Unlock",
+        "service": "lock.unlock", "target": {"entity_id": "lock.front"}},
+        {"action": "IGNORE", "title": "Ignore", "destructive": true}]}
       required: false
       selector:
         object: {}
