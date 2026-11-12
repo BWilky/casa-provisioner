@@ -2798,7 +2798,7 @@ class CasaAdminDeviceView(HomeAssistantView):
                     return self.json({"error": "expires_at_override must be >= 0"}, status_code=400)
             _set_expiry_override(stored_data, device_id, value)
 
-        # "Force Device Changes": a direct per-device stamp of live settings.
+        # "Edit Device Settings": a direct per-device stamp of live settings.
         # Pushed through the same encrypted profile-update pipeline template
         # applies use (update_type "profile", profile_id None) — the app
         # already knows how to apply this exact envelope, so no app-side
@@ -2810,11 +2810,12 @@ class CasaAdminDeviceView(HomeAssistantView):
                 return self.json({"error": "provisioning_fields must be an object"}, status_code=400)
 
             # Only live device settings may be stored or pushed post-provision;
-            # process-scope keys (password, pin, timeout_minutes, ...) are
-            # dropped even if an older panel or manual API client sends them.
-            fields = {k: v for k, v in fields.items() if k in LIVE_PROVISIONING_FIELDS}
+            # process-scope keys (username, password, pin, ...) and the host
+            # URL are dropped even if an older panel or manual API client
+            # sends them (see PUSH_PROTECTED_FIELDS).
+            fields, _held = _pushable_fields(fields)
             if not fields:
-                return self.json({"error": "No device-live fields to push"}, status_code=400)
+                return self.json({"error": "No device-live fields to push (the host URL and sign-in can only change by re-provisioning)"}, status_code=400)
 
             profile_fields, wg_payload = _split_wireguard_from_profile(fields, self.hass.data[DOMAIN].get("wg_data"))
             if wg_payload and not body.get("allow_shared"):
@@ -3174,6 +3175,29 @@ def _reprovision_service_data(hass, device_info: dict, fallback_host_url: str) -
     if alias:
         data["device_alias"] = alias
     return data
+
+
+# Settings a post-provision push must never carry, whatever the caller sends:
+# moving a remote device to another host leaves it pointed at a server it has
+# no session on, and nothing can reach it to undo that. Changing the host (or
+# the account a device signs in as, which is not a device setting at all and
+# only ever travels in a provisioning payload or an explicit reauth) needs a
+# re-provision.
+PUSH_PROTECTED_FIELDS = ("host_url",)
+_WIREGUARD_CONFIG_FIELDS = ("wireguard_config", "wireguard_profile_id")
+
+
+def _pushable_fields(fields: dict, *, skip_wireguard_config: bool = False):
+    """Filter a settings push down to what may be sent to a provisioned
+    device: live fields only, minus PUSH_PROTECTED_FIELDS, and optionally
+    minus the WireGuard client config (a bulk apply must not replace each
+    device's own config). Returns (fields, sorted names of what was held back)."""
+    held = set(PUSH_PROTECTED_FIELDS)
+    if skip_wireguard_config:
+        held.update(_WIREGUARD_CONFIG_FIELDS)
+    kept = {k: v for k, v in fields.items() if k in LIVE_PROVISIONING_FIELDS and k not in held}
+    not_applied = sorted(k for k in fields if k in held)
+    return kept, not_applied
 
 
 def _split_wireguard_from_profile(fields: dict, wg_data: dict):
@@ -3776,6 +3800,7 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
 
         # Build the type-specific payload.
         wg_payload = None
+        not_applied = []
         if update_type == "wireguard":
             if action == "update":
                 config = str(body.get("wireguard_config", "")).strip()
@@ -3798,9 +3823,14 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             # actually sets, and only live device settings can change
             # post-provision (expiration_hours goes through
             # expires_at_override instead).
-            fields = {k: v for k, v in matched.get("fields", {}).items() if k in LIVE_PROVISIONING_FIELDS}
+            # The host URL is never part of it (PUSH_PROTECTED_FIELDS), and a
+            # caller applying to many devices at once can leave each device's
+            # own WireGuard config alone.
+            fields, not_applied = _pushable_fields(
+                matched.get("fields", {}), skip_wireguard_config=bool(body.get("skip_wireguard_config")),
+            )
             if not fields:
-                return self.json({"error": "This template sets no device-live fields"}, status_code=400)
+                return self.json({"error": "This template sets no device-live fields that can be applied to a provisioned device"}, status_code=400)
             # WireGuard settings travel as their own wireguard/update entry —
             # the app ignores them inside profile/update.
             fields, wg_payload = _split_wireguard_from_profile(fields, self.hass.data[DOMAIN].get("wg_data"))
@@ -3810,7 +3840,7 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
         if targets is None:
             return self.json({"error": "Target device or user not found"}, status_code=404)
         if not targets:
-            return self.json({"queued": 0, "skipped": 0, "not_found": not_found})
+            return self.json({"queued": 0, "skipped": 0, "not_found": not_found, "not_applied": not_applied})
 
         qu_data = self.hass.data[DOMAIN]["qu_data"]
         stored_data = self.hass.data[DOMAIN]["stored_data"]
@@ -3889,7 +3919,7 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             "CASA: Queued %s '%s' update(s) (push=%s notify=%s) by %s; delivery in background.",
             queued, update_type, send_update_push, notify_push, created_by,
         )
-        return self.json({"queued": queued, "skipped": skipped, "not_found": not_found})
+        return self.json({"queued": queued, "skipped": skipped, "not_found": not_found, "not_applied": not_applied})
 
     async def delete(self, request):
         """Cancel a single queued update by device_id + id.

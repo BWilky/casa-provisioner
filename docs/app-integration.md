@@ -249,7 +249,7 @@ types the app must accept:
 
 | Key | Type |
 |---|---|
-| `host_url` | string. A change to a different origin is refused (log + ack, keep the current server): the device has no credentials there; the panel warns that this needs a re-provision. Same-origin changes apply. |
+| `host_url` | string. **Servers newer than 26.11.12 never send this**: the host URL and the sign-in account never change through a settings push, only by re-provisioning. Apps must still refuse a cross-origin value from an older server (log + ack, keep the current server). |
 | `default_dashboard`, `allowed_pages`, `allowed_wifi`, `wireguard_excluded_wifi`, `push_notifications` (`"false"`, `"true"`, `"mandatory"`) | string |
 | `welcome_url` | string; `""` means no welcome page (same as absent) |
 | `immersive_level` | int, numeric string, or a legacy `"level,mode,color"` triple |

@@ -41,7 +41,7 @@ MAX_PROFILE_REPORT_INTERVAL_SECONDS = 86400
 # panel side by FIELD_SCOPES in panel/views/profile-fields.js — keep in sync.
 #
 # LIVE: genuine ongoing device state — savable on provision templates,
-# editable per-device via "Force Device Changes", and round-tripped by the
+# editable per-device via "Edit Device Settings", and round-tripped by the
 # device's own profile self-report.
 LIVE_PROVISIONING_FIELDS = {
     "host_url": "",

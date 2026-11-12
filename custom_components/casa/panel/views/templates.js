@@ -4,6 +4,84 @@
 // shared "Apply to devices" modal (one-time bulk apply of a template's set
 // live fields — devices do not become attached to the template).
 
+/* ---------- what a template apply may change ---------- */
+
+// Never sent to an already-provisioned device (the server drops it too): a
+// remote device moved to another host cannot be reached to undo it.
+export const NEVER_APPLIED = ["host_url"];
+// Per-device identity: left alone when one template goes to many devices.
+export const WIREGUARD_CONFIG_KEYS = ["wireguard_config", "wireguard_profile_id"];
+
+// Which devices were provisioned from `template`, and which of its fields a
+// re-apply to them would send. liveKeys: Set of device-live field keys.
+export function lineageApplyPlan(template, devices, liveKeys) {
+  const held = new Set([...NEVER_APPLIED, ...WIREGUARD_CONFIG_KEYS]);
+  const fields = Object.keys((template && template.fields) || {}).filter((k) => liveKeys.has(k) && !held.has(k));
+  const targets = (devices || []).filter((d) => template && template.id && d.provisioning_profile_id === template.id);
+  return { fields, devices: targets };
+}
+
+// After a template is saved: offer to send it to the devices that were
+// provisioned from it. Explicit and one-time, like every template apply.
+export async function offerLineageApply(app, template) {
+  const { api, ui } = app;
+  let fieldsMod;
+  try {
+    fieldsMod = await app.loadModule("views/profile-fields.js");
+  } catch (_err) {
+    return;
+  }
+  const plan = lineageApplyPlan(template, app.summary()?.devices, fieldsMod.LIVE_KEYS);
+  if (!plan.devices.length || !plan.fields.length) return;
+  const n = plan.devices.length;
+  const names = plan.devices.map((d) => d.alias || d.username || String(d.device_id || "").slice(0, 12));
+  const body = document.createElement("div");
+  body.innerHTML = `
+    <p style="margin:0 0 10px; font-size:14px; line-height:1.5;">
+      ${n} device${n === 1 ? " was" : "s were"} provisioned from this template:
+      <strong>${ui.esc(names.join(", "))}</strong>. Send the saved settings to ${n === 1 ? "it" : "them"} now?
+    </p>
+    <div style="display:flex; flex-wrap:wrap; gap:4px; margin-bottom:10px;">
+      ${plan.fields.map((k) => `<span class="chip chip--neutral">${ui.esc(k)}</span>`).join(" ")}
+    </div>
+    <div class="muted" style="font-size:12px; line-height:1.5;">
+      Sent by push where possible, otherwise picked up on each device's next heartbeat.
+      The host URL, the sign-in account and each device's own WireGuard config are never changed by this.
+    </div>
+    <div class="field__error" data-lineage-err hidden></div>`;
+  ui.openModal({
+    title: "Apply to provisioned devices",
+    bodyEl: body,
+    buttons: [
+      { label: "Not now", variant: "text" },
+      {
+        label: `Apply to ${n} device${n === 1 ? "" : "s"}`,
+        variant: "primary",
+        onClick: async (btn) => {
+          const errEl = body.querySelector("[data-lineage-err]");
+          errEl.hidden = true;
+          btn.disabled = true;
+          try {
+            const res = await api.applyTemplateToDevices({
+              templateId: template.id,
+              deviceIds: plan.devices.map((d) => d.device_id),
+              sendPush: true,
+              skipWireguardConfig: true,
+            });
+            ui.toast(`Settings queued for ${res.queued} device${res.queued === 1 ? "" : "s"}.`);
+            app.refresh();
+          } catch (err) {
+            btn.disabled = false;
+            errEl.hidden = false;
+            errEl.textContent = "Failed to apply: " + ui.errMsg(err);
+            return false;
+          }
+        },
+      },
+    ],
+  });
+}
+
 /* ---------- shared apply-to-devices modal ---------- */
 
 // openApplyTemplateModal(app, template) — template: {id, name, fields}
@@ -20,7 +98,7 @@ export async function openApplyTemplateModal(app, template) {
     return;
   }
 
-  const setLive = Object.keys(template.fields || {}).filter((k) => fieldsMod.LIVE_KEYS.has(k));
+  const setLive = Object.keys(template.fields || {}).filter((k) => fieldsMod.LIVE_KEYS.has(k) && !NEVER_APPLIED.includes(k));
   if (!setLive.length) {
     ui.showInfo({
       title: "Nothing to apply",
@@ -61,7 +139,8 @@ export async function openApplyTemplateModal(app, template) {
           One-time apply: pushes this template's ${setLive.length} set device
           field${setLive.length === 1 ? "" : "s"} to the selected devices. Devices
           do not follow the template afterwards — later template edits change
-          nothing until you apply again.
+          nothing until you apply again. The host URL and the sign-in account
+          are never changed by an apply.
         </div>
         <div style="display:flex; flex-wrap:wrap; gap:4px; margin-bottom:14px;">${chipList}</div>
         <span style="flex:1;"></span>

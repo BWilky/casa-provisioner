@@ -262,12 +262,15 @@ export class CasaApi {
   }
   // One-time bulk apply of a template's set live fields to selected devices;
   // devices do not become attached to the template.
-  applyTemplateToDevices({ templateId, deviceIds, sendPush = true, notifyPush = false, title = "", message = "" }) {
+  // The server never sends the host URL; skipWireguardConfig also leaves
+  // each device's own WireGuard config alone.
+  applyTemplateToDevices({ templateId, deviceIds, sendPush = true, notifyPush = false, title = "", message = "", skipWireguardConfig = false }) {
     return this.queueUpdate({
       update_type: "profile",
       action: "update",
       profile_id: templateId,
       device_ids: deviceIds,
+      skip_wireguard_config: skipWireguardConfig,
       send_update_push: sendPush,
       notify_push: notifyPush,
       title,
@@ -288,7 +291,7 @@ export class CasaApi {
       this.confirmSharedWireguard
     );
   }
-  // "Force Device Changes": one-time direct stamp of live fields onto a
+  // "Edit Device Settings": one-time direct stamp of live fields onto a
   // single device (see CasaAdminDeviceView.put's provisioning_fields branch).
   updateDeviceProvisioning(deviceId, fields) {
     return this.updateDevice({ device_id: deviceId, provisioning_fields: fields });

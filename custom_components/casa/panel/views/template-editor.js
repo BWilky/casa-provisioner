@@ -211,6 +211,14 @@ export function createView(app) {
       }
       app.setHeader({ title: titleText() });
       updateDirtyUi();
+      // Devices provisioned from this template do not follow it; offer the
+      // one-time apply right where the edit was made.
+      try {
+        templatesMod = templatesMod || (await app.loadModule("views/templates.js"));
+        await templatesMod.offerLineageApply(app, { id: templateId, name: payload.name, fields: payload.fields });
+      } catch (_err) {
+        /* the save itself succeeded; the offer is optional */
+      }
     } catch (err) {
       ui.toast("Save failed: " + ui.errMsg(err), { error: true });
     } finally {

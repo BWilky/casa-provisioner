@@ -28,6 +28,34 @@ function orderedRecord(d) {
 /* ---------- queue_update request builders (ported from legacy
    _pushDeviceWg / _pushDeviceProfile; shared with openPushModal) ---------- */
 
+// Turning the VPN off (or revoking its profile) on a device that is away from
+// home cuts it off from Home Assistant, so it takes two deliberate confirms.
+// Pure text builder (tested); confirmVpnOff shows the two prompts in turn.
+export function vpnOffPrompts(deviceName) {
+  return [
+    {
+      title: "Turn off remote access?",
+      message:
+        `This turns off the WireGuard VPN on "${deviceName}". Away from the home network it will ` +
+        "no longer be able to reach Home Assistant.",
+      confirmLabel: "Continue",
+    },
+    {
+      title: "Are you sure?",
+      message:
+        `If "${deviceName}" is not on the home network when this lands, it loses contact with Home ` +
+        "Assistant. Getting it back then depends on a push notification reaching it, or on " +
+        "re-provisioning it in person.",
+      confirmLabel: "Turn off remote access",
+    },
+  ];
+}
+
+function confirmVpnOff(ui, deviceName, onConfirm) {
+  const [first, second] = vpnOffPrompts(deviceName);
+  ui.showConfirm({ ...first, onConfirm: () => ui.showConfirm({ ...second, onConfirm }) });
+}
+
 // Picker label: the alias plus who already holds the profile, if anyone.
 function wgOptionLabel(p) {
   const users = Array.isArray(p.used_by) ? p.used_by : [];
@@ -145,13 +173,27 @@ export async function openPushModal(app, device, kind) {
             errEl.textContent = "Select a template first.";
             return false;
           }
-          try {
+          const send = async () => {
             const { req, label } = isWg
               ? buildWireguardRequest(device.device_id, profileId, profiles, sendPush, notifyPush)
               : buildProfileRequest(device.device_id, profileId, profiles, sendPush, notifyPush);
             const res = await api.queueUpdate(req);
             ui.toast(queueSuccessText(label, res));
             app.refresh();
+          };
+          if (isWg && !profileId) {
+            // Revoke: this modal closes; the two confirms take over.
+            confirmVpnOff(ui, device.alias || device.device_id, async () => {
+              try {
+                await send();
+              } catch (err) {
+                ui.toast("Failed to queue: " + ui.errMsg(err), { error: true });
+              }
+            });
+            return;
+          }
+          try {
+            await send();
           } catch (err) {
             errEl.hidden = false;
             errEl.textContent = "Failed to queue: " + ui.errMsg(err);
@@ -187,7 +229,7 @@ export function createView(app) {
   let wgLoading = false;
   let ppProfiles = null;
   let ppLoading = false;
-  let provisioningEditing = false; // "Force Device Changes" active?
+  let provisioningEditing = false; // "Edit Device Settings" active?
   let provisioningDraft = null; // editable copy of provisioning fields while editing
   let provisioningBaseline = null; // the reported values the draft started from
   let provisioningSubSection = "connection"; // sub-nav within the Provisioning section
@@ -530,7 +572,7 @@ export function createView(app) {
 
   // Read-only by default, sourced from the device's self-reported state (the
   // only durable source of "what this device actually has" — see
-  // CasaDeviceProfileReportView). "Force Device Changes" swaps into an
+  // CasaDeviceProfileReportView). "Edit Device Settings" swaps into an
   // editable copy of the same fields/markup the template editor uses
   // (profile-fields.js) — saving pushes the changes straight to this one
   // device (one-time; templates never sync automatically).
@@ -578,7 +620,10 @@ export function createView(app) {
         }</div>`
       : "";
 
-    const provSections = fieldsMod.sectionsFor(liveKeys);
+    // The host URL is shown but never editable here: the server refuses to
+    // push it (a remote device moved to another host can't be reached again).
+    const formKeys = provisioningEditing ? new Set([...liveKeys].filter((k) => k !== "host_url")) : liveKeys;
+    const provSections = fieldsMod.sectionsFor(formKeys);
     // A previously-persisted sub-section (e.g. "wifi") may no longer exist
     // under the live-only scope — snap to the first available one.
     if (!provSections.some((s) => s.id === provisioningSubSection)) {
@@ -595,11 +640,11 @@ export function createView(app) {
       ? `<button class="btn btn--text" id="dev-prov-cancel">Cancel</button>
          <button class="btn btn--primary" id="dev-prov-save">Save &amp; Push to Device</button>`
       : `<button class="btn btn--outlined" id="dev-prov-refresh">Refresh Now</button>
-         <button class="btn btn--danger-outlined" id="dev-prov-force">Force Device Changes</button>`;
+         <button class="btn btn--primary" id="dev-prov-force">Edit Device Settings</button>`;
 
     // While waiting for the device's first self-report, showing the
     // DEFAULTS-filled field form would look like real data — show a plain
-    // explanation instead. Force Device Changes still works in this state
+    // explanation instead. Edit Device Settings still works in this state
     // (it doesn't depend on a report having arrived), so editing mode
     // always shows the real form regardless of report status.
     const bodyHtml = !provisioningEditing && !hasReport
@@ -612,17 +657,17 @@ export function createView(app) {
            </p>
          </div>`
       : `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">${subNav}</div>
-         <div id="dev-prov-fields">${fieldsMod.renderSectionHtml(provisioningSubSection, values, { readOnly: !provisioningEditing, wgProfiles: wgProfiles || [], esc, fields: liveKeys })}</div>`;
+         <div id="dev-prov-fields">${fieldsMod.renderSectionHtml(provisioningSubSection, values, { readOnly: !provisioningEditing, wgProfiles: wgProfiles || [], esc, fields: formKeys })}</div>`;
 
     shell.formEl.innerHTML = `
       <h2>Provisioning</h2>
-      <p class="editor__form-desc">What this specific device is currently configured with — read-only unless "Force Device Changes" is active.</p>
+      <p class="editor__form-desc">What this specific device is currently configured with — read-only unless "Edit Device Settings" is active.</p>
       <div class="card section-card"><div class="card__body">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           ${freshness}
         </div>
         ${provisionedFromHtml}
-        ${provisioningEditing ? '<p class="field__help" style="margin:8px 0 0;">Changes are pushed directly to this device (one-time — templates never sync automatically).</p>' : ""}
+        ${provisioningEditing ? '<p class="field__help" style="margin:8px 0 0;">Changes are pushed directly to this device (one-time — templates never sync automatically). The host URL and the sign-in account cannot be changed here; re-provision the device to move it.</p>' : ""}
       </div></div>
       ${bodyHtml}
       ${msgHtml(msgs.provisioning)}
@@ -683,7 +728,7 @@ export function createView(app) {
   function changedProvisioningFields() {
     const draft = fieldsMod.collectFields(provisioningDraft, fieldsMod.LIVE_KEYS);
     const base = fieldsMod.collectFields(provisioningBaseline || {}, fieldsMod.LIVE_KEYS);
-    const keys = new Set(Object.keys(draft).filter((k) => draft[k] !== base[k]));
+    const keys = new Set(Object.keys(draft).filter((k) => k !== "host_url" && draft[k] !== base[k]));
     for (const group of COUPLED_FIELDS) {
       if (group.some((k) => keys.has(k))) {
         group.forEach((k) => {
@@ -696,29 +741,6 @@ export function createView(app) {
     return out;
   }
 
-  // First app version that refuses a cross-origin host_url push (keeps its
-  // current server); older versions apply it and strand themselves on an
-  // origin they have no credentials for.
-  const SAFE_HOST_CHANGE_APP_VERSION = [1, 8];
-
-  function appVersionAtLeast(version, min) {
-    const m = String(version || "").match(/^(\d+)(?:\.(\d+))?/);
-    if (!m) return false; // unknown -> treat as old
-    const parts = [parseInt(m[1], 10), parseInt(m[2] || "0", 10)];
-    for (let i = 0; i < min.length; i++) {
-      if (parts[i] !== min[i]) return parts[i] > min[i];
-    }
-    return true;
-  }
-
-  function originOf(url) {
-    try {
-      return new URL(String(url || "").trim()).origin;
-    } catch (_e) {
-      return null;
-    }
-  }
-
   async function saveProvisioning() {
     msgs.provisioning = {};
     const fields = changedProvisioningFields();
@@ -727,30 +749,9 @@ export function createView(app) {
       renderSection();
       return;
     }
-    const oldOrigin = originOf(provisioningBaseline && provisioningBaseline.host_url);
-    if ("host_url" in fields && oldOrigin && originOf(fields.host_url) !== oldOrigin) {
-      if (!appVersionAtLeast(device.app_version, SAFE_HOST_CHANGE_APP_VERSION)) {
-        // Blocked: this app version would apply the new host unconditionally
-        // and land on an origin it has no credentials for.
-        ui.showInfo({
-          title: "Re-provision to change host",
-          message:
-            `The new host URL is on a different origin than ${oldOrigin}. Moving a device to another ` +
-            `origin requires re-provisioning it. This device runs Casa ${device.app_version || "(unknown version)"}, ` +
-            "which would switch to the new host without credentials for it and stop working, so the change " +
-            "was not pushed. Re-provision the device, or keep the current origin.",
-        });
-        return;
-      }
-      ui.showConfirm({
-        title: "Host change needs re-provisioning",
-        message:
-          `The new host URL is on a different origin than ${oldOrigin}. A device can only move to another ` +
-          "origin by being re-provisioned; this app version will ignore the host change and keep its current " +
-          "server (older app versions would break). Push the other changes anyway?",
-        confirmLabel: "Push anyway",
-        onConfirm: () => pushProvisioning(fields),
-      });
+    const wasOn = !!(provisioningBaseline && provisioningBaseline.allow_wireguard);
+    if (wasOn && fields.allow_wireguard === false) {
+      confirmVpnOff(ui, displayName(device), () => pushProvisioning(fields));
       return;
     }
     await pushProvisioning(fields);
@@ -1033,6 +1034,14 @@ export function createView(app) {
     const profileId = select.value;
     const sendPush = !!shell.formEl.querySelector("#dev-wg-send-push")?.checked;
     const notifyPush = !!shell.formEl.querySelector("#dev-wg-notify-push")?.checked;
+    if (!profileId) {
+      confirmVpnOff(ui, displayName(device), () => sendWg(profileId, sendPush, notifyPush));
+      return;
+    }
+    await sendWg(profileId, sendPush, notifyPush);
+  }
+
+  async function sendWg(profileId, sendPush, notifyPush) {
     msgs.vpn = {};
     try {
       const { req, label } = buildWireguardRequest(
