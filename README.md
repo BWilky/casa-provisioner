@@ -79,8 +79,9 @@ Generates an encrypted provisioning payload. Supports four methods: `qr`, `ble`,
 |-------|---------|-------------|
 | `push_notifications` | `false` | `false`, `true`, or `mandatory` |
 | `allow_wireguard` | `false` | Enable WireGuard VPN for this profile |
-| `wireguard_config` | — | Paste the client's WireGuard config file content |
+| `wireguard_config` | — | Paste the client's WireGuard config file content. One config per device; see [How the app uses the config](docs/app-integration.md#how-the-app-uses-the-wireguard-config) |
 | `wireguard_excluded_wifi` | — | Comma-separated SSIDs where WireGuard stays off |
+| `allow_shared_wireguard` | `false` | Hand out a WireGuard config that another device already holds (refused otherwise) |
 
 **Timing & Security**
 

@@ -2,6 +2,37 @@
 // loop (independent of which view is mounted), plus thin wrappers around every
 // HA service and admin REST endpoint the panel uses.
 
+// One WireGuard config per device: the server refuses to send a config that
+// another device already holds, answering with code "wireguard_in_use" (a
+// 409 body for REST calls, the service response for casa.provision). Returns
+// {message, holders} for such an answer, else null.
+export function sharedWireguardConflict(v) {
+  const body = v && (v.body || v.response || v);
+  if (!body || typeof body !== "object" || body.code !== "wireguard_in_use") return null;
+  return {
+    message: String(body.message || body.error || "This WireGuard config is already in use by another device."),
+    holders: Array.isArray(body.holders) ? body.holders : [],
+  };
+}
+
+// Runs run(false); on a shared-config refusal asks confirm(conflict) and, on
+// yes, repeats as run(true) (the caller adds the override flag). A "no"
+// rejects with the refusal's message so the call site shows it as the error.
+export async function retryIfSharedAllowed(run, confirm) {
+  let res;
+  let conflict;
+  try {
+    res = await run(false);
+    conflict = sharedWireguardConflict(res);
+  } catch (err) {
+    conflict = sharedWireguardConflict(err);
+    if (!conflict) throw err;
+  }
+  if (!conflict) return res;
+  if (!confirm || !(await confirm(conflict))) throw new Error(conflict.message);
+  return run(true);
+}
+
 export class CasaApi {
   constructor() {
     this._hass = null;
@@ -12,6 +43,8 @@ export class CasaApi {
     this._paused = false;
     this._intervalMs = 30000;
     this._reqSeq = 0;
+    // Set by the app shell: async (conflict) => boolean. See retryIfSharedAllowed.
+    this.confirmSharedWireguard = null;
   }
 
   setHass(hass) {
@@ -126,7 +159,10 @@ export class CasaApi {
   }
 
   provision(data) {
-    return this._callWs("provision", data);
+    return retryIfSharedAllowed(
+      (allow) => this._callWs("provision", allow ? { ...data, allow_shared_wireguard: true } : data),
+      this.confirmSharedWireguard
+    );
   }
   async deleteDevice(deviceId) {
     const res = await this._callWs("delete_device", { device_id: deviceId });
@@ -247,7 +283,10 @@ export class CasaApi {
   // Presence-conditional: pass only the keys you want to change
   // ({device_id, alias?, expires_at_override?}).
   updateDevice(body) {
-    return this._hass.callApi("PUT", "casa/admin/device", body);
+    return retryIfSharedAllowed(
+      (allow) => this._hass.callApi("PUT", "casa/admin/device", allow ? { ...body, allow_shared: true } : body),
+      this.confirmSharedWireguard
+    );
   }
   // "Force Device Changes": one-time direct stamp of live fields onto a
   // single device (see CasaAdminDeviceView.put's provisioning_fields branch).
@@ -255,7 +294,10 @@ export class CasaApi {
     return this.updateDevice({ device_id: deviceId, provisioning_fields: fields });
   }
   queueUpdate(req) {
-    return this._hass.callApi("POST", "casa/admin/queue_update", req);
+    return retryIfSharedAllowed(
+      (allow) => this._hass.callApi("POST", "casa/admin/queue_update", allow ? { ...req, allow_shared: true } : req),
+      this.confirmSharedWireguard
+    );
   }
   // One-click re-provision of an existing device on its current account
   // ({device_id, method: "auto" | "qr", host_url}). Push when registered,

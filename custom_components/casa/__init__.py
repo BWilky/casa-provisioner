@@ -849,7 +849,7 @@ def _pending_profile_valid_until(now: float, *, scramble_at, window_ends_at, lis
     return float(end) + _PENDING_PROFILE_GRACE_SECONDS
 
 
-def _stash_pending_profile(hass, user_id: str, *, profile_id, profile_name, device_alias, expiration_hours, valid_until) -> None:
+def _stash_pending_profile(hass, user_id: str, *, profile_id, profile_name, device_alias, expiration_hours, valid_until, wireguard_key_fp=None) -> None:
     """Persist what a provision should stamp on the device that redeems it
     (template lineage, session length, the typed name). Keyed by HA user id —
     the one thing provision time and registration time share. Stored, so it
@@ -860,6 +860,7 @@ def _stash_pending_profile(hass, user_id: str, *, profile_id, profile_name, devi
         "profile_name": profile_name or None,
         "device_alias": (str(device_alias or "").strip()[:DEVICE_ALIAS_MAX_LEN] or None),
         "expiration_hours": expiration_hours,
+        "wireguard_key_fp": wireguard_key_fp or None,
         "set_at": time.time(),
         "valid_until": float(valid_until),
     }
@@ -952,6 +953,8 @@ async def _apply_pending_provision(hass, user_id: str, device_info: dict, refres
     device_info["provisioning_profile_name"] = pending.get("profile_name")
     if "expiration_hours" in pending:
         device_info["provisioning_expiration_hours"] = pending["expiration_hours"]
+    if pending.get("wireguard_key_fp"):
+        device_info["wireguard_key_fp"] = pending["wireguard_key_fp"]
     alias = str(pending.get("device_alias") or "").strip()
     if alias and not str(device_info.get("alias") or "").strip():
         device_info["alias"] = alias[:DEVICE_ALIAS_MAX_LEN]
@@ -1325,6 +1328,80 @@ def _set_expiry_override(stored_data: dict, device_id: str, value):
         device_info["expires_at_override_set_at"] = dt_util.now().isoformat()
         device_info.pop("expires_at_override_sent", None)
     return device_info
+
+
+WIREGUARD_IN_USE = "wireguard_in_use"
+
+
+def _wireguard_key_fingerprint(config) -> str | None:
+    """Identify a WireGuard client config by its private key (hashed, so the
+    key itself is never copied anywhere). Two configs with the same key are
+    the same peer to the VPN server, however else they differ. None when the
+    text carries no PrivateKey."""
+    match = re.search(r"^[ \t]*PrivateKey[ \t]*=[ \t]*(\S+)", str(config or ""), re.I | re.M)
+    if not match:
+        return None
+    return hashlib.sha256(match.group(1).encode("utf-8")).hexdigest()[:16]
+
+
+def _set_wireguard_assignment(device_info: dict, config) -> None:
+    """Remember which WireGuard client a device was last sent (None = revoked)."""
+    fp = _wireguard_key_fingerprint(config) if config else None
+    if fp:
+        device_info["wireguard_key_fp"] = fp
+    else:
+        device_info.pop("wireguard_key_fp", None)
+
+
+def _wireguard_holders(stored_data: dict, fp: str | None, *, exclude_device_ids=(), exclude_user_id=None) -> list:
+    """Names of the devices (and live, unredeemed setup links) already holding
+    the WireGuard client with fingerprint fp."""
+    if not fp:
+        return []
+    excluded = set(exclude_device_ids or ())
+    holders = []
+
+    def _scan(devices, username):
+        for did, dinfo in (devices or {}).items():
+            if did in excluded or (dinfo or {}).get("wireguard_key_fp") != fp:
+                continue
+            name = str(dinfo.get("alias") or "").strip() or did
+            holders.append(f"{name} ({username})" if username else name)
+
+    for _uid, udata in stored_data.get("users", {}).items():
+        if not udata.get("deleted", False):
+            _scan(udata.get("devices"), udata.get("username"))
+    for _uid, devices in stored_data.get("native_devices", {}).items():
+        _scan(devices, None)
+    now = time.time()
+    for uid, pending in (stored_data.get("pending_profiles") or {}).items():
+        if uid == exclude_user_id or (pending or {}).get("wireguard_key_fp") != fp:
+            continue
+        if now <= float(pending.get("valid_until") or 0):
+            name = str(pending.get("device_alias") or "").strip()
+            holders.append(f"{name} (awaiting setup)" if name else "a device awaiting setup")
+    return holders
+
+
+def _wireguard_conflict(stored_data: dict, config, *, target_device_ids=(), exclude_user_id=None) -> dict | None:
+    """One WireGuard client per device: the VPN server keeps a single endpoint
+    per key, so two devices on one config knock each other offline. Returns an
+    error body when sending `config` to the targets would share it (several
+    targets at once, or a device/setup link that already holds it), else None.
+    Callers let an admin override with an explicit allow_shared flag."""
+    fp = _wireguard_key_fingerprint(config)
+    if not fp:
+        return None
+    targets = list(target_device_ids or ())
+    holders = _wireguard_holders(stored_data, fp, exclude_device_ids=targets, exclude_user_id=exclude_user_id)
+    if len(targets) > 1:
+        message = f"This would put one WireGuard config on {len(targets)} devices."
+    elif holders:
+        message = "This WireGuard config is already in use by " + ", ".join(holders) + "."
+    else:
+        return None
+    message += " Devices sharing a config knock each other offline; each device needs its own."
+    return {"error": message, "message": message, "code": WIREGUARD_IN_USE, "holders": holders}
 
 
 def _enqueue_update(qu_data: dict, device_id: str, update_type: str, action: str, payload: dict, created_by: str) -> str:
@@ -2363,7 +2440,13 @@ class CasaWireGuardProfilesView(HomeAssistantView):
             return self.json_message("Admin access required", status_code=403)
 
         wg_data = self.hass.data.get(DOMAIN, {}).get("wg_data", {"profiles": []})
-        return self.json({"profiles": wg_data.get("profiles", [])})
+        stored_data = self.hass.data.get(DOMAIN, {}).get("stored_data", {})
+        # used_by is computed per request, never stored on the profile.
+        profiles = [
+            {**p, "used_by": _wireguard_holders(stored_data, _wireguard_key_fingerprint(p.get("config")))}
+            for p in wg_data.get("profiles", [])
+        ]
+        return self.json({"profiles": profiles})
 
     async def post(self, request):
         user = request.get("hass_user")
@@ -2733,6 +2816,12 @@ class CasaAdminDeviceView(HomeAssistantView):
             if not fields:
                 return self.json({"error": "No device-live fields to push"}, status_code=400)
 
+            profile_fields, wg_payload = _split_wireguard_from_profile(fields, self.hass.data[DOMAIN].get("wg_data"))
+            if wg_payload and not body.get("allow_shared"):
+                conflict = _wireguard_conflict(stored_data, wg_payload["config"], target_device_ids=[device_id])
+                if conflict:
+                    return self.json(conflict, status_code=409)
+
             # Merge: the panel sends only the fields the admin changed (older
             # panels send all of them), so the stored view stays complete.
             device_info["provisioning_fields"] = {**(device_info.get("provisioning_fields") or {}), **fields}
@@ -2741,7 +2830,6 @@ class CasaAdminDeviceView(HomeAssistantView):
             qu_data = self.hass.data[DOMAIN]["qu_data"]
             session = async_get_clientsession(self.hass)
             created_by = user.name or user.id
-            profile_fields, wg_payload = _split_wireguard_from_profile(fields, self.hass.data[DOMAIN].get("wg_data"))
             if profile_fields:
                 payload = {"profile_id": None, "name": "Custom device settings", "fields": profile_fields}
                 _update_id, pushed, _skipped = await _enqueue_and_push_update(
@@ -2755,6 +2843,7 @@ class CasaAdminDeviceView(HomeAssistantView):
                     stored_data, qu_data, session, device_id, device_info,
                     "wireguard", "update", wg_payload, created_by, send_push=True,
                 )
+                _set_wireguard_assignment(device_info, wg_payload["config"])
                 pushed = pushed or wg_pushed
             qu_store = self.hass.data[DOMAIN]["qu_store"]
             qu_store.async_delay_save(lambda: qu_data, 2.0)
@@ -3725,6 +3814,19 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
 
         qu_data = self.hass.data[DOMAIN]["qu_data"]
         stored_data = self.hass.data[DOMAIN]["stored_data"]
+
+        # The config these targets are about to receive, if any: a direct
+        # WireGuard update, or the one a template apply resolves to.
+        wg_config = None
+        if update_type == "wireguard" and action == "update":
+            wg_config = payload["config"]
+        elif wg_payload is not None:
+            wg_config = wg_payload["config"]
+        if wg_config and not body.get("allow_shared"):
+            conflict = _wireguard_conflict(stored_data, wg_config, target_device_ids=[did for did, _ in targets])
+            if conflict:
+                return self.json(conflict, status_code=409)
+        wg_changed = False
         created_by = user.name or user.id
 
         # Enqueue durably (in-memory + delayed save) and respond right away;
@@ -3740,6 +3842,9 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
         for did, dinfo in targets:
             if wg_payload is not None:
                 wg_jobs.append((did, dinfo, _enqueue_update(qu_data, did, "wireguard", "update", wg_payload, created_by)))
+            if update_type == "wireguard" or wg_payload is not None:
+                _set_wireguard_assignment(dinfo, wg_config)
+                wg_changed = True
             if payload is None:
                 queued += 1
                 continue
@@ -3765,7 +3870,7 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
 
         qu_store = self.hass.data[DOMAIN]["qu_store"]
         qu_store.async_delay_save(lambda: qu_data, 2.0)
-        if pending_flagged:
+        if pending_flagged or wg_changed:
             store = self.hass.data[DOMAIN]["store"]
             store.async_delay_save(lambda: stored_data, 2.0)
 
@@ -5212,6 +5317,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not provider:
             return {"error": "Home Assistant core auth provider not found"}
 
+        wireguard_config_raw = ""
+        wireguard_excluded_wifi_raw = ""
+
+        # Fetch from linked WireGuard profile if specified
+        wg_profile_key = get_field("wireguard_profile_id", "") or get_field("wireguard_profile", "")
+        if wg_profile_key:
+            wg_data = hass.data.get(DOMAIN, {}).get("wg_data", {"profiles": []})
+            wg_profile = None
+            for wp in wg_data.get("profiles", []):
+                if wp.get("id") == wg_profile_key or wp.get("alias") == wg_profile_key:
+                    wg_profile = wp
+                    break
+            if wg_profile:
+                wireguard_config_raw = wg_profile.get("config", "")
+                wireguard_excluded_wifi_raw = wg_profile.get("excluded_wifi", "")
+                _LOGGER.info("CASA: Linked WireGuard profile '%s' resolved.", wg_profile.get("alias"))
+
+        # Fallback to direct field values if not linked/not found
+        if not wireguard_config_raw:
+            wireguard_config_raw = get_field("wireguard_config", "")
+        if not wireguard_excluded_wifi_raw:
+            wireguard_excluded_wifi_raw = get_field("wireguard_excluded_wifi", "")
+
+        # Checked here, before the account password is rotated and existing
+        # sessions are ended, so a refusal changes nothing.
+        # One WireGuard client per device: refuse to hand out a config another
+        # device (or a live setup link for another account) already holds,
+        # unless the caller says so. A re-provision of the same device, or a
+        # regenerated link for the same account, is not sharing.
+        wireguard_key_fp = _wireguard_key_fingerprint(wireguard_config_raw)
+        if wireguard_key_fp and not get_field("allow_shared_wireguard", False):
+            conflict = _wireguard_conflict(
+                hass.data[DOMAIN]["stored_data"], wireguard_config_raw,
+                target_device_ids=[replaces_device_id] if replaces_device_id else [],
+                exclude_user_id=target_user.id if target_user else None,
+            )
+            if conflict:
+                return {"error": conflict["message"], "code": WIREGUARD_IN_USE, "holders": conflict["holders"]}
+
         target_password = str(get_field("password", "")).strip()
 
         # A supplied password is set on the account too (it used to be
@@ -5239,29 +5383,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         allow_wireguard = get_field("allow_wireguard", False)
         normalized_wireguard = "true" if allow_wireguard else "false"
-
-        wireguard_config_raw = ""
-        wireguard_excluded_wifi_raw = ""
-
-        # Fetch from linked WireGuard profile if specified
-        wg_profile_key = get_field("wireguard_profile_id", "") or get_field("wireguard_profile", "")
-        if wg_profile_key:
-            wg_data = hass.data.get(DOMAIN, {}).get("wg_data", {"profiles": []})
-            wg_profile = None
-            for wp in wg_data.get("profiles", []):
-                if wp.get("id") == wg_profile_key or wp.get("alias") == wg_profile_key:
-                    wg_profile = wp
-                    break
-            if wg_profile:
-                wireguard_config_raw = wg_profile.get("config", "")
-                wireguard_excluded_wifi_raw = wg_profile.get("excluded_wifi", "")
-                _LOGGER.info("CASA: Linked WireGuard profile '%s' resolved.", wg_profile.get("alias"))
-
-        # Fallback to direct field values if not linked/not found
-        if not wireguard_config_raw:
-            wireguard_config_raw = get_field("wireguard_config", "")
-        if not wireguard_excluded_wifi_raw:
-            wireguard_excluded_wifi_raw = get_field("wireguard_excluded_wifi", "")
 
         if wireguard_config_raw:
             wireguard_config_encoded = base64.b64encode(str(wireguard_config_raw).encode("utf-8")).decode("utf-8")
@@ -5493,6 +5614,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             profile_name=matched_profile.get("name") if matched_profile else None,
             device_alias=device_alias,
             expiration_hours=expiration_hours,
+            wireguard_key_fp=wireguard_key_fp,
             valid_until=_pending_profile_valid_until(
                 now_ts, scramble_at=scramble_at, window_ends_at=window_ends_at, listen_until=listen_until,
             ),
@@ -6434,6 +6556,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         session = async_get_clientsession(hass)
         command = "wireguard_update" if action == "update" else "wireguard_revoke"
 
+        # This service has no one to ask, so sharing is logged, not refused.
+        if action == "update":
+            conflict = _wireguard_conflict(stored_data, wireguard_config, target_device_ids=[t[0] for t in targets])
+            if conflict:
+                _LOGGER.warning("CASA: update_wireguard: %s", conflict["message"])
+
         sent_count = 0
         failed_count = 0
         skipped_count = 0
@@ -6489,6 +6617,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             if success:
                 sent_count += 1
+                _set_wireguard_assignment(dinfo, wireguard_config if action == "update" else None)
+                _save_stored_data(hass)
                 _LOGGER.info("CASA: Sent wireguard %s to device '%s' (silent=%s).", action, did, silent)
             else:
                 failed_count += 1

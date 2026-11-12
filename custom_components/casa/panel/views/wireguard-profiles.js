@@ -66,6 +66,7 @@ export function createView(app) {
       .map(
         (p) => `<tr data-id="${ui.esc(p.id)}">
           <td><strong>${ui.esc(p.alias || "(unnamed)")}</strong></td>
+          <td>${usedByHtml(p)}</td>
           <td class="mono">${ui.esc(p.excluded_wifi || "—")}</td>
           <td>${ui.esc(ui.fmtTime(p.created_at))}</td>
           <td class="col-actions">
@@ -76,10 +77,19 @@ export function createView(app) {
       .join("");
     refs.results.innerHTML = `<div class="card" style="overflow-x:auto;">
       <table class="table">
-        <thead><tr><th>Alias</th><th>Excluded Wi-Fi</th><th>Created</th><th></th></tr></thead>
+        <thead><tr><th>Alias</th><th>Used by</th><th>Excluded Wi-Fi</th><th>Created</th><th></th></tr></thead>
         <tbody>${trs}</tbody>
       </table>
     </div>`;
+  }
+
+  function usedByHtml(p) {
+    const users = Array.isArray(p.used_by) ? p.used_by : [];
+    if (!users.length) return `<span class="muted">Free</span>`;
+    const names = ui.esc(users.join(", "));
+    return users.length > 1
+      ? `<span class="chip chip--warn" title="Shared by ${users.length} devices">Shared</span> ${names}`
+      : names;
   }
 
   /* ---------- create/edit modal ---------- */
@@ -89,12 +99,18 @@ export function createView(app) {
     body.innerHTML = `
       <div class="field">
         <label>Alias</label>
-        <input class="input" id="wg-alias" placeholder="e.g. Home Network" value="${ui.esc((existing && existing.alias) || "")}">
-        <div class="field__help">Leave blank to auto-generate a name.</div>
+        <input class="input" id="wg-alias" placeholder="e.g. Sam's iPhone" value="${ui.esc((existing && existing.alias) || "")}">
+        <div class="field__help">Name it after the device that will use it. Leave blank to auto-generate a name.</div>
       </div>
       <div class="field">
         <label>Config *</label>
         <textarea class="input" id="wg-config" rows="8" placeholder="[Interface]&#10;PrivateKey = ...&#10;&#10;[Peer]&#10;PublicKey = ...">${ui.esc((existing && existing.config) || "")}</textarea>
+        <div class="field__help">
+          Paste one client config from your VPN server, created for one device only.
+          The app routes only the Home Assistant address through the tunnel unless AllowedIPs
+          names that address itself or the user turns on Full Tunnel.
+          DNS is used only in Full Tunnel, and private DNS servers are dropped.
+        </div>
       </div>
       <div class="field">
         <label>Excluded Wi-Fi</label>
@@ -216,6 +232,9 @@ export function createView(app) {
             </div>
             <span class="spacer"></span>
             <button class="btn btn--primary" id="wg-create">+ New profile</button>
+          </div>
+          <div class="muted" style="font-size:13px; margin:0 0 10px;">
+            Each profile is one WireGuard client: one key and one tunnel address. Give every device its own profile. Two devices sharing a profile knock each other offline, and revoking one revokes both. Casa asks before sending a profile that another device already holds.
           </div>
           <div class="list-meta" id="wg-meta"></div>
           <div id="wg-results"></div>

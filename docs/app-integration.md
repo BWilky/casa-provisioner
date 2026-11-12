@@ -209,6 +209,38 @@ The HA user account is never deleted; only this device's record and session are 
 | `app`       | `clear_cache_reload` | `{}` | clear the web cache and reload the WebView, then ack; the server drops it unpulled after 24 h and keeps at most one pending |
 | `location`  | `update`         | `{ "anchors": [ ... ], "config_version": "<string>" }`         | replace the zone config; empty `anchors` (`config_version: ""`) means tear down all regions and clear the config, without prompting for location permission |
 
+### How the app uses the WireGuard config
+
+The `config` text is a standard wg-quick client config, but the app does not apply
+it verbatim:
+
+- **AllowedIPs.** Unless the list already names the Home Assistant host, the app
+  replaces it with that host as a `/32`, so only Home Assistant traffic uses the
+  tunnel. A config exported with `0.0.0.0/0` (the UniFi default) therefore still
+  installs as a split tunnel. The user's "Route All Traffic (Full Tunnel)" setting
+  switches it to `0.0.0.0/0`.
+- **DNS.** In split-tunnel mode the app drops the `DNS =` line, so the tunnel does
+  not replace the phone's resolver for other apps. In full-tunnel mode DNS is kept,
+  minus private-range servers (they are unreachable before the handshake on
+  cellular); if none remain the app uses `1.1.1.1, 1.0.0.1`.
+- **One config per device.** A WireGuard server identifies a peer by its public key
+  and keeps one current endpoint and one tunnel address for it. Two devices
+  installed from the same config take the tunnel from each other every time one of
+  them sends a packet, and neither can be revoked alone. Each device needs its own
+  client entry on the VPN server and its own config here.
+
+The server enforces this. It remembers which client each device was last sent
+(`wireguard_key_fp` on the device record: a hash of the config's private key, set on
+update, cleared on revoke, carried from a setup link to the device that redeems it).
+Sending a config that another device or a live setup link already holds, or one
+config to several devices at once, is refused with code `wireguard_in_use`: HTTP 409
+from `/api/casa/admin/queue_update` and `/api/casa/admin/device`, and an
+`{error, code, holders}` response from `casa.provision`. The override is
+`allow_shared: true` on the two endpoints and `allow_shared_wireguard: true` on
+`casa.provision`; the panel asks the admin and retries with it. The legacy
+`casa.update_wireguard` service only logs a warning. Devices that received a config
+before this tracking existed are unknown to it until they are sent one again.
+
 ### `profile` / `update` fields
 
 `fields` is sparse — only the keys being changed are present (template applies carry

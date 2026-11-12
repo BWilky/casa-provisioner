@@ -282,7 +282,7 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
         <div class="field${stateCls("wireguard_config")}" data-field="wireguard_config">
           ${labelRow("wireguard_config", `<label>WireGuard config</label>`)}
           <textarea class="textarea" data-key="wireguard_config" placeholder="[Interface]&#10;PrivateKey = ..." ${dis()}>${esc(val("wireguard_config"))}</textarea>
-          <div class="field__help">Full client config pushed to the device. Ignored when a WireGuard profile is linked above.</div>
+          <div class="field__help">Full client config pushed to the device. Ignored when a WireGuard profile is linked above. One config per device: do not reuse a config that another device already has.</div>
         </div>
         ${textField({ key: "wireguard_excluded_wifi", label: "WireGuard excluded Wi-Fi", placeholder: "HomeSSID", help: "SSIDs on which the tunnel stays down (device is already local)." })}`;
 
@@ -297,7 +297,7 @@ export function renderSectionHtml(sectionId, values, { readOnly = false, wgProfi
         ],
       })}
       ${toggleField({ key: "allow_wireguard", label: "Allow WireGuard", help: "Lets the device bring up the VPN tunnel for remote access." })}
-      ${selectField({ key: "wireguard_profile_id", label: "Link WireGuard profile", options, help: "Linking a profile overrides the pasted config below." })}
+      ${selectField({ key: "wireguard_profile_id", label: "Link WireGuard profile", options, help: "Linking a profile overrides the pasted config below. Every device provisioned from this template gets this same profile, and WireGuard needs one profile per device, so link one only on a template used for a single device." })}
       ${inlineHtml}`;
   }
 

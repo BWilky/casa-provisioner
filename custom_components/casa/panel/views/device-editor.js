@@ -28,6 +28,12 @@ function orderedRecord(d) {
 /* ---------- queue_update request builders (ported from legacy
    _pushDeviceWg / _pushDeviceProfile; shared with openPushModal) ---------- */
 
+// Picker label: the alias plus who already holds the profile, if anyone.
+function wgOptionLabel(p) {
+  const users = Array.isArray(p.used_by) ? p.used_by : [];
+  return users.length ? `${p.alias} — in use by ${users.join(", ")}` : p.alias;
+}
+
 function buildWireguardRequest(deviceId, profileId, profiles, sendPush, notifyPush) {
   const req = {
     device_id: deviceId,
@@ -103,7 +109,7 @@ export async function openPushModal(app, device, kind) {
   }
 
   const options = profiles
-    .map((p) => `<option value="${esc(p.id)}">${esc(isWg ? p.alias : p.name)}</option>`)
+    .map((p) => `<option value="${esc(p.id)}">${esc(isWg ? wgOptionLabel(p) : p.name)}</option>`)
     .join("");
   const body = document.createElement("div");
   body.innerHTML = `
@@ -113,6 +119,7 @@ export async function openPushModal(app, device, kind) {
         <option value="">${isWg ? "-- None / Revoke VPN --" : "-- Select a template --"}</option>
         ${options}
       </select>
+      ${isWg ? '<div class="field__help">Pick a profile no other device is using. Two devices on one profile knock each other offline.</div>' : ""}
     </div>
     ${isWg ? "" : '<div class="muted" style="font-size:12px; margin:0 0 10px;">One-time apply of the template\'s set device fields — the device does not follow the template afterwards.</div>'}
     <label class="toggle"><input type="checkbox" data-pm-send> Send update via push</label>
@@ -985,7 +992,7 @@ export function createView(app) {
     const d = device;
     ensureWgProfiles();
     const options = (wgProfiles || [])
-      .map((p) => `<option value="${esc(p.id)}">${esc(p.alias)}</option>`)
+      .map((p) => `<option value="${esc(p.id)}">${esc(wgOptionLabel(p))}</option>`)
       .join("");
     shell.formEl.innerHTML = `
       <h2>VPN / WireGuard</h2>
@@ -1007,6 +1014,7 @@ export function createView(app) {
             ${options}
           </select>
           ${wgProfiles === null ? '<div class="field__help">Loading profiles…</div>' : ""}
+          <div class="field__help">Pick a profile no other device is using. Two devices on one profile knock each other offline.</div>
         </div>
         <label class="toggle"><input type="checkbox" id="dev-wg-send-push"> Send update via push</label>
         <label class="toggle"><input type="checkbox" id="dev-wg-notify-push"> Notify via push</label>

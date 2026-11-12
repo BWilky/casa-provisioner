@@ -163,6 +163,12 @@ provision:
       selector:
         text:
           multiline: true
+    allow_shared_wireguard:
+      name: "Allow Shared WireGuard Config"
+      description: "Each device needs its own WireGuard config. Provisioning is refused when the config is already held by another device or a live setup link; turn this on to hand it out anyway."
+      default: false
+      selector:
+        boolean: {}
     wireguard_excluded_wifi:
       name: "WireGuard Excluded Wi-Fi Networks"
       description: "Comma-separated list of Wi-Fi SSIDs where WireGuard should not activate (e.g., home networks)."

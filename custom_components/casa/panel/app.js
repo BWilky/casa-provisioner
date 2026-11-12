@@ -52,6 +52,20 @@ export async function createApp({ host, loadModule, version }) {
     shadowRoot: shadow,
   });
 
+  // Not dismissable: the api call awaiting this must always get an answer.
+  api.confirmSharedWireguard = (conflict) =>
+    new Promise((resolve) => {
+      ui.openModal({
+        title: "WireGuard config already in use",
+        bodyHtml: `<p style="margin:0; font-size:14px; line-height:1.5;">${uiMod.esc(conflict.message)}</p>`,
+        dismissable: false,
+        buttons: [
+          { label: "Cancel", variant: "text", onClick: () => resolve(false) },
+          { label: "Send anyway", variant: "danger", onClick: () => resolve(true) },
+        ],
+      });
+    });
+
   const hdr = shadow.getElementById("hdr");
   const hdrNav = shadow.getElementById("hdr-nav");
   const hdrTitle = shadow.getElementById("hdr-title");
