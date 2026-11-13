@@ -67,22 +67,32 @@ Plan: `push-notifications-relay/docs/superpowers/plans/2026-11-13-relay-hardenin
   - Bump version to 1.3.0, update the README, deploy, verify.
   - Enable TTL policies.
 
-## Phase 2: casa provisioner fixes (no protocol change)
+## Phase 2: casa provisioner fixes (no protocol change). Built 2026-11-13, not yet released
 
-- [ ] **C1 ✔ Claim takeover.** A fresh provisioning claim may only move the device it was issued for, `replaces_device_id`. Drop the time-based path for foreign records (`__init__.py:7054`, `:769`).
+On branch `security-phase2` as casa 26.11.14. Plan: `docs/superpowers/plans/2026-11-13-security-phase2.md`.
+- **Done:** C1–C7, C10–C14, plus the final-review fixes.
+- **Partial, by ruling:**
+  - C2 detects a reused link and alerts the admin; it does not revoke the extra session.
+  - C9 covers uninstall only. Regen rows, auth entries and the WireGuard views keep their secrets.
+  - C10 still stores `last_12_token` and keeps its sensors.
+  - C13 leaves the Reload button open to any HA user.
+- **Deferred to Phase 4:** C8.
+- **Deferred minors:** the remove_user race, `site_id` churn on a 5xx during the heal, a startup de-dupe of double-pinned records, stripping `action_data` without actions, removing stores through the live Store instances, and the missing tests.
+
+- [x] **C1 ✔ Claim takeover.** A fresh provisioning claim may only move the device it was issued for, `replaces_device_id`. Drop the time-based path for foreign records (`__init__.py:7054`, `:769`).
 - [ ] **C2 True single-use links.** On redemption, revoke every new session except the first and alert the admin if there were several (`:446-496`, `:987`).
-- [ ] **C3 Admin panel XSS.** Render `current_url` as a link only when it is http(s) (`panel/views/device-editor.js:489`).
-- [ ] **C4 Service authorization.**
+- [x] **C3 Admin panel XSS.** Render `current_url` as a link only when it is http(s) (`panel/views/device-editor.js:489`).
+- [x] **C4 Service authorization.**
   - scramble, provision and remove_token are admin or system only, regardless of the option (see Q2).
   - Restrict them to Casa-managed users.
   - Never allow removing an admin's or the owner's tokens.
-- [ ] **C5 Strip reserved keys from `notify_user` data.** Strip `command`, `casa_command`, `aps`, `casa_update`, `update_payload`, `wireguard_payload`, `encrypted` and `device_key_id`. Stop forwarding `action_data` to the device; it is already stored server-side. Cap the full push estimate at 4 KB before creating the pending record.
-- [ ] **C6 React to relay 403s.**
+- [x] **C5 Strip reserved keys from `notify_user` data.** Strip `command`, `casa_command`, `aps`, `casa_update`, `update_payload`, `wireguard_payload`, `encrypted` and `device_key_id`. Stop forwarding `action_data` to the device; it is already stored server-side. Cap the full push estimate at 4 KB before creating the pending record.
+- [x] **C6 React to relay 403s.**
   - "registration invalid or expired": mark the device `needs_reregister` right away.
   - "Invalid site key": re-verify or re-register the site, then reconcile.
 
   Today recovery waits up to about 24 h for the daily reconcile.
-- [ ] **C7 Keep `site_id` only after `/register_site` succeeds.** Retry with backoff instead of only on restart (`:328`).
+- [x] **C7 Keep `site_id` only after `/register_site` succeeds.** Retry with backoff instead of only on restart (`:328`).
 - [ ] **C8 WireGuard updates go through the queue.**
   - `update_wireguard` uses the acked `profile_updates` queue; the push becomes only a nudge.
   - Don't mark the update applied on relay 200 (`:6630-6650`).
@@ -97,10 +107,10 @@ Plan: `push-notifications-relay/docs/superpowers/plans/2026-11-13-relay-hardenin
   - No `site_key` or full push token in logs, including DEBUG (`:6277`).
   - Use `request.remote`, not X-Forwarded-For or a body-supplied `ip_address`.
   - Stop storing `last_12_token`; drop the token-suffix and push-token sensors.
-- [ ] **C11 Deleted users.** `remove_user` purges the user's device records, their relay tokens, `provision_claims`, `provision_opened` and `server_passwords`. `notify_user` by device_id honours the deleted flag.
-- [ ] **C12 Sibling re-pin.** Re-pin only when the caller presents the current pinned token or a fresh claim (`:1928`, `:4896`).
+- [x] **C11 Deleted users.** `remove_user` purges the user's device records, their relay tokens, `provision_claims`, `provision_opened` and `server_passwords`. `notify_user` by device_id honours the deleted flag.
+- [x] **C12 Sibling re-pin.** Re-pin only when the caller presents the current pinned token or a fresh claim (`:1928`, `:4896`).
 - [ ] **C13 Native device auto-create.** Non-admin users can't mass-create native device records (cap per user; admin approval?). The Reload button is admin only.
-- [ ] **C14 Location report replay.** Reject a repeated (device_id, ts) within the ±300 s window.
+- [x] **C14 Location report replay.** Reject a repeated (device_id, ts) within the ±300 s window.
 
 ## Phase 3: iOS fixes (no protocol change)
 
