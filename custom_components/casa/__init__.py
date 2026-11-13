@@ -1017,6 +1017,34 @@ async def _alert_link_used_twice(hass, login_username, user, token_ids) -> None:
         _LOGGER.error("CASA: Could not raise the link-reuse notification: %s", err)
 
 
+# Services that reveal a password or end sessions: admin/system only even when
+# the admin_system_only option is off (that option governs everything else).
+ALWAYS_ADMIN_SERVICES = frozenset({"scramble_guest_password", "provision", "generate_qr", "remove_token"})
+
+
+async def _authorize_service(hass, call, *, admin_system_only: bool) -> list:
+    """Return all HA users when the call may run, else raise HomeAssistantError.
+
+    Script/automation contexts (parent_id set) and system contexts (no
+    user_id) are always allowed. A user calling directly must be an admin
+    when admin_system_only is on, and always for ALWAYS_ADMIN_SERVICES."""
+    users = await hass.auth.async_get_users()
+    if not admin_system_only and call.service not in ALWAYS_ADMIN_SERVICES:
+        return users
+    if call.context.parent_id is not None or call.context.user_id is None:
+        return users
+    calling_user = next((u for u in users if u.id == call.context.user_id), None)
+    if not calling_user or not getattr(calling_user, "is_admin", False):
+        _LOGGER.warning(
+            "CASA SECURITY: Blocked unauthorized service call to '%s' by user '%s' (ID: %s).",
+            call.service,
+            getattr(calling_user, "name", "Unknown") if calling_user else "Unknown",
+            call.context.user_id,
+        )
+        raise HomeAssistantError("Admin or system context is required to execute this service.")
+    return users
+
+
 async def _end_provision_window(hass, user_id: str, provision_id: str, reason: str) -> None:
     """Close a provisioning window: scramble the password (the link dies),
     retire its QR file, forget the persisted record and stop its tasks.
@@ -5203,27 +5231,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _check_authorization(call: ServiceCall):
         """Check if the service call is authorized."""
-        users = await hass.auth.async_get_users()
-        if not entry.options.get(CONF_ADMIN_SYSTEM_ONLY, True):
-            return users
-
-        # System/Script contexts are allowed:
-        # - call.context.parent_id is set when called from script/automation
-        # - call.context.user_id is None when triggered by the system/time triggers
-        if call.context.parent_id is not None or call.context.user_id is None:
-            return users
-
-        # Directly called by a user. Verify that they are an admin.
-        calling_user = next((u for u in users if u.id == call.context.user_id), None)
-        if not calling_user or not getattr(calling_user, "is_admin", False):
-            _LOGGER.warning(
-                "CASA SECURITY: Blocked unauthorized service call to '%s' by user '%s' (ID: %s).",
-                call.service,
-                getattr(calling_user, "name", "Unknown") if calling_user else "Unknown",
-                call.context.user_id,
-            )
-            raise HomeAssistantError("Admin or system context is required to execute this service.")
-        return users
+        return await _authorize_service(
+            hass, call, admin_system_only=entry.options.get(CONF_ADMIN_SYSTEM_ONLY, True),
+        )
 
     async def _get_context_creator(context) -> str:
         """Analyze the context to find who/what triggered the action."""
