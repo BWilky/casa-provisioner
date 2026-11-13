@@ -1272,6 +1272,18 @@ def _find_device_record(stored_data: dict, device_id: str):
     return None, None, None
 
 
+# Device records per account. Casa-managed accounts and admins: 100. A
+# non-admin's own HA account (a "native" device) gets fewer: any HA user can
+# create these just by opening the app, each with registry entries.
+NATIVE_DEVICE_LIMIT = 10
+
+
+def _device_limit(*, native: bool, ha_user) -> int:
+    if not native or getattr(ha_user, "is_admin", False):
+        return 100
+    return NATIVE_DEVICE_LIMIT
+
+
 def _may_repin(stored_data: dict, device_id: str, refresh_token_id) -> bool:
     """May this session become device_id's pinned session? Yes when it
     already is, or when it is pinned to no other device record (the same
@@ -2819,6 +2831,21 @@ class CasaLocationZonesView(HomeAssistantView):
         return self.json({"status": "ok", "config_version": lz_data["config_version"], "queued": queued})
 
 
+def _seen_report_before(hass, payload_b64: str) -> bool:
+    """True when this exact ciphertext was already accepted inside the
+    report's ±300 s window. Every real report carries a fresh random nonce,
+    so only a replayed capture repeats; outside the window ts rejects it."""
+    seen = hass.data[DOMAIN].setdefault("seen_reports", {})
+    now = time.time()
+    for digest in [d for d, until in seen.items() if until < now]:
+        seen.pop(digest, None)
+    digest = hashlib.sha256(payload_b64.encode("utf-8")).hexdigest()
+    if digest in seen:
+        return True
+    seen[digest] = now + 600
+    return False
+
+
 class CasaLocationReportView(HomeAssistantView):
     """Device-facing zone report endpoint. No HA session required — the
     device_key encryption IS the authentication (same trust model as the
@@ -2867,6 +2894,9 @@ class CasaLocationReportView(HomeAssistantView):
             return self.json({"error": "Rejected"}, status_code=403)
         ts = inner.get("ts")
         if not isinstance(ts, (int, float)) or abs(time.time() - ts) > 300:
+            return self.json({"error": "Rejected"}, status_code=403)
+        if _seen_report_before(self.hass, payload_b64):
+            _LOGGER.warning("CASA: Rejected replayed location report for device '%s'.", device_id)
             return self.json({"error": "Rejected"}, status_code=403)
 
         if not _apply_location_report(self.hass, device_id, device_info,
@@ -4892,6 +4922,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 user_entry["devices"] = {}
             devices = user_entry["devices"]
             username = user_entry.get("username")
+            native_account, account_user = False, None
         else:
             # Check if they are a valid Home Assistant user
             users = await hass.auth.async_get_users()
@@ -4904,9 +4935,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 native_devices[user_id] = {}
             devices = native_devices[user_id]
             username = ha_user.name or user_id
+            native_account, account_user = True, ha_user
 
-        if device_id not in devices and len(devices) >= 100:
-            raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
+        limit = _device_limit(native=native_account, ha_user=account_user)
+        if device_id not in devices and len(devices) >= limit:
+            raise HomeAssistantError(f"Maximum of {limit} registered devices reached for this user.")
 
         # One owner per device_id: registering a device_id recorded under
         # another live user moves it here only with proof of possession
@@ -5049,6 +5082,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 user_entry["devices"] = {}
             devices = user_entry["devices"]
             username = user_entry.get("username")
+            native_account, account_user = False, None
         else:
             # Check if they are a valid Home Assistant user
             users = await hass.auth.async_get_users()
@@ -5061,9 +5095,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 native_devices[user_id] = {}
             devices = native_devices[user_id]
             username = ha_user.name or user_id
+            native_account, account_user = True, ha_user
 
-        if device_id not in devices and len(devices) >= 100:
-            raise HomeAssistantError("Maximum of 100 registered devices reached for this user.")
+        limit = _device_limit(native=native_account, ha_user=account_user)
+        if device_id not in devices and len(devices) >= limit:
+            raise HomeAssistantError(f"Maximum of {limit} registered devices reached for this user.")
 
         # One owner per device_id. A heartbeat with proof of possession (a
         # fresh provisioning claim covers a push-off app re-provisioned to a

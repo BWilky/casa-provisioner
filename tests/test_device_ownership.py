@@ -223,3 +223,14 @@ def test_register_get_after_relogin_repins():
     req = FakeRequest(hass.auth.users["A"], headers=bearer("rNew"), query={"device_id": "D1"})
     asyncio.run(view.get(req))
     assert sd["users"]["A"]["devices"]["D1"]["refresh_token_id"] == "rNew"
+
+
+# --- Native (non-casa) accounts: a non-admin cannot mint unlimited device records ---
+
+from custom_components.casa import _device_limit, NATIVE_DEVICE_LIMIT
+
+
+def test_device_limit_by_account_kind():
+    assert _device_limit(native=False, ha_user=None) == 100
+    assert _device_limit(native=True, ha_user=make_user("x", admin=True)) == 100
+    assert _device_limit(native=True, ha_user=make_user("y")) == NATIVE_DEVICE_LIMIT == 10
