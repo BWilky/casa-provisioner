@@ -4721,6 +4721,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     pruned = await _prune_stale_queued_updates(hass)
     if pruned:
         _LOGGER.warning("CASA: Startup pruned %d stale queued update(s).", pruned)
+    forgotten = await _forget_deleted_users(hass)
+    if forgotten:
+        _LOGGER.warning("CASA: Startup removed %d device record(s) left under deleted users.", forgotten)
 
     create_devices = entry.options.get(CONF_CREATE_DEVICES, True)
     
@@ -6162,6 +6165,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if user_id not in stored_data["users"] or stored_data["users"][user_id].get("deleted", False):
             raise HomeAssistantError(f"User '{target_username}' was not created via this integration and cannot be removed.")
 
+        # Devices, relay registrations, sessions, claims and the password
+        # fingerprint go first, while the account's tokens can still be read.
+        login_username = next((
+            cred.data.get("username") for cred in target_user.credentials
+            if cred.auth_provider_type == "homeassistant"
+        ), None)
+        user_entry = stored_data["users"][user_id]
+        doomed_device_ids = list(user_entry.get("devices", {}).keys())
+        await _forget_user(hass, user_id, login_username)
+
         # Perform deletion
         await hass.auth.async_remove_user(target_user)
         _LOGGER.info("CASA: Local user '%s' (ID: %s) removed.", target_username, user_id)
@@ -6178,8 +6191,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Remove from Home Assistant Device Registry
         from homeassistant.helpers import device_registry as dr
         dev_reg = dr.async_get(hass)
-        user_entry = stored_data["users"][user_id]
-        for device_id in list(user_entry.get("devices", {}).keys()):
+        for device_id in doomed_device_ids:
             device_entry = dev_reg.async_get_device(identifiers={(DOMAIN, device_id)})
             if device_entry:
                 dev_reg.async_remove_device(device_entry.id)
@@ -6320,6 +6332,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if device_id:
             found = None
             for uid, udata in stored_data.get("users", {}).items():
+                if udata.get("deleted", False):
+                    continue
                 if device_id in udata.get("devices", {}):
                     found = (uid, udata["devices"][device_id], udata.get("username", "Unknown"))
                     break
@@ -6657,6 +6671,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if device_id:
             found = None
             for uid, udata in stored_data.get("users", {}).items():
+                if udata.get("deleted", False):
+                    continue
                 if device_id in udata.get("devices", {}):
                     found = (device_id, udata["devices"][device_id], uid)
                     break
@@ -7273,6 +7289,78 @@ def _collapse_duplicate_device_records(stored_data: dict, ha_users) -> int:
     natives = stored_data.get("native_devices", {})
     for uid in [u for u, devs in natives.items() if not devs and u in emptied]:
         natives.pop(uid, None)
+    return removed
+
+
+def _push_token_in_live_use(stored_data: dict, push_token) -> bool:
+    if not push_token:
+        return False
+    for udata in stored_data.get("users", {}).values():
+        if udata.get("deleted", False):
+            continue
+        if any(d.get("push_token") == push_token for d in udata.get("devices", {}).values()):
+            return True
+    return any(
+        d.get("push_token") == push_token
+        for devices in stored_data.get("native_devices", {}).values() for d in devices.values()
+    )
+
+
+async def _forget_user_devices(hass, user_id: str) -> int:
+    """Drop every device record under user_id: unregister its relay proxy
+    token, revoke its pinned session and drop its update queue. A device_id
+    or proxy token that a live record elsewhere still uses (the phone moved
+    to another user) keeps its queue and relay registration."""
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    devices = (stored_data.get("users", {}).get(user_id) or {}).get("devices") or {}
+    user = await hass.auth.async_get_user(user_id)
+    qu_data = hass.data[DOMAIN].get("qu_data") or {}
+    removed = 0
+    for device_id in list(devices):
+        info = devices.pop(device_id) or {}
+        removed += 1
+        live_info, _uid, _name = _find_device_record(stored_data, device_id)
+        if live_info is None and qu_data.get("updates", {}).pop(device_id, None) is not None:
+            qu_store = hass.data[DOMAIN].get("qu_store")
+            if qu_store:
+                qu_store.async_delay_save(lambda: qu_data, 2.0)
+        if not _push_token_in_live_use(stored_data, info.get("push_token")):
+            await _unregister_relay_token(hass, info.get("push_token"), device_id)
+        token = user.refresh_tokens.get(info.get("refresh_token_id")) if user else None
+        if token:
+            hass.auth.async_remove_refresh_token(token)
+    return removed
+
+
+async def _forget_user(hass, user_id: str, login_username: str | None) -> None:
+    """Everything a removed casa user leaves behind: device records (with
+    their relay registrations and sessions), provisioning claims and the
+    server-set password fingerprint for the login."""
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    user = await hass.auth.async_get_user(user_id)
+    token_ids = set(user.refresh_tokens) if user else set()
+    await _forget_user_devices(hass, user_id)
+    (stored_data.get("provision_claims") or {}).pop(user_id, None)
+    (stored_data.get("provision_opened") or {}).pop(user_id, None)
+    rclaims = stored_data.get("replacement_claims") or {}
+    for tid in token_ids:
+        rclaims.pop(tid, None)
+    if login_username:
+        (stored_data.get("server_passwords") or {}).pop(str(login_username).casefold(), None)
+    await hass.data[DOMAIN]["store"].async_save(stored_data)
+
+
+async def _forget_deleted_users(hass) -> int:
+    """Startup self-heal: device records still held under users removed
+    before _forget_user existed (their push tokens otherwise look live to
+    reconcile and stay registered on the relay forever)."""
+    stored_data = hass.data[DOMAIN]["stored_data"]
+    removed = 0
+    for uid, udata in list(stored_data.get("users", {}).items()):
+        if udata.get("deleted", False) and udata.get("devices"):
+            removed += await _forget_user_devices(hass, uid)
+    if removed:
+        await hass.data[DOMAIN]["store"].async_save(stored_data)
     return removed
 
 
