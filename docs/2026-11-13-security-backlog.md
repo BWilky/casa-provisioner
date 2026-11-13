@@ -145,7 +145,19 @@ Order: casa first (it emits both), then iOS (accepts both), then flip the casa d
   - The new app accepts the encrypted form. It keeps accepting plaintext only from casa versions that predate it, based on the server version the heartbeat reports.
   - Casa sends the encrypted form to apps that report support.
 - [ ] **X3 Per-device keys.** Casa issues each device its own random key, delivered once to its pinned session through the heartbeat. Location reports, action presses and encrypted pushes use it. The site-wide `device_key` stays only for apps that haven't picked up a per-device key, and is removed in Phase 5. The heartbeat stops returning keys to non-owned or unpinned callers right away.
-- [ ] **X4 Notification content encryption (optional).** Casa encrypts title, body and actions with the per-device key; a new iOS Notification Service Extension decrypts them. Casa sends plaintext to apps that don't report support. Works with the relay down; the relay only ever sees ciphertext.
+- [ ] **X4 Notification content encryption (optional, last in Phase 4).**
+  - **How it works with the app closed:** iOS runs a Notification Service Extension (NSE) for any push marked `aps.mutable-content: 1`, whether the app is running, backgrounded or force-quit, and gives it about 30 s to rewrite the content.
+  - **Flow:**
+    1. Casa sends a placeholder alert ("New notification") plus `enc` = AES-GCM(title, body, actions, nav data) under the per-device key (X3).
+    2. The NSE decrypts and replaces title and body, and puts the decrypted actions into `userInfo`. CasaNotificationContent then sees them as today.
+  - **Needs:**
+    - A new NSE target.
+    - The device key in a Keychain access group shared with the NSE.
+    - A relay option to set `mutable-content: 1` (casa strips caller `aps` since Phase 2). Old apps keep receiving plaintext, based on the app version from the heartbeat.
+  - **Limits:**
+    - Before the first unlock after a reboot the Keychain is unreadable, and a decrypt failure or timeout also leaves the content unchanged. Either way the placeholder shows.
+    - Silent pushes skip the NSE; they are already casa-encrypted.
+  - Works with the relay down; the relay and Apple only ever see ciphertext.
 
 ## Phase 5: removals once old clients are gone
 
