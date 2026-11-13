@@ -984,6 +984,39 @@ async def _apply_pending_provision(hass, user_id: str, device_info: dict, refres
     return True
 
 
+async def _alert_link_used_twice(hass, login_username, user, token_ids) -> None:
+    """A single-use link produced more than one session: it was shared or
+    intercepted. Nobody is signed out (HA can't tell which session the real
+    phone kept), so the admin is told who and from where, to revoke any
+    unknown session from the Sessions page."""
+    lines = []
+    for tid in sorted(token_ids):
+        token = user.refresh_tokens.get(tid)
+        if token is None:
+            continue
+        created = getattr(token, "created_at", None)
+        lines.append(
+            f"- {getattr(token, 'client_name', None) or 'unknown client'}, "
+            f"IP {getattr(token, 'last_used_ip', None) or 'unknown'}, "
+            f"signed in {created.isoformat(timespec='seconds') if created else 'unknown'}"
+        )
+    _LOGGER.warning(
+        "CASA SECURITY: Single-use link for '%s' was used by %d sessions.", login_username, len(token_ids),
+    )
+    try:
+        await hass.services.async_call("persistent_notification", "create", {
+            "title": "Casa: a single-use link was used more than once",
+            "message": (
+                f"The provisioning link for **{login_username}** signed in {len(token_ids)} sessions:\n"
+                + "\n".join(lines)
+                + "\n\nIf you don't recognise one, revoke it in Casa → Sessions."
+            ),
+            "notification_id": f"casa_link_reuse_{user.id}",
+        })
+    except Exception as err:
+        _LOGGER.error("CASA: Could not raise the link-reuse notification: %s", err)
+
+
 async def _end_provision_window(hass, user_id: str, provision_id: str, reason: str) -> None:
     """Close a provisioning window: scramble the password (the link dies),
     retire its QR file, forget the persisted record and stop its tasks.
@@ -1011,6 +1044,8 @@ async def _end_provision_window(hass, user_id: str, provision_id: str, reason: s
                 hass, user_id, new_tokens,
                 replaces_device_id=rec.get("replaces_device_id"),
             )
+            if rec.get("single_use") and len(new_tokens) > 1:
+                await _alert_link_used_twice(hass, login_username, user, new_tokens)
             try:
                 await _set_account_password(hass, provider, login_username, window_provision_id=provision_id)
                 _LOGGER.info("CASA: Password for %s scrambled (%s).", login_username, reason)

@@ -268,3 +268,27 @@ def test_revoke_leaves_no_expired_row_and_scrambles(tmp_path):
     assert hass.casa["stored_data"]["pending_provisions"] == {}
     assert "u1" not in _expired(hass)
     assert hass.auth.provider.data.passwords["kitchen"] != "link-pw"
+
+
+def test_single_use_link_redeemed_twice_alerts_admin(tmp_path):
+    # Two sessions born inside a single-use window: the link was used twice
+    # (shared or intercepted). The admin is told who, and from where.
+    hass = _hass(tmp_path, _record())
+    user = hass.auth.users["u1"]
+    for tid, ip in (("t1", "192.0.2.10"), ("t2", "198.51.100.7")):
+        tok = FakeToken(tid)
+        tok.last_used_ip = ip
+        user.refresh_tokens[tid] = tok
+    asyncio.run(_end_provision_window(hass, "u1", "p1", "redeemed"))
+    notes = [c for c in hass.service_calls if c[0] == "persistent_notification" and c[1] == "create"]
+    assert len(notes) == 1
+    message = notes[0][2]["message"]
+    assert "kitchen" in message and "192.0.2.10" in message and "198.51.100.7" in message
+    assert set(hass.casa["stored_data"]["provision_claims"]["u1"]) == {"t1", "t2"}  # nobody signed out
+
+
+def test_single_use_link_redeemed_once_does_not_alert(tmp_path):
+    hass = _hass(tmp_path, _record())
+    hass.auth.users["u1"].refresh_tokens["t1"] = FakeToken("t1")
+    asyncio.run(_end_provision_window(hass, "u1", "p1", "redeemed"))
+    assert not [c for c in hass.service_calls if c[0] == "persistent_notification"]
