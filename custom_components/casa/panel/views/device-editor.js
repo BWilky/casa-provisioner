@@ -485,9 +485,11 @@ export function createView(app) {
     rows.push(
       label("Active URL"),
       `<span>${
-        d.current_url
+        !d.current_url
+          ? "—"
+          : ui.safeHttpUrl(d.current_url)
           ? `<a href="${esc(d.current_url)}" target="_blank" rel="noopener noreferrer" style="color:var(--casa-primary); text-decoration:none; word-break:break-all;">${esc(d.current_url)}</a>`
-          : "—"
+          : `<span style="word-break:break-all;">${esc(d.current_url)}</span>`
       }</span>`
     );
     rows.push(

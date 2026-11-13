@@ -14,6 +14,20 @@ export function esc(val) {
     .replaceAll("'", "&#39;");
 }
 
+// The URL itself when it is an absolute http(s) URL, else null. Device-reported
+// values (a heartbeat's current_url) are untrusted: only these may become an
+// href, so a "javascript:" value can never run in the HA origin.
+export function safeHttpUrl(val) {
+  if (typeof val !== "string" || !val) return null;
+  let parsed;
+  try {
+    parsed = new URL(val);
+  } catch {
+    return null;
+  }
+  return parsed.protocol === "http:" || parsed.protocol === "https:" ? val : null;
+}
+
 // Human-readable message from any rejection shape. HA's callApi/callWS reject
 // with plain objects ({body, message, error, code}), not Error instances, so
 // naive `err.message || err` interpolation renders "[object Object]" and hides
