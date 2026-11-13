@@ -1214,6 +1214,27 @@ def _find_device_record(stored_data: dict, device_id: str):
     return None, None, None
 
 
+def _may_repin(stored_data: dict, device_id: str, refresh_token_id) -> bool:
+    """May this session become device_id's pinned session? Yes when it
+    already is, or when it is pinned to no other device record (the same
+    phone signed in again). A session pinned to a different record — a
+    sibling device on a shared account — never takes this one over, or it
+    could pull this device's queue (WireGuard keys, reauth credentials)."""
+    if not refresh_token_id:
+        return False
+    for udata in stored_data.get("users", {}).values():
+        if udata.get("deleted", False):
+            continue
+        for did, info in udata.get("devices", {}).items():
+            if did != device_id and info.get("refresh_token_id") == refresh_token_id:
+                return False
+    for devices in stored_data.get("native_devices", {}).values():
+        for did, info in devices.items():
+            if did != device_id and info.get("refresh_token_id") == refresh_token_id:
+                return False
+    return True
+
+
 def _save_notification_actions(hass) -> None:
     data = hass.data[DOMAIN]
     prune_pending(data["na_data"])
@@ -2069,7 +2090,7 @@ class CasaRegisterDeviceView(HomeAssistantView):
                 bearer_token = auth_header[7:].strip()
                 devices[device_id]["last_12_token"] = bearer_token[-12:]
                 refresh_token_id = _get_refresh_token_id_from_jwt(bearer_token)
-                if refresh_token_id:
+                if refresh_token_id and _may_repin(stored_data, device_id, refresh_token_id):
                     devices[device_id]["refresh_token_id"] = refresh_token_id
 
             store = self.hass.data[DOMAIN]["store"]
@@ -4842,6 +4863,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if _device_being_purged(hass, device_id):
             raise HomeAssistantError("Device is being removed.")
 
+        # A sibling on a shared account (its session is pinned to another
+        # record) must not re-point this device's push token or session.
+        if device_id in devices and refresh_token_id is not None and not _may_repin(stored_data, device_id, refresh_token_id):
+            _LOGGER.warning(
+                "CASA: Refused registration of device '%s' by a session that belongs to another device.", device_id,
+            )
+            raise HomeAssistantError("This session belongs to another device.")
+
         now_iso = dt_util.now().isoformat()
         
         # Keep existing push token if not provided in the update
@@ -4853,7 +4882,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         final_last_12 = last_12_token if last_12_token is not None else existing_last_12
 
         existing_refresh_id = devices.get(device_id, {}).get("refresh_token_id")
-        final_refresh_id = refresh_token_id if refresh_token_id is not None else existing_refresh_id
+        final_refresh_id = (
+            refresh_token_id
+            if refresh_token_id is not None and _may_repin(stored_data, device_id, refresh_token_id)
+            else existing_refresh_id
+        )
 
         existing_ip = devices.get(device_id, {}).get("ip_address")
         final_ip = ip_address if ip_address is not None else existing_ip
@@ -5026,7 +5059,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         if last_12_token is not None:
             device_info["last_12_token"] = last_12_token
-        if refresh_token_id is not None:
+        if refresh_token_id is not None and _may_repin(stored_data, device_id, refresh_token_id):
             device_info["refresh_token_id"] = refresh_token_id
         if ip_address is not None:
             device_info["ip_address"] = ip_address

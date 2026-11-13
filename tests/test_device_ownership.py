@@ -184,3 +184,42 @@ def test_device_is_marked_purging_during_relay_await(monkeypatch):
     assert result["found"] and seen == [True]
     assert not casa._device_being_purged(hass, "PHONE")
     assert "PHONE" not in sd["users"]["A"]["devices"]
+
+
+# --- Shared accounts: a sibling device cannot re-pin another device's session ---
+
+from custom_components.casa import CasaRegisterDeviceView, _may_repin
+
+
+def _shared():
+    hass = FakeHass()
+    hass.auth.add_user(make_user("A", login="family", tokens=["r1", "r2", "rNew"]))
+    sd = hass.casa["stored_data"]
+    sd["users"]["A"] = {"username": "family", "devices": {
+        "D1": {"refresh_token_id": "r1"}, "D2": {"refresh_token_id": "r2"},
+    }}
+    return hass, sd
+
+
+def test_may_repin_rules():
+    _hass_, sd = _shared()
+    assert _may_repin(sd, "D1", "r1")          # same token
+    assert _may_repin(sd, "D1", "rNew")        # the phone logged in again
+    assert not _may_repin(sd, "D1", "r2")      # D2's session
+    assert _may_repin(sd, "D1", None) is False
+
+
+def test_register_get_from_sibling_does_not_repin():
+    hass, sd = _shared()
+    view = bind_view(CasaRegisterDeviceView(hass, None))
+    req = FakeRequest(hass.auth.users["A"], headers=bearer("r2"), query={"device_id": "D1"})
+    asyncio.run(view.get(req))
+    assert sd["users"]["A"]["devices"]["D1"]["refresh_token_id"] == "r1"
+
+
+def test_register_get_after_relogin_repins():
+    hass, sd = _shared()
+    view = bind_view(CasaRegisterDeviceView(hass, None))
+    req = FakeRequest(hass.auth.users["A"], headers=bearer("rNew"), query={"device_id": "D1"})
+    asyncio.run(view.get(req))
+    assert sd["users"]["A"]["devices"]["D1"]["refresh_token_id"] == "rNew"
