@@ -187,3 +187,49 @@ def test_target_username_prefers_stored_casa_username():
 
 def test_target_username_falls_back_to_ha_user_name():
     assert _notify_target_username({"users": {}}, make_user("u2", name="Bob")) == "Bob"
+
+
+# --- Security: caller data cannot carry control keys; push stays under APNs' 4 KB ---
+
+import pytest as _pytest
+
+from custom_components.casa import HomeAssistantError as _HAError
+
+
+def test_notify_strips_reserved_keys_without_actions():
+    hass = FakeHass()
+    body = _body(hass, {"command": "deprovision", "casa_command": "reload", "aps": {"sound": "x"},
+                        "update_id": "u", "casa_update": "x", "foo": 1})
+    assert body["data"] == {"foo": 1}
+
+
+def test_notify_strips_nested_data_command():
+    # The app also reads data.command / data.casa_command.
+    hass = FakeHass()
+    body = _body(hass, {"data": {"command": "deprovision", "keep": 2}, "foo": 1})
+    assert body["data"] == {"data": {"keep": 2}, "foo": 1}
+
+
+def test_notify_strips_reserved_keys_with_actions():
+    hass = FakeHass()
+    body = _body(hass, {**DATA, "command": "deprovision", "aps": {"alert": "x"}})
+    assert "command" not in body["data"] and "aps" not in body["data"]
+    assert body["category"] == "CASA_DYNAMIC"
+
+
+def test_notify_does_not_forward_action_data():
+    hass = FakeHass()
+    body = _body(hass, DATA)
+    assert "action_data" not in body["data"]
+    rec = hass.casa["na_data"]["pending"][body["data"]["notification_id"]]
+    assert rec["action_data"] == {"c": 1}  # still server-side for the event
+
+
+def test_notify_rejects_oversize_push_before_pending_record():
+    hass = FakeHass()
+    big = {**DATA, "nav_path": "/" + "x" * 5000}
+    with _pytest.raises(_HAError):
+        _body(hass, big)
+    assert hass.casa["na_data"]["pending"] == {}
+    with _pytest.raises(_HAError):
+        _body(hass, {"note": "y" * 5000})

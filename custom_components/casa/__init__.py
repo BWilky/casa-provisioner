@@ -1168,18 +1168,64 @@ async def _assert_may_attach_service(hass, context_user_id, actions) -> None:
         raise HomeAssistantError("Only administrators can attach a service to a notification action.")
 
 
-def _action_push_fields(hass, *, device_id: str, user_id: str, username, parsed_data: dict, actions: list) -> dict:
+# Keys the app treats as control fields (command dispatch, encrypted update
+# envelopes, the APNs envelope itself). notify_user data is caller-supplied, so
+# these never pass through from it — only casa's own update pushes set them.
+RESERVED_PUSH_KEYS = frozenset({
+    "aps", "command", "casa_command", "casa_update", "update_id", "update_payload",
+    "wireguard_payload", "encrypted", "device_key_id",
+})
+# Caller keys kept server-side: stored on the pending record, returned in the
+# casa_notification_action event, never sent to the device.
+SERVER_SIDE_NOTIFY_KEYS = frozenset({"actions", "action_data"})
+# APNs rejects payloads over 4096 bytes; leave room for the relay's envelope.
+MAX_PUSH_BYTES = 3800
+
+
+def _strip_reserved_push_keys(parsed_data):
+    """Caller data minus RESERVED_PUSH_KEYS, at the top level and inside a
+    nested `data` object (the app reads data.command too)."""
+    if not isinstance(parsed_data, dict):
+        return parsed_data
+    dropped = sorted(k for k in parsed_data if k in RESERVED_PUSH_KEYS)
+    out = {k: v for k, v in parsed_data.items() if k not in RESERVED_PUSH_KEYS}
+    nested = out.get("data")
+    if isinstance(nested, dict):
+        dropped += sorted(f"data.{k}" for k in nested if k in RESERVED_PUSH_KEYS)
+        out["data"] = {k: v for k, v in nested.items() if k not in RESERVED_PUSH_KEYS}
+    if dropped:
+        _LOGGER.warning("CASA SECURITY: notify_user data keys reserved for Casa were dropped: %s", ", ".join(dropped))
+    return out
+
+
+def _check_push_size(title, message, data, category=None) -> None:
+    aps = {"alert": {"title": title or "", "body": message or ""}}
+    if category:
+        aps["category"] = category
+    envelope = {"aps": aps, **data} if isinstance(data, dict) else {"aps": aps, "data": data}
+    size = len(json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    if size > MAX_PUSH_BYTES:
+        raise HomeAssistantError(
+            f"Notification is too large for a push ({size} bytes, limit {MAX_PUSH_BYTES}). "
+            "Shorten the message or move data into action_data, which stays in Home Assistant."
+        )
+
+
+def _action_push_fields(hass, *, device_id: str, user_id: str, username, parsed_data: dict, actions: list,
+                        title=None, message=None) -> dict:
     """Create the pending record for one device and return the `data` dict
-    that goes to the relay: caller keys + notification_id + device-safe actions."""
-    nid = create_pending(
+    that goes to the relay: caller keys + notification_id + device-safe actions.
+    The size check runs first, so an oversize push leaves no pending record."""
+    out = {k: v for k, v in _strip_reserved_push_keys(parsed_data).items() if k not in SERVER_SIDE_NOTIFY_KEYS}
+    out["notification_id"] = "x" * 32  # create_pending's id length, for sizing
+    out["actions"] = device_actions(actions)
+    _check_push_size(title, message, out, CATEGORY)
+    out["notification_id"] = create_pending(
         hass.data[DOMAIN]["na_data"],
         device_id=device_id, user_id=user_id, username=username, actions=actions,
         tag=parsed_data.get("tag"), action_data=parsed_data.get("action_data"),
     )
     _save_notification_actions(hass)
-    out = {k: v for k, v in parsed_data.items() if k != "actions"}
-    out["notification_id"] = nid
-    out["actions"] = device_actions(actions)
     return out
 
 
@@ -1229,10 +1275,13 @@ def _notify_relay_body(hass, *, push_token, title, message, stored_data, parsed_
         payload["category"] = CATEGORY
         payload["data"] = _action_push_fields(
             hass, device_id=device_id, user_id=user_id, username=username,
-            parsed_data=parsed_data, actions=actions,
+            parsed_data=parsed_data, actions=actions, title=title, message=message,
         )
     elif parsed_data is not None:
-        payload["data"] = parsed_data
+        payload["data"] = _strip_reserved_push_keys(parsed_data)
+        _check_push_size(title, message, payload["data"])
+    else:
+        _check_push_size(title, message, {})
     return payload
 
 
