@@ -325,12 +325,11 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
     """
     session = async_get_clientsession(hass)
 
+    # The site_id is only written to stored_data once the relay accepts it
+    # (201): an id the relay never registered must not reach provisioning
+    # payloads, where every device /register would 404.
+    site_id = stored_data.get("site_id") or secrets.token_hex(16)  # 32 hex chars
     for _attempt in range(3):
-        site_id = stored_data.get("site_id")
-        if not site_id:
-            site_id = secrets.token_hex(16)  # 32 hex chars
-            stored_data["site_id"] = site_id
-
         try:
             async with session.post(
                 relay_url(hass, "/register_site"),
@@ -339,6 +338,7 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
             ) as resp:
                 if resp.status == 201:
                     data = await resp.json()
+                    stored_data["site_id"] = site_id
                     stored_data["site_key"] = data["site_key"]
                     _set_relay_site_credentials(
                         stored_data, relay_base(hass), site_id, data["site_key"]
@@ -350,27 +350,85 @@ async def _register_site(hass: HomeAssistant, stored_data: dict, store) -> bool:
                 if resp.status == 409:
                     # site_id taken but we have no key -> lockout; rotate to a fresh site_id.
                     _LOGGER.warning("CASA: site_id already registered with no local key; rotating site_id and retrying.")
-                    stored_data["site_id"] = secrets.token_hex(16)
+                    site_id = secrets.token_hex(16)
                     continue
 
                 if resp.status == 422:
                     _LOGGER.warning("CASA: Relay rejected site_id as malformed (422); regenerating.")
-                    stored_data["site_id"] = secrets.token_hex(16)
+                    site_id = secrets.token_hex(16)
                     continue
 
                 if resp.status == 400:
                     _LOGGER.error("CASA: Relay reports no database configured (400); cannot register site.")
-                    return False
+                    break
 
                 text = await resp.text()
                 _LOGGER.error("CASA: Unexpected /register_site status %s: %s", resp.status, text)
-                return False
+                break
         except Exception as err:
             _LOGGER.error("CASA: Failed to reach relay /register_site: %s", err)
-            return False
+            break
+    else:
+        _LOGGER.error("CASA: Could not register site after multiple attempts.")
 
-    _LOGGER.error("CASA: Could not register site after multiple attempts.")
+    # Not registered: hold no site_id without a key (the daily job retries).
+    if not stored_data.get("site_key"):
+        stored_data.pop("site_id", None)
     return False
+
+
+# Minimum seconds between site re-verifications triggered by "Invalid site
+# key" send failures, so a burst of failed sends re-verifies once.
+_SITE_REVERIFY_INTERVAL = 600
+
+
+async def _handle_relay_send_rejection(hass, status: int, text: str, push_token) -> None:
+    """Act on a relay /send rejection now instead of at the daily reconcile.
+
+    403 "registration invalid or expired": the relay lost this device's
+    registration; flag the device so its next heartbeat re-registers.
+    403 "Invalid site key": the relay lost (or re-keyed) our site; verify and
+    re-register it, and when that issued new credentials, flag every device
+    (a new site has no registrations)."""
+    if status != 403:
+        return
+    data = hass.data[DOMAIN]
+    stored_data = data["stored_data"]
+    text = text or ""
+    if "registration invalid or expired" in text:
+        for udata in stored_data.get("users", {}).values():
+            if udata.get("deleted", False):
+                continue
+            for info in udata.get("devices", {}).values():
+                if push_token and info.get("push_token") == push_token:
+                    info["needs_reregister"] = True
+        for devices in stored_data.get("native_devices", {}).values():
+            for info in devices.values():
+                if push_token and info.get("push_token") == push_token:
+                    info["needs_reregister"] = True
+        _save_stored_data(hass)
+        return
+    if "Invalid site key" not in text:
+        return
+    now = time.time()
+    if now - data.get("site_reverify_at", 0) < _SITE_REVERIFY_INTERVAL:
+        return
+    data["site_reverify_at"] = now
+    old_key = stored_data.get("site_key")
+    await _ensure_site_registration(hass, stored_data, data["store"])
+    if stored_data.get("site_key") and stored_data.get("site_key") != old_key:
+        _LOGGER.warning("CASA: Site re-registered with the relay; every device will re-register.")
+        for udata in stored_data.get("users", {}).values():
+            if udata.get("deleted", False):
+                continue
+            for info in udata.get("devices", {}).values():
+                if info.get("push_token"):
+                    info["needs_reregister"] = True
+        for devices in stored_data.get("native_devices", {}).values():
+            for info in devices.values():
+                if info.get("push_token"):
+                    info["needs_reregister"] = True
+        _save_stored_data(hass)
 
 
 async def _ensure_site_registration(hass: HomeAssistant, stored_data: dict, store) -> None:
@@ -3673,6 +3731,7 @@ async def _send_push_to_relay(hass, session, payload) -> bool:
                 return True
             text = await resp.text()
             _LOGGER.warning("CASA: Relay %s returned %s for push: %s", url, resp.status, text)
+            await _handle_relay_send_rejection(hass, resp.status, text, payload.get("target"))
             if resp.status < 500:
                 return False
     except Exception as err:
@@ -6452,6 +6511,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             else:
                                 text = await response.text()
                                 _LOGGER.warning("CASA: Relay %s returned status %s for token %s...: %s", url, response.status, tok[:10], text)
+                                await _handle_relay_send_rejection(hass, response.status, text, tok)
                     except Exception as err:
                         _LOGGER.warning("CASA: Failed to connect to relay %s for token %s...: %s", url, tok[:10], err)
                     
@@ -7016,6 +7076,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     async def _scheduled_reconcile(now):
+        # A site that failed to register (relay down at setup) retries daily.
+        if not hass.data[DOMAIN]["stored_data"].get("site_key"):
+            await _ensure_site_registration(hass, hass.data[DOMAIN]["stored_data"], hass.data[DOMAIN]["store"])
         await _reconcile_site()
         # Daily queue hygiene too (stale/oversized queues, stranded markers).
         await _prune_stale_queued_updates(hass)
