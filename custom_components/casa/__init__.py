@@ -1045,6 +1045,13 @@ async def _authorize_service(hass, call, *, admin_system_only: bool) -> list:
     return users
 
 
+def _client_ip(request) -> str | None:
+    """The caller's address as HA resolved it. HA's http integration already
+    applies use_x_forwarded_for/trusted_proxies to request.remote; reading the
+    headers here again would trust any client that sets them."""
+    return request.remote
+
+
 async def _end_provision_window(hass, user_id: str, provision_id: str, reason: str) -> None:
     """Close a provisioning window: scramble the password (the link dies),
     retire its QR file, forget the persisted record and stop its tasks.
@@ -2022,12 +2029,7 @@ class CasaRegisterDeviceView(HomeAssistantView):
             last_12_token = bearer_token[-12:]
             refresh_token_id = _get_refresh_token_id_from_jwt(bearer_token)
 
-        # Determine the client's IP address from request headers or remote peer
-        client_ip = request.headers.get("X-Forwarded-For")
-        if client_ip:
-            client_ip = client_ip.split(",")[0].strip()
-        else:
-            client_ip = request.headers.get("X-Real-IP") or request.remote
+        client_ip = _client_ip(request)
 
         try:
             await self.register_device_func(user.id, device_id, push_token, last_12_token, refresh_token_id, client_ip)
@@ -2204,15 +2206,10 @@ class CasaHeartbeatView(HomeAssistantView):
             last_12_token = bearer_token[-12:]
             refresh_token_id = _get_refresh_token_id_from_jwt(bearer_token)
 
-        # Determine the client's IP address from request headers or remote peer
-        client_ip = request.headers.get("X-Forwarded-For")
-        if client_ip:
-            client_ip = client_ip.split(",")[0].strip()
-        else:
-            client_ip = request.headers.get("X-Real-IP") or request.remote
+        client_ip = _client_ip(request)
 
         last_12_token = data.get("last_12_token") or last_12_token
-        ip_address = data.get("ip_address") or client_ip
+        ip_address = client_ip
         provisioned_at = data.get("provisioned_at")
         expires_at = data.get("expires_at")
         current_url = data.get("current_url")
@@ -6390,11 +6387,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 stored_data.get("site_id")
             )
             _LOGGER.debug(
-                "CASA DEBUG PAYLOAD: Target=%s, SiteID=%s, SiteKey=%s, Data=%s",
-                push_token,
-                stored_data.get("site_id"),
-                stored_data.get("site_key"),
-                parsed_data
+                "CASA DEBUG PAYLOAD: device=%s, data keys=%s",
+                device_id,
+                sorted(parsed_data) if isinstance(parsed_data, dict) else type(parsed_data).__name__,
             )
 
             async def send_post(tok=push_token, data_payload=dict(payload)):
