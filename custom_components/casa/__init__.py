@@ -7552,6 +7552,14 @@ async def async_remove_config_entry_device(
     return True
 
 
+# Every Store this integration writes. Uninstall removes them all: they hold
+# WireGuard private keys, queued reauth passwords and saved templates.
+CASA_STORE_KEYS = (
+    "casa_users", "Casa_WireGuardProfiles", "casa_provision_profiles",
+    "casa_queued_updates", "casa_location_zones", "casa_notification_actions",
+)
+
+
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Purge persistent state when the integration is permanently deleted.
 
@@ -7614,12 +7622,14 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             except Exception as err:
                 _LOGGER.warning("CASA: /remove_site failed: %s", err)
 
-    # 3. Delete the persistent store so a reinstall starts fresh.
-    try:
-        await store.async_remove()
-        _LOGGER.info("CASA: Removed integration store on entry deletion.")
-    except Exception as err:
-        _LOGGER.warning("CASA: Failed to remove store on entry deletion: %s", err)
+    # 3. Delete every persistent store so a reinstall starts fresh and no
+    # secret outlives the integration.
+    for key in CASA_STORE_KEYS:
+        try:
+            await (store if key == "casa_users" else Store(hass, 1, key)).async_remove()
+        except Exception as err:
+            _LOGGER.warning("CASA: Failed to remove store '%s' on entry deletion: %s", key, err)
+    _LOGGER.info("CASA: Removed integration stores on entry deletion.")
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
