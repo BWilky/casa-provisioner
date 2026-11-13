@@ -112,21 +112,29 @@ On branch `security-phase2` as casa 26.11.14. Plan: `docs/superpowers/plans/2026
 - [ ] **C13 Native device auto-create.** Non-admin users can't mass-create native device records (cap per user; admin approval?). The Reload button is admin only.
 - [x] **C14 Location report replay.** Reject a repeated (device_id, ts) within the ±300 s window.
 
-## Phase 3: iOS fixes (no protocol change)
+## Phase 3: iOS fixes (no protocol change). Built 2026-11-13, uncommitted, not device-tested
 
-- [ ] **I1 ✔ Web-view bridges.**
+- **Where:** in the casa-ios working tree, on top of the uncommitted 1.95 work (Bryce: do not commit).
+- **Patch and notes:** `casa-ios/docs/patches/2026-11-13-phase3-security.patch` and `casa-ios/docs/2026-11-13-phase3-security-notes.md` (change list, device checklist, deferred items).
+- **Done:** I1–I9, plus the fixes from the independent review:
+  - Certificate pinning remembers a public-CA host as "system", pins the name for a CA certificate reached by IP (Let's Encrypt renewals keep working), and turns a refusal into a visible error rather than a hang.
+  - Redirecting servers are handled.
+  - IPv6 literals are handled.
+  - The fail-closed WiFi lock is seeded at launch.
+
+- [x] **I1 ✔ Web-view bridges.**
   - Drop messages unless they come from the main frame and the HA origin.
   - Block cross-origin main-frame navigation; check the host, not only the path.
   - Check the web view's origin before every `evaluateJavaScript` that carries secrets.
   - Inject auto-login only on the HA host.
-- [ ] **I2 TLS.** Run normal certificate evaluation first. Fall back only to a certificate whose key hash was pinned at provisioning, or trusted on first use. Remove `InsecureSessionDelegate` from the reachability probes.
-- [ ] **I3 WireGuard keys to the Keychain.** Move the private key and preshared key from app-group UserDefaults to SecureStore (AfterFirstUnlockThisDeviceOnly), with a one-time migration.
-- [ ] **I4 Log redaction.** No full push payloads, APNs token or query strings in AppLogStore. `jsLogger` logs the main frame only.
-- [ ] **I5 Share deep link.** Remove the `hascasa://share` route; the App Group handoff stays.
-- [ ] **I6 https-only `relay_url`.**
-- [ ] **I7 Remove the `push2.bonjour.casa` fallback** (`RelayEndpoints.swift`, `AppState.swift:1014`).
-- [ ] **I8 WiFi lock fails closed** while an allow-list exists (uncommitted 1.95 code, `NetworkHelper.swift:11`).
-- [ ] **I9 Entitlements and plists.**
+- [x] **I2 TLS.** Run normal certificate evaluation first. Fall back only to a certificate whose key hash was pinned at provisioning, or trusted on first use. Remove `InsecureSessionDelegate` from the reachability probes.
+- [x] **I3 WireGuard keys to the Keychain.** Move the private key and preshared key from app-group UserDefaults to SecureStore (AfterFirstUnlockThisDeviceOnly), with a one-time migration.
+- [x] **I4 Log redaction.** No full push payloads, APNs token or query strings in AppLogStore. `jsLogger` logs the main frame only.
+- [x] **I5 Share deep link.** Remove the `hascasa://share` route; the App Group handoff stays.
+- [x] **I6 https-only `relay_url`.**
+- [x] **I7 Remove the `push2.bonjour.casa` fallback** (`RelayEndpoints.swift`, `AppState.swift:1014`).
+- [x] **I8 WiFi lock fails closed** while an allow-list exists (uncommitted 1.95 code, `NetworkHelper.swift:11`).
+- [x] **I9 Entitlements and plists.**
   - Drop the unused external-accessory entitlement.
   - Remove ATS arbitrary loads from CasaShare.
   - Remove the obsolete Bluetooth peripheral string.
