@@ -1077,7 +1077,15 @@ async def _alert_link_used_twice(hass, login_username, user, token_ids) -> None:
 
 # Services that reveal a password or end sessions: admin/system only even when
 # the admin_system_only option is off (that option governs everything else).
-ALWAYS_ADMIN_SERVICES = frozenset({"scramble_guest_password", "provision", "generate_qr", "remove_token"})
+ALWAYS_ADMIN_SERVICES = frozenset({
+    "scramble_guest_password", "provision", "generate_qr", "provision_ble_beacon", "create_user",
+    "remove_token", "remove_user", "deprovision_device", "delete_device",
+})
+
+
+def _protected_session_target(user) -> bool:
+    """Admins' and the owner's sessions are never ended by remove_token."""
+    return bool(getattr(user, "is_admin", False) or getattr(user, "is_owner", False))
 
 
 async def _authorize_service(hass, call, *, admin_system_only: bool) -> list:
@@ -2032,6 +2040,11 @@ async def _complete_pending_reauth(hass, device_id: str, user_id: str, refresh_t
     if old_rtid and refresh_token_id == old_rtid:
         # Same-user reauth: the pre-reauth session is still heartbeating.
         # Completion requires a fresh login (a new refresh token).
+        return False
+    if not _may_repin(stored_data, device_id, refresh_token_id):
+        # A sibling device's session (shared account) must not complete this
+        # device's reauth: that would pin it here, revoke the real phone's
+        # session and swallow its new credentials.
         return False
 
     # Move the record to the new owner (cross-user reauth only).
@@ -6024,6 +6037,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         target_user = next((u for u in users if _user_matches_username(u, target_username)), None)
         if not target_user:
             return
+        if _protected_session_target(target_user):
+            _LOGGER.warning("CASA SECURITY: remove_token refused for an admin or owner account ('%s').", target_username)
+            raise HomeAssistantError("Cannot remove an admin's or the owner's sessions.")
 
         if token_id == "*":
             for token in list(target_user.refresh_tokens.values()):

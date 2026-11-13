@@ -45,3 +45,21 @@ def test_admin_and_system_contexts_allowed(service):
     assert asyncio.run(_authorize_service(hass, _call(service, "admin"), admin_system_only=True))
     assert asyncio.run(_authorize_service(hass, _call(service, None), admin_system_only=True))
     assert asyncio.run(_authorize_service(hass, _call(service, "guest", parent_id="auto"), admin_system_only=True))
+
+
+@pytest.mark.parametrize("service", ["provision_ble_beacon", "create_user", "remove_user", "deprovision_device", "delete_device"])
+def test_more_credential_and_session_services_are_admin_only(service):
+    hass = _hass()
+    assert service in ALWAYS_ADMIN_SERVICES
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(_authorize_service(hass, _call(service, "guest"), admin_system_only=False))
+
+
+def test_remove_token_target_guard():
+    from custom_components.casa import _protected_session_target
+    hass = _hass()
+    owner = make_user("own", login="owner")
+    owner.is_owner = True
+    assert _protected_session_target(hass.auth.users["admin"])
+    assert _protected_session_target(owner)
+    assert not _protected_session_target(hass.auth.users["guest"])

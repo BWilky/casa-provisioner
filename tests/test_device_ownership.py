@@ -234,3 +234,40 @@ def test_device_limit_by_account_kind():
     assert _device_limit(native=False, ha_user=None) == 100
     assert _device_limit(native=True, ha_user=make_user("x", admin=True)) == 100
     assert _device_limit(native=True, ha_user=make_user("y")) == NATIVE_DEVICE_LIMIT == 10
+
+
+# --- Final review fixes ----------------------------------------------------------
+
+from custom_components.casa import _complete_pending_reauth
+
+
+def _reauth_pending():
+    hass = FakeHass()
+    hass.auth.add_user(make_user("A", login="family", tokens=["r1", "r2", "rNew"]))
+    sd = hass.casa["stored_data"]
+    sd["users"]["A"] = {"username": "family", "devices": {
+        "D1": {"refresh_token_id": "r1", "reauth_pending": {"update_id": "u", "target_user_id": "A", "old_refresh_token_id": "r1"}},
+        "D2": {"refresh_token_id": "r2"},
+    }}
+    hass.casa["qu_data"]["updates"] = {"D1": [{"id": "u", "type": "auth", "payload": {"username": "family", "password": "p"}}]}
+    return hass, sd
+
+
+def test_sibling_cannot_complete_another_devices_reauth():
+    hass, sd = _reauth_pending()
+    assert asyncio.run(_complete_pending_reauth(hass, "D1", "A", "r2")) is False
+    d1 = sd["users"]["A"]["devices"]["D1"]
+    assert d1["refresh_token_id"] == "r1" and "reauth_pending" in d1
+    assert "r1" not in hass.auth.removed_tokens
+    assert hass.casa["qu_data"]["updates"]["D1"]
+
+
+def test_relogged_phone_completes_its_reauth(monkeypatch):
+    import sys
+    import types
+    mod = sys.modules.get("homeassistant.helpers.dispatcher") or types.ModuleType("homeassistant.helpers.dispatcher")
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers.dispatcher", mod)
+    monkeypatch.setattr(mod, "async_dispatcher_send", lambda *a, **k: None, raising=False)
+    hass, sd = _reauth_pending()
+    assert asyncio.run(_complete_pending_reauth(hass, "D1", "A", "rNew")) is True
+    assert sd["users"]["A"]["devices"]["D1"]["refresh_token_id"] == "rNew"
