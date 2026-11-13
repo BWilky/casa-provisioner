@@ -812,6 +812,27 @@ def _consume_replacement_claim(hass, refresh_token_id: str | None) -> str | None
     return claim.get("replaces_device_id") or None
 
 
+def _peek_replacement_claim(hass, refresh_token_id: str | None) -> str | None:
+    """The device id a QR re-provision left for this session token, without
+    consuming it (_apply_device_replacement does that). None when absent or
+    older than _CLAIM_WINDOW_SECONDS."""
+    if not refresh_token_id:
+        return None
+    claim = (hass.data[DOMAIN]["stored_data"].get("replacement_claims") or {}).get(refresh_token_id)
+    if not claim or time.time() - claim.get("at", 0) > _CLAIM_WINDOW_SECONDS:
+        return None
+    return claim.get("replaces_device_id") or None
+
+
+async def _record_session_alive(hass, owner_user_id: str, record: dict) -> bool:
+    """True while the session pinned on a device record still exists."""
+    rtid = record.get("refresh_token_id")
+    if not rtid:
+        return False
+    owner = await hass.auth.async_get_user(owner_user_id)
+    return bool(owner and rtid in owner.refresh_tokens)
+
+
 async def _apply_device_replacement(hass, new_device_id: str, new_info: dict, refresh_token_id: str | None) -> str | None:
     """A QR re-provision redeemed by a different phone (wiped or replaced, so
     a new device_id): the new record inherits the old one's alias (only if
@@ -7061,7 +7082,12 @@ async def _claim_device_for_caller(hass, device_id: str, user_id: str, devices: 
       (a) presents the refresh token pinned on the record;
       (b) holds a fresh claim — a session that redeemed a provisioning
           window for its user, or one created at/after such a window opened
-          in the last 24 h and itself under 30 min old (_has_fresh_claim);
+          in the last 24 h and itself under 30 min old (_has_fresh_claim) —
+          AND either the record's pinned session no longer exists (a phone
+          reset and re-provisioned whose teardown never reached HA) or the
+          window was a re-provision of exactly this device. Every provisioned
+          guest holds a fresh claim, so a claim alone never takes a device
+          that is still live under its owner;
       (c) is the target of the record's pending reauthentication.
     On a move the old owner's pinned session is revoked, and the record's
     queue and reauth markers are dropped (_move_device_record)."""
@@ -7078,6 +7104,13 @@ async def _claim_device_for_caller(hass, device_id: str, user_id: str, devices: 
     if not (pinned or reauth_target):
         fresh = await _has_fresh_claim(hass, user_id, refresh_token_id)
         if not fresh:
+            return False
+        named = _peek_replacement_claim(hass, refresh_token_id) == device_id
+        if not named and await _record_session_alive(hass, other_uid, other):
+            _LOGGER.warning(
+                "CASA: Device '%s' is still active under another user; not moved. "
+                "Delete its record to re-provision it to a different user.", device_id,
+            )
             return False
         # Re-check after the await: the record may have moved meanwhile.
         if device_id in devices:

@@ -50,21 +50,57 @@ def test_pinned_token_moves():
     assert _claim(hass, sd) and _moved(hass, sd)
 
 
-def test_redeemed_provisioning_claim_moves_purges_and_revokes_old_session():
+def test_redeemed_provisioning_claim_moves_dead_record_and_purges_it():
+    # A phone reset and re-provisioned to B whose teardown never reached HA:
+    # A's pinned session is gone, so B's fresh claim may take the record.
     hass, sd = _hass()
+    hass.auth.users["A"].refresh_tokens.pop("rA")
     sd["provision_claims"] = {"B": {"rB": time.time()}}
     assert _claim(hass, sd) and _moved(hass, sd)
     moved = sd["users"]["B"]["devices"]["PHONE"]
     assert moved["alias"] == "Hall" and "reauth_pending" not in moved
     assert "PHONE" not in hass.casa["qu_data"]["updates"]
-    assert "rA" in hass.auth.removed_tokens  # old owner's pinned session revoked
     assert "rB" not in sd["provision_claims"]["B"]  # claim consumed
 
 
-def test_young_session_after_recent_window_moves():
+def test_fresh_claim_cannot_take_live_device():
+    # Any provisioned guest holds a fresh claim; knowing a live device's id
+    # must not let it take that device (and revoke its owner's session).
     hass, sd = _hass()
+    sd["provision_claims"] = {"B": {"rB": time.time()}}
+    assert _claim(hass, sd) is False
+    assert "PHONE" in sd["users"]["A"]["devices"] and sd["users"]["B"]["devices"] == {}
+    assert "rA" not in hass.auth.removed_tokens
+    assert "rB" in sd["provision_claims"]["B"]  # not consumed by a refused move
+
+
+def test_replacement_claim_moves_the_device_it_names():
+    hass, sd = _hass()
+    sd["provision_claims"] = {"B": {"rB": time.time()}}
+    sd["replacement_claims"] = {"rB": {"replaces_device_id": "PHONE", "at": time.time()}}
+    assert _claim(hass, sd) and _moved(hass, sd)
+    assert "rA" in hass.auth.removed_tokens  # old owner's pinned session revoked
+    assert "rB" in sd["replacement_claims"]  # left for _apply_device_replacement
+
+
+def test_replacement_claim_for_another_device_does_not_help():
+    hass, sd = _hass()
+    sd["provision_claims"] = {"B": {"rB": time.time()}}
+    sd["replacement_claims"] = {"rB": {"replaces_device_id": "OTHER", "at": time.time()}}
+    assert _claim(hass, sd) is False
+
+
+def test_young_session_after_recent_window_moves_dead_record():
+    hass, sd = _hass()
+    hass.auth.users["A"].refresh_tokens.pop("rA")
     sd["provision_opened"] = {"B": time.time() - 600}
     assert _claim(hass, sd) and _moved(hass, sd)
+
+
+def test_young_session_after_recent_window_cannot_take_live_device():
+    hass, sd = _hass()
+    sd["provision_opened"] = {"B": time.time() - 600}
+    assert _claim(hass, sd) is False
 
 
 def test_old_session_or_old_window_does_not_move():
