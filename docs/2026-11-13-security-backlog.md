@@ -152,7 +152,7 @@ Order: casa first (it emits both), then iOS (accepts both), then flip the casa d
   - `deprovision`, reload and clear-cache move inside the device-key-encrypted `casa_update` envelope (timestamped).
   - The new app accepts the encrypted form. It keeps accepting plaintext only from casa versions that predate it, based on the server version the heartbeat reports.
   - Casa sends the encrypted form to apps that report support.
-- [ ] **X3 Per-device keys.** Casa issues each device its own random key, delivered once to its pinned session through the heartbeat. Location reports, action presses and encrypted pushes use it. The site-wide `device_key` stays only for apps that haven't picked up a per-device key, and is removed in Phase 5. The heartbeat stops returning keys to non-owned or unpinned callers right away.
+- [x] **X3 Per-device keys** (casa 26.11.15, branch `security-phase4-step1`; design `docs/superpowers/specs/2026-11-13-security-phase4-design.md`). No app change. A device's pushes switch to its own key once it has fetched it and never go back; the site key is refused for reports from a device once it has reported under its own key; per-device rotate in the device editor and on owner change. Casa issues each device its own random key, delivered once to its pinned session through the heartbeat. Location reports, action presses and encrypted pushes use it. The site-wide `device_key` stays only for apps that haven't picked up a per-device key, and is removed in Phase 5. The heartbeat stops returning keys to non-owned or unpinned callers right away.
 - [ ] **X4 Notification content encryption (optional, last in Phase 4).**
   - **How it works with the app closed:** iOS runs a Notification Service Extension (NSE) for any push marked `aps.mutable-content: 1`, whether the app is running, backgrounded or force-quit, and gives it about 30 s to rewrite the content.
   - **Flow:**
@@ -166,6 +166,9 @@ Order: casa first (it emits both), then iOS (accepts both), then flip the casa d
     - Before the first unlock after a reboot the Keychain is unreadable, and a decrypt failure or timeout also leaves the content unchanged. Either way the placeholder shows.
     - Silent pushes skip the NSE; they are already casa-encrypted.
   - Works with the relay down; the relay and Apple only ever see ciphertext.
+
+- [x] **C8 WireGuard via the queue** (casa 26.11.15). `casa.update_wireguard` queues `wireguard` updates (durable, acked) instead of the legacy `wireguard_update` push; `silent`/`title`/`message` are ignored.
+- [ ] **X2 next:** app 1.96 (signed `device/deprovision` handled headless in the AppDelegate path), then casa sends it to ≥ 1.96. Only admin "Deprovision device" sends a wipe.
 
 ## Phase 5: removals once old clients are gone
 

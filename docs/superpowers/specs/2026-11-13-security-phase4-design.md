@@ -96,7 +96,7 @@ Separately:
 ### G3 WireGuard through the queue (casa only; works with every app ≥ June 2026)
 
 - **`casa.update_wireguard`** (legacy service) and every other path that today sends a `wireguard_update` push use `_enqueue_and_push_update` (type `wireguard`, action `update`/`revoke`) instead.
-- **Assignment tracking.** The WireGuard assignment (`_set_wireguard_assignment`) is recorded when the device acks the queue entry, not when the relay returns 200. Until then it is "pending" (`wireguard_pending_fp`) for the one-config-per-device conflict check, so a pending assignment still blocks handing the same config to another device.
+- **Assignment tracking.** As built (plan ruling R3): the assignment is recorded when the update is queued, as the panel's paths already do. A pending and an applied assignment count the same for the conflict check, and the panel shows the device's own reported `wireguard_configured`, so recording on ack would change nothing visible. The fix is that the update is now durable and acknowledged instead of a fire-and-forget push recorded on relay 200.
   - **Revoke** clears both the assignment and any pending one at enqueue time, as today, so a lost phone's config can go to its replacement at once (my call; the router key can't be rotated anyway).
   - **An ack means delivered, not applied.** The app also acks entries it rejects (an unparseable config) and duplicates. Casa generates the config, so a rejection is a bug, not a normal path; the ack protocol does not change (my call).
 - **The legacy push builder** (`command: wireguard_update|wireguard_revoke`) is no longer used for new sends. Its code is removed in Phase 5.
