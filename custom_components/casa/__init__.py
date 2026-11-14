@@ -27,7 +27,7 @@ import qrcode
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from .const import CASA_VERSION, DOMAIN, QUEUE_MAX_AGE_DAYS, QUEUE_MAX_PER_DEVICE, CONF_ADMIN_SYSTEM_ONLY, RELAY_BASE_URL, CONF_RELAY_BASE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
-from .device_keys import key_id as _key_id
+from .device_keys import decrypt_from_device, encryption_key, ensure_device_key, key_id as _key_id, rotate_device_key
 from .actions import CATEGORY, consume_pending, create_pending, device_actions, prune_pending, validate_actions, validate_press
 from .location import (
     ACTION_INFO,
@@ -2361,8 +2361,8 @@ class CasaHeartbeatView(HomeAssistantView):
         # reregister=true tells the device its relay registration was lost (detected
         # by /reconcile) and it should re-register and report a fresh proxy token.
         # updates=true tells the device to pull queued updates from /api/casa/profile_updates.
-        # device_key is the shared secret used to decrypt encrypted pushes; device_key_id
-        # lets the device detect when its stored key is stale after a rotation.
+        # device_key is the device's own secret for encrypted pushes and reports;
+        # device_key_id lets it detect a stale key after a rotation.
         stored_data = self.hass.data[DOMAIN]["stored_data"]
 
         lz_data = self.hass.data[DOMAIN].get("lz_data", {})
@@ -2386,7 +2386,14 @@ class CasaHeartbeatView(HomeAssistantView):
             self.hass.data[DOMAIN]["qu_store"].async_delay_save(lambda: qu_data, 2.0)
             result["updates"] = True
 
-        device_key = stored_data.get("device_key")
+        # The device's own key, only for its own pinned session. Anyone else
+        # gets null, which the app ignores (it keeps the key it holds).
+        device_key = None
+        if device_info is not None and refresh_token_id and device_info.get("refresh_token_id") == refresh_token_id:
+            device_key = ensure_device_key(device_info)
+            if not device_info.get("device_key_delivered_at"):
+                device_info["device_key_delivered_at"] = dt_util.now().isoformat()
+                _save_stored_data(self.hass)
         response = {
             "status": "success",
             "reregister": bool(result.get("reregister")),
