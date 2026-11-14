@@ -90,3 +90,12 @@ def test_no_legacy_wireguard_push_sent(monkeypatch):
     _run(hass, "update", CONF)
     _run(hass, "revoke")
     assert all(p["data"]["command"] not in ("wireguard_update", "wireguard_revoke") for p in hass.sent)
+
+
+def test_only_a_visible_notice_request_is_flagged_as_ignored():
+    from custom_components.casa import _asks_for_wireguard_notice
+    assert not _asks_for_wireguard_notice({})
+    assert not _asks_for_wireguard_notice({"silent": True, "title": "", "message": ""})
+    assert _asks_for_wireguard_notice({"silent": False})
+    assert _asks_for_wireguard_notice({"title": "VPN updated"})
+    assert _asks_for_wireguard_notice({"message": "x"})

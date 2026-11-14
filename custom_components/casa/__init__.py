@@ -3854,6 +3854,12 @@ async def _send_encrypted_update_push(hass, stored_data, session, device_id, dev
     })
 
 
+def _asks_for_wireguard_notice(data) -> bool:
+    """update_wireguard's legacy visible-notification fields, set to
+    something other than the silent default."""
+    return data.get("silent", True) is False or bool(str(data.get("title") or "").strip()) or bool(str(data.get("message") or "").strip())
+
+
 async def _queue_wireguard_change(hass, targets, action, config, excluded_wifi, created_by) -> dict:
     """casa.update_wireguard: queue a wireguard update/revoke for each
     (device_id, device_info, uid) target and deliver it like any queued
@@ -6852,9 +6858,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         device_id = str(call.data.get("device_id", "")).strip()
         username = str(call.data.get("username", "")).strip()
         action = str(call.data.get("action", "update")).strip().lower()
-        if any(k in call.data for k in ("silent", "title", "message")):
+        if _asks_for_wireguard_notice(call.data):
             _LOGGER.warning(
-                "CASA: update_wireguard silent/title/message are ignored; the update is queued and delivered by a silent push."
+                "CASA: update_wireguard no longer shows a notification (silent/title/message are ignored); "
+                "the update is queued and delivered silently. Use casa.notify_user for a visible notice."
             )
         # encrypt_config: false is deprecated and ignored — the push always
         # carries the config end-to-end encrypted (plaintext base64 let the

@@ -936,7 +936,7 @@ set_device_expiration:
 
 update_wireguard:
   name: "Update WireGuard Configuration"
-  description: "Pushes a new WireGuard configuration (or revokes the existing one) to a provisioned device over push notification (fire-and-forget; prefer queued updates from the admin panel). The config is always end-to-end encrypted so the push relay can never read it."
+  description: "Queues a new WireGuard configuration (or a revoke) for a provisioned device or all of a user's devices. It is delivered by an encrypted silent push, or when the device next checks in, and stays queued until the device confirms it. The config is end-to-end encrypted with the device's own key, so the push relay can never read it."
   fields:
     device_id:
       name: "Device ID"
@@ -976,25 +976,7 @@ update_wireguard:
         text: {}
     encrypt_config:
       name: "Encrypt Configuration (deprecated)"
-      description: "Deprecated and ignored: the WireGuard push is always end-to-end encrypted with a key derived from the site device_key (never sent to the relay), so the relay cannot read or tamper with it. Passing false only logs a warning."
+      description: "Deprecated and ignored: the update is always end-to-end encrypted with the device's own key (never sent to the relay), so the relay cannot read or tamper with it. Passing false only logs a warning."
       default: true
       selector:
         boolean: {}
-    silent:
-      name: "Silent"
-      description: "Deliver as a silent background push that applies the change without alerting the user. Disable to also show a notification."
-      default: true
-      selector:
-        boolean: {}
-    title:
-      name: "Notification Title"
-      description: "Title shown to the user. Only used when Silent is disabled."
-      required: false
-      selector:
-        text: {}
-    message:
-      name: "Notification Message"
-      description: "Message shown to the user. Only used when Silent is disabled."
-      required: false
-      selector:
-        text: {}

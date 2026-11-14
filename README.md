@@ -214,7 +214,7 @@ Removes a device's server-side record and revokes its access **without** wiping 
 
 ### `casa.update_wireguard`
 
-Pushes a new WireGuard configuration (or revokes the existing one) to a device or all of a user's devices. End-to-end encrypted by default so the relay can never read the config.
+Queues a new WireGuard configuration (or a revoke) for a device or all of a user's devices. It is delivered by an encrypted silent push, or when the device next checks in, and stays queued until the device confirms it. End-to-end encrypted with the device's own key, so the relay can never read the config. Since 26.11.15 it no longer shows a notification; use `casa.notify_user` for that.
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -223,8 +223,7 @@ Pushes a new WireGuard configuration (or revokes the existing one) to a device o
 | `action` | | `update` (default) or `revoke` |
 | `wireguard_config` | | Client config file content (required for `update`) |
 | `wireguard_excluded_wifi` | | Comma-separated SSIDs where WireGuard stays off |
-| `encrypt_config` | | Default `true`; disable only for debugging |
-| `silent` | | Default `true`; disable to also show a notification |
+| `encrypt_config` | | Deprecated and ignored (always encrypted) |
 
 ---
 
