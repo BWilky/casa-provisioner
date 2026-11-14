@@ -112,3 +112,24 @@ def test_public_state_never_contains_key():
     state = public_key_state(info)
     assert own not in json.dumps(state)
     assert state == {"device_key_id": key_id(own), "delivered": False, "legacy_key_uses": 2}
+
+
+def test_previous_key_still_opens_reports_until_new_key_delivered():
+    from custom_components.casa.device_keys import mark_delivered
+    sd = {"device_key": SITE}
+    info = {}
+    old = ensure_device_key(info)
+    decrypt_from_device(sd, info, "D1", _payload(old))
+    rotate_device_key(info)
+    assert decrypt_from_device(sd, info, "D1", _payload(old)) == {"ts": 1}
+    mark_delivered(info)
+    with pytest.raises(ValueError):
+        decrypt_from_device(sd, info, "D1", _payload(old))
+
+
+def test_previous_key_never_encrypts():
+    sd = {"device_key": SITE}
+    info = {"device_key_delivered_at": "t"}
+    ensure_device_key(info)
+    rotate_device_key(info)
+    assert encryption_key(sd, info) == info["device_key"]

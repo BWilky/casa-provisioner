@@ -27,7 +27,7 @@ import qrcode
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from .const import CASA_VERSION, DOMAIN, QUEUE_MAX_AGE_DAYS, QUEUE_MAX_PER_DEVICE, CONF_ADMIN_SYSTEM_ONLY, RELAY_BASE_URL, CONF_RELAY_BASE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
-from .device_keys import decrypt_from_device, encryption_key, ensure_device_key, key_id as _key_id, rotate_device_key
+from .device_keys import decrypt_from_device, encryption_key, ensure_device_key, key_id as _key_id, mark_delivered, rotate_device_key
 from .actions import CATEGORY, consume_pending, create_pending, device_actions, prune_pending, validate_actions, validate_press
 from .location import (
     ACTION_INFO,
@@ -2390,8 +2390,7 @@ class CasaHeartbeatView(HomeAssistantView):
         device_key = None
         if device_info is not None and refresh_token_id and device_info.get("refresh_token_id") == refresh_token_id:
             device_key = ensure_device_key(device_info)
-            if not device_info.get("device_key_delivered_at"):
-                device_info["device_key_delivered_at"] = dt_util.now().isoformat()
+            if mark_delivered(device_info):
                 _save_stored_data(self.hass)
         response = {
             "status": "success",

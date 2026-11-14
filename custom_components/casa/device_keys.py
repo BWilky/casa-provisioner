@@ -12,6 +12,10 @@ Record fields:
   device_key_confirmed_at  set once a report decrypts under it; from then
                            on the site key is refused for this device
   legacy_key_uses          reports that only decrypted under the site key
+  device_key_prev          the key before a rotation; still opens reports
+                           and presses (never encrypts) until the heartbeat
+                           hands the new key over, so a backgrounded phone
+                           doesn't lose them meanwhile
 
 The site key stays as the fallback for records that haven't switched yet
 (every app version switches on its next check-in). Phase 5 removes it.
@@ -56,6 +60,12 @@ def encryption_key(stored_data: dict, device_info: dict) -> str | None:
 def decrypt_from_device(stored_data: dict, device_info: dict, device_id: str, payload_b64: str, *, info: bytes = REPORT_INFO) -> dict:
     """Decrypt a report or button press from device_id. Raises ValueError
     when no acceptable key opens it."""
+    prev = device_info.get("device_key_prev")
+    if prev:
+        try:
+            return decrypt_report_payload(payload_b64, prev, device_id, info=info)
+        except ValueError:
+            pass
     own = device_info.get("device_key")
     if own:
         try:
@@ -82,8 +92,23 @@ def rotate_device_key(device_info: dict) -> str:
     sees a new key id, checks in for it and pulls its queue meanwhile).
     device_key_confirmed_at is kept: a device that has proven it holds its
     own key never goes back to the site key."""
+    old = device_info.get("device_key")
+    if old and not device_info.get("device_key_prev"):
+        device_info["device_key_prev"] = old
     device_info["device_key"] = secrets.token_hex(32)
     return key_id(device_info["device_key"])
+
+
+def mark_delivered(device_info: dict) -> bool:
+    """The heartbeat handed the current key to the device's own session.
+    Returns True when the record changed (caller saves)."""
+    changed = False
+    if not device_info.get("device_key_delivered_at"):
+        device_info["device_key_delivered_at"] = dt_util.now().isoformat()
+        changed = True
+    if device_info.pop("device_key_prev", None):
+        changed = True
+    return changed
 
 
 def public_key_state(device_info: dict) -> dict:

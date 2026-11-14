@@ -84,3 +84,14 @@ def test_key_not_logged(caplog):
     with caplog.at_level(logging.DEBUG):
         body = _json(_beat(hass, "rt1"))
     assert body["device_key"] not in caplog.text
+
+
+def test_heartbeat_retires_previous_key_after_rotation():
+    from custom_components.casa.device_keys import rotate_device_key
+    hass = _hass()
+    _json(_beat(hass, "rt1"))
+    rotate_device_key(_record(hass))
+    assert _record(hass).get("device_key_prev")
+    body = _json(_beat(hass, "rt1"))
+    assert body["device_key"] == _record(hass)["device_key"]
+    assert "device_key_prev" not in _record(hass)
