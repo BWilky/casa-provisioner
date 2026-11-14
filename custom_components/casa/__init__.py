@@ -34,7 +34,6 @@ from .location import (
     ALLOWED_REASONS,
     ALLOWED_REPORT_KEYS,
     compute_config_version,
-    decrypt_report_payload,
     validate_zone_config,
 )
 from homeassistant.helpers.event import async_track_time_interval, async_call_later
@@ -2896,14 +2895,13 @@ class CasaLocationReportView(HomeAssistantView):
 
         data = self.hass.data.get(DOMAIN, {})
         stored_data = data.get("stored_data", {})
-        device_key = stored_data.get("device_key")
         device_info, _uid, _uname = _find_device_record(stored_data, device_id)
-        if device_info is None or not device_key:
+        if device_info is None:
             # Deliberately vague: this endpoint is unauthenticated.
             return self.json({"error": "Rejected"}, status_code=403)
 
         try:
-            inner = decrypt_report_payload(payload_b64, device_key, device_id)
+            inner = _decrypt_device_report(self.hass, stored_data, device_info, device_id, payload_b64)
         except ValueError:
             _LOGGER.warning("CASA: Rejected location report for device '%s' (decrypt failed).", device_id)
             return self.json({"error": "Rejected"}, status_code=403)
@@ -2923,6 +2921,19 @@ class CasaLocationReportView(HomeAssistantView):
             _LOGGER.warning("CASA: Rejected location report for device '%s' (invalid state/reason).", device_id)
             return self.json({"error": "Rejected"}, status_code=403)
         return self.json({"status": "ok"})
+
+
+def _decrypt_device_report(hass, stored_data, device_info, device_id, payload_b64, info=None) -> dict:
+    """decrypt_from_device, saving the record when it changed (the first
+    report under the device's own key, or a site-key use counted)."""
+    tracked = ("device_key_confirmed_at", "legacy_key_uses")
+    before = [device_info.get(k) for k in tracked]
+    kwargs = {} if info is None else {"info": info}
+    try:
+        return decrypt_from_device(stored_data, device_info, device_id, payload_b64, **kwargs)
+    finally:
+        if [device_info.get(k) for k in tracked] != before:
+            _save_stored_data(hass)
 
 
 class CasaNotificationActionView(HomeAssistantView):
@@ -2957,13 +2968,12 @@ class CasaNotificationActionView(HomeAssistantView):
             # Integration unloading/reloading: let the app retry the press.
             return self.json({"error": "Unavailable"}, status_code=503)
         stored_data = data.get("stored_data", {})
-        device_key = stored_data.get("device_key")
         device_info, _uid, _uname = _find_device_record(stored_data, device_id)
-        if device_info is None or not device_key:
+        if device_info is None:
             return self.json({"error": "Rejected"}, status_code=403)
 
         try:
-            inner = validate_press(decrypt_report_payload(payload_b64, device_key, device_id, info=ACTION_INFO))
+            inner = validate_press(_decrypt_device_report(self.hass, stored_data, device_info, device_id, payload_b64, info=ACTION_INFO))
         except ValueError as err:
             _LOGGER.info("CASA: Rejected notification action from device '%s' (%s).", device_id, err)
             return self.json({"error": "Rejected"}, status_code=403)
