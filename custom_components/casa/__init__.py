@@ -4720,7 +4720,28 @@ class CasaAdminRegenerateKeyView(HomeAssistantView):
         if not user or not getattr(user, "is_admin", False):
             return self.json_message("Admin access required", status_code=403)
 
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
         stored_data = self.hass.data[DOMAIN]["stored_data"]
+        device_id = str((body or {}).get("device_id") or "").strip() if isinstance(body, dict) else ""
+        if device_id:
+            # One device's own key. Pushes switch to it at once; the device
+            # sees the new key id, checks in for it, and pulls its queue
+            # until then.
+            device_info, _uid, _uname = _find_device_record(stored_data, device_id)
+            if device_info is None:
+                return self.json({"error": "Device not found"}, status_code=404)
+            if device_info.get("device_key"):
+                new_id = rotate_device_key(device_info)
+            else:
+                new_id = _device_key_id(ensure_device_key(device_info))
+            await self.hass.data[DOMAIN]["store"].async_save(stored_data)
+            _LOGGER.info("CASA: Rotated the key of device '%s' (new id=%s) by %s.", device_id, new_id, user.name or user.id)
+            await _nudge_device_checkin(self.hass, async_get_clientsession(self.hass), stored_data, device_info)
+            return self.json({"status": "ok", "device_id": device_id, "device_key_id": new_id})
+
         stored_data["device_key"] = secrets.token_hex(32)
         store = self.hass.data[DOMAIN]["store"]
         await store.async_save(stored_data)
@@ -7330,6 +7351,9 @@ def _move_device_record(stored_data: dict, qu_data: dict, device_id: str, from_u
     if info is None:
         return None
     info.pop("reauth_pending", None)
+    if info.get("device_key"):
+        # The old owner's phone session may have held this key.
+        rotate_device_key(info)
     dropped = (qu_data.get("updates") or {}).pop(device_id, None)
     dest[device_id] = info
     _LOGGER.info(

@@ -937,6 +937,11 @@ export function createView(app) {
         <h5>Reload app</h5>
         <p class="field__help" style="margin:0 0 10px;">Sends a silent push that reloads the Casa app UI on the device.</p>
         <button class="btn btn--outlined" id="dev-reload">Reload app</button>
+      </div></div>
+      <div class="card section-card"><div class="card__body">
+        <h5>Encryption key</h5>
+        <p class="field__help" style="margin:0 0 10px;">Each device has its own key for its updates, location reports and notification buttons. Give it a new one if the old key may have been exposed.</p>
+        <button class="btn btn--outlined" id="dev-rotate-key">Rotate key</button>
       </div></div>`;
 
     shell.formEl.querySelector("#dev-push-example").addEventListener("click", (e) => {
@@ -947,6 +952,24 @@ export function createView(app) {
     });
     shell.formEl.querySelector("#dev-send-push").addEventListener("click", sendTestPush);
     shell.formEl.querySelector("#dev-reload").addEventListener("click", confirmReload);
+    shell.formEl.querySelector("#dev-rotate-key").addEventListener("click", confirmRotateKey);
+  }
+
+  function confirmRotateKey() {
+    ui.showConfirm({
+      title: "Rotate encryption key",
+      message: `Give "${displayName(device)}" a new encryption key? It picks up the new key on its next check-in; until then updates wait in its queue.`,
+      confirmLabel: "Rotate",
+      confirmDanger: false,
+      onConfirm: async () => {
+        try {
+          await api.rotateDeviceKey(device.device_id);
+          ui.toast("Key rotated.");
+        } catch (err) {
+          ui.toast("Failed: " + ui.errMsg(err), { error: true });
+        }
+      },
+    });
   }
 
   async function sendTestPush() {

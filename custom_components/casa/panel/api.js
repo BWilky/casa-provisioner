@@ -346,6 +346,11 @@ export class CasaApi {
   regenerateDeviceKey() {
     return this._hass.callApi("POST", "casa/admin/regenerate_device_key");
   }
+  // One device's own encryption key (security Phase 4): it picks the new key
+  // up on its next check-in; updates wait in its queue meanwhile.
+  rotateDeviceKey(deviceId) {
+    return this._hass.callApi("POST", "casa/admin/regenerate_device_key", { device_id: deviceId });
+  }
   getSessions() {
     return this._hass.callApi("GET", "casa/admin/sessions");
   }
