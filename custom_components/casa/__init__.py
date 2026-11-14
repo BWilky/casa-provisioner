@@ -27,6 +27,7 @@ import qrcode
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from .const import CASA_VERSION, DOMAIN, QUEUE_MAX_AGE_DAYS, QUEUE_MAX_PER_DEVICE, CONF_ADMIN_SYSTEM_ONLY, RELAY_BASE_URL, CONF_RELAY_BASE_URL, CONF_CREATE_DEVICES, CONF_SHOW_PANEL, UNIVERSAL_LINK_SETUP_URL, DEVICE_ALIAS_MAX_LEN, DEFAULT_HEARTBEAT_INTERVAL_SECONDS, MIN_HEARTBEAT_INTERVAL_SECONDS, MAX_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_PROFILE_REPORT_INTERVAL_SECONDS, MIN_PROFILE_REPORT_INTERVAL_SECONDS, MAX_PROFILE_REPORT_INTERVAL_SECONDS, LIVE_PROVISIONING_FIELDS, PROFILE_PROVISIONING_FIELDS
+from .device_keys import key_id as _key_id
 from .actions import CATEGORY, consume_pending, create_pending, device_actions, prune_pending, validate_actions, validate_press
 from .location import (
     ACTION_INFO,
@@ -87,13 +88,10 @@ def _encrypt_payload(payload_str: str, key_bytes: bytes) -> str:
 
 
 def _device_key_id(device_key: str) -> str:
-    """Short, non-secret fingerprint of the site device_key.
-
-    Sent in heartbeats and on every encrypted push so the app can tell whether the
-    key it holds is current. On mismatch the app falls back to pulling the plaintext
-    update from /api/casa/profile_updates instead of trying to decrypt.
-    """
-    return hashlib.sha256(device_key.encode("utf-8")).hexdigest()[:8]
+    """Short, non-secret fingerprint of a device key (see device_keys.key_id).
+    On mismatch the app pulls the plaintext update from
+    /api/casa/profile_updates instead of trying to decrypt."""
+    return _key_id(device_key)
 
 
 def _encrypt_push_payload(plaintext: str, device_key: str, device_id: str) -> str:

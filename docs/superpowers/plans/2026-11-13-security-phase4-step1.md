@@ -48,7 +48,7 @@
   - `ensure_device_key(device_info: dict) -> str` creates `device_key = secrets.token_hex(32)` if it is missing, then returns it.
   - `encryption_key(stored_data: dict, device_info: dict) -> str | None` returns the device's key if `device_key_delivered_at` is set, otherwise `stored_data.get("device_key")`.
   - `decrypt_from_device(stored_data, device_info, device_id, payload_b64, *, info=REPORT_INFO) -> dict` tries the device key first, then the site key (refused once `device_key_confirmed_at` is set; R2). On a device-key success it sets `device_key_confirmed_at` if missing. On a site-key success it increments `legacy_key_uses` and logs INFO the first time. It raises `ValueError` when nothing decrypts. It wraps `location.decrypt_report_payload`.
-  - `rotate_device_key(device_info: dict) -> str` sets a new key, pops `device_key_confirmed_at`, keeps `device_key_delivered_at` (R1) and returns the new key id.
+  - `rotate_device_key(device_info: dict) -> str` sets a new key, keeps `device_key_delivered_at` (R1) and `device_key_confirmed_at`, and returns the new key id.
   - `public_key_state(device_info) -> dict` returns `{"device_key_id", "delivered", "legacy_key_uses"}` for the panel. It never includes the key.
 
 - [ ] **Step 1: Write the failing tests** in `tests/test_device_keys.py`, using a payload built with the test-side encryptor `_enc(key, did, obj, info)` (HKDF and AES-GCM, as in `test_location.py`):
