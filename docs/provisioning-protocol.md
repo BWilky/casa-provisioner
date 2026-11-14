@@ -114,10 +114,10 @@ Sent through the relay as `data.command`.
 | `request_heartbeat` | Ask the device to check in. |
 | `request_profile_report` | Ask the device to send a profile report. |
 | `deprovision` | Tell the device to wipe itself. |
-| `wireguard_update` | Push a WireGuard configuration. |
-| `wireguard_revoke` | Revoke the WireGuard configuration. |
+| `wireguard_update` | Legacy (casa before 26.11.15): push a WireGuard configuration. Newer casa queues a `wireguard` update instead. |
+| `wireguard_revoke` | Legacy (casa before 26.11.15): revoke the WireGuard configuration. |
 
-Visible notifications from `casa.notify_user` carry no `data.command`; any `data` is caller-supplied and the app must not route them through command dispatch. `wireguard_update` / `wireguard_revoke` may be sent as visible alerts (push_type alert) when not silent. Pushes with `category: CASA_DYNAMIC` are `notify_user` visibles with `data.actions`; still no `data.command`, still never command dispatch.
+Visible notifications from `casa.notify_user` carry no `data.command`; any `data` is caller-supplied and the app must not route them through command dispatch. Pushes with `category: CASA_DYNAMIC` are `notify_user` visibles with `data.actions`; still no `data.command`, still never command dispatch.
 
 ## 10. Relay
 

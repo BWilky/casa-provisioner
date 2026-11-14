@@ -3855,6 +3855,36 @@ async def _send_encrypted_update_push(hass, stored_data, session, device_id, dev
     })
 
 
+async def _queue_wireguard_change(hass, targets, action, config, excluded_wifi, created_by) -> dict:
+    """casa.update_wireguard: queue a wireguard update/revoke for each
+    (device_id, device_info, uid) target and deliver it like any queued
+    update (encrypted silent push, or a check-in nudge when the push can't
+    go out). The queue is durable, so nothing is lost when the app is in
+    the background or the relay is down; the assignment is recorded as
+    queued, as the panel's paths do."""
+    data = hass.data[DOMAIN]
+    stored_data = data["stored_data"]
+    qu_data = data["qu_data"]
+    session = async_get_clientsession(hass)
+    payload = {"config": config, "excluded_wifi": excluded_wifi} if action == "update" else {}
+    sent = skipped = 0
+    for did, dinfo, _uid in targets:
+        _update_id, pushed, push_skipped = await _enqueue_and_push_update(
+            hass, stored_data, qu_data, session, did, dinfo, "wireguard", action, payload, created_by,
+        )
+        _set_wireguard_assignment(dinfo, config if action == "update" else None)
+        if pushed:
+            sent += 1
+        elif push_skipped:
+            skipped += 1
+        if not pushed and dinfo.get("push_token"):
+            await _nudge_device_checkin(hass, session, stored_data, dinfo)
+        _LOGGER.info("CASA: Queued wireguard %s for device '%s' (pushed=%s).", action, did, pushed)
+    data["qu_store"].async_delay_save(lambda: qu_data, 2.0)
+    _save_stored_data(hass)
+    return {"success": True, "queued_count": len(targets), "sent_count": sent, "skipped_count": skipped, "failed_count": 0}
+
+
 async def _enqueue_and_push_update(hass, stored_data, qu_data, session, device_id, device_info, update_type, action, payload, created_by, send_push=True):
     """Enqueue a durable update for a device and optionally deliver it via an
     encrypted silent push. Used by CasaAdminDeviceView's "Force Device
@@ -6818,13 +6848,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         }
 
     async def handle_update_wireguard(call: ServiceCall):
-        import json
 
         users = await _check_authorization(call)
         device_id = str(call.data.get("device_id", "")).strip()
         username = str(call.data.get("username", "")).strip()
         action = str(call.data.get("action", "update")).strip().lower()
-        silent = call.data.get("silent", True)
+        if any(k in call.data for k in ("silent", "title", "message")):
+            _LOGGER.warning(
+                "CASA: update_wireguard silent/title/message are ignored; the update is queued and delivered by a silent push."
+            )
         # encrypt_config: false is deprecated and ignored — the push always
         # carries the config end-to-end encrypted (plaintext base64 let the
         # relay read the tunnel's private key).
@@ -6834,8 +6866,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
         wireguard_config = str(call.data.get("wireguard_config", ""))
         excluded_wifi = str(call.data.get("wireguard_excluded_wifi", "")).strip()
-        title = str(call.data.get("title", "")).strip()
-        message = str(call.data.get("message", "")).strip()
 
         if action not in ("update", "revoke"):
             raise HomeAssistantError("Invalid action. Must be 'update' or 'revoke'.")
@@ -6887,10 +6917,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         if not targets:
             _LOGGER.warning("CASA: No target devices found for wireguard %s.", action)
-            return {"success": True, "sent_count": 0, "failed_count": 0, "skipped_count": 0}
-
-        session = async_get_clientsession(hass)
-        command = "wireguard_update" if action == "update" else "wireguard_revoke"
+            return {"success": True, "queued_count": 0, "sent_count": 0, "failed_count": 0, "skipped_count": 0}
 
         # This service has no one to ask, so sharing is logged, not refused.
         if action == "update":
@@ -6898,74 +6925,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if conflict:
                 _LOGGER.warning("CASA: update_wireguard: %s", conflict["message"])
 
-        sent_count = 0
-        failed_count = 0
-        skipped_count = 0
-
-        for did, dinfo, uid in targets:
-            push_token = dinfo.get("push_token")
-            if not push_token:
-                _LOGGER.warning("CASA: Device '%s' has no push token; skipping wireguard %s.", did, action)
-                skipped_count += 1
-                continue
-
-            # Inner payload is encrypted (or plaintext-base64) end-to-end; the relay only routes it.
-            if action == "update":
-                inner = {
-                    "action": "update",
-                    "config": wireguard_config,
-                    "excluded_wifi": excluded_wifi,
-                    "ts": int(time.time()),
-                }
-            else:
-                inner = {"action": "revoke", "ts": int(time.time())}
-            inner_str = json.dumps(inner)
-
-            device_key = stored_data.get("device_key")
-            if not device_key:
-                _LOGGER.error("CASA ERROR: No site device_key available; cannot encrypt wireguard payload.")
-                failed_count += 1
-                continue
-            try:
-                wg_payload = _encrypt_push_payload(inner_str, device_key, did)
-            except Exception as e:
-                _LOGGER.error("CASA ERROR: Failed to encrypt wireguard payload for device '%s': %s", did, e)
-                failed_count += 1
-                continue
-
-            payload = {
-                "target": push_token,
-                "site_id": stored_data.get("site_id"),
-                "site_key": stored_data.get("site_key"),
-                "title": "" if silent else title,
-                "message": "" if silent else message,
-                "push_type": "background" if silent else "alert",
-                "priority": 5 if silent else 10,
-                "data": {
-                    "command": command,
-                    "encrypted": True,
-                    "wireguard_payload": wg_payload,
-                    "device_key_id": _device_key_id(device_key),
-                },
-            }
-
-            success = await _send_push_to_relay(hass, session, payload)
-
-            if success:
-                sent_count += 1
-                _set_wireguard_assignment(dinfo, wireguard_config if action == "update" else None)
-                _save_stored_data(hass)
-                _LOGGER.info("CASA: Sent wireguard %s to device '%s' (silent=%s).", action, did, silent)
-            else:
-                failed_count += 1
-                _LOGGER.error("CASA: Failed to deliver wireguard %s to device '%s' after trying all relays.", action, did)
-
-        return {
-            "success": failed_count == 0,
-            "sent_count": sent_count,
-            "failed_count": failed_count,
-            "skipped_count": skipped_count,
-        }
+        return await _queue_wireguard_change(
+            hass, targets, action, wireguard_config, excluded_wifi,
+            f"service:update_wireguard:{getattr(call.context, 'user_id', None) or 'system'}",
+        )
 
     hass.services.async_register(
         DOMAIN, "register_device", handle_register_device,

@@ -66,11 +66,12 @@ Response fields:
   proof of possession (see "Device ownership" below). Such a heartbeat changes nothing,
   answers `updates: false`, applies no location fields, and reports the record's real
   `has_alias`.
-- **Persist `device_key` and `device_key_id` on every heartbeat.** `device_key` is the
-  shared secret used to decrypt pushes; `device_key_id` is its fingerprint.
+- **Persist `device_key` and `device_key_id` whenever they are strings.** Since casa
+  26.11.15 `device_key` is the device's **own** key (no longer one key shared by the site),
+  used for pushes, location reports and notification-action presses; `device_key_id` is
+  its fingerprint. It is sent only to the session pinned on the device record; any other
+  caller gets `null` for both, and the app must keep the key it already holds.
 - If `updates == true`, call the pull endpoint (§2).
-- `device_key`/`device_key_id` are only ever `null` if the site key isn't set yet
-  (shouldn't happen in normal operation).
 - `heartbeat_interval_seconds` is the site's admin-configured cadence (default 300,
   range 60–3600). Always present. The app should apply it as its new heartbeat
   interval going forward, and reset to the 300s default on reprovision — a custom
@@ -323,7 +324,11 @@ The inner `id` **always equals the envelope `update_id`** (and equals the queue 
 so ack either one. The envelope `update_id` lets you dequeue even when `device_key_id`
 doesn't match and you can't decrypt yet.
 
-### WireGuard push (legacy `update_wireguard` service — fire-and-forget)
+### WireGuard push (legacy — no longer sent since 26.11.15)
+
+Casa 26.11.15+ delivers every WireGuard change as a queued `wireguard`
+update (`casa_update`, above). Apps keep handling this shape until Phase 5
+for older casa versions.
 
 ```
 command:           "wireguard_update" | "wireguard_revoke"
