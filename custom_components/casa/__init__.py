@@ -2571,7 +2571,7 @@ class CasaAdminSummaryView(HomeAssistantView):
                     "provisioning_pending_push": bool(dinfo.get("provisioning_pending_push", False)),
                     "provisioning_profile_id": dinfo.get("provisioning_profile_id"),
                     "provisioning_profile_name": dinfo.get("provisioning_profile_name"),
-                    "push_ready": bool(dinfo.get("push_token")) and bool(stored_data.get("device_key")),
+                    "push_ready": bool(dinfo.get("push_token")) and bool(encryption_key(stored_data, dinfo)),
                     "reauth_pending": _reauth(dinfo),
                 })
 
@@ -2616,7 +2616,7 @@ class CasaAdminSummaryView(HomeAssistantView):
                         "provisioning_pending_push": bool(dinfo.get("provisioning_pending_push", False)),
                         "provisioning_profile_id": dinfo.get("provisioning_profile_id"),
                         "provisioning_profile_name": dinfo.get("provisioning_profile_name"),
-                        "push_ready": bool(dinfo.get("push_token")) and bool(stored_data.get("device_key")),
+                        "push_ready": bool(dinfo.get("push_token")) and bool(encryption_key(stored_data, dinfo)),
                     "reauth_pending": _reauth(dinfo),
                     })
 
@@ -3817,7 +3817,7 @@ async def _send_encrypted_update_push(hass, stored_data, session, device_id, dev
     """Deliver an already-queued update over an encrypted silent push.
     Returns False (without raising) when the device has no push_token /
     device_key or encryption fails — the durable queue still delivers."""
-    device_key = stored_data.get("device_key")
+    device_key = encryption_key(stored_data, device_info)
     push_token = device_info.get("push_token")
     if not push_token or not device_key:
         return False
@@ -3859,7 +3859,7 @@ async def _enqueue_and_push_update(hass, stored_data, qu_data, session, device_i
     pushed = False
     skipped = False
     if send_push:
-        if not device_info.get("push_token") or not stored_data.get("device_key"):
+        if not device_info.get("push_token") or not encryption_key(stored_data, device_info):
             skipped = True
         else:
             pushed = await _send_encrypted_update_push(hass, stored_data, session, device_id, device_info, update_id, update_type, action, payload)
@@ -4124,7 +4124,6 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
         queued = skipped = 0
         pending_flagged = False
         jobs = []
-        device_key = stored_data.get("device_key")
 
         wg_jobs = []
         for did, dinfo in targets:
@@ -4139,7 +4138,7 @@ class CasaAdminQueueUpdateView(HomeAssistantView):
             update_id = _enqueue_update(qu_data, did, update_type, action, payload, created_by)
             queued += 1
             push_token = dinfo.get("push_token")
-            if send_update_push and (not push_token or not device_key):
+            if send_update_push and (not push_token or not encryption_key(stored_data, dinfo)):
                 skipped += 1
             if notify_push:
                 if not push_token:
@@ -4416,7 +4415,7 @@ class CasaAdminReauthDeviceView(HomeAssistantView):
         pushed = False
         push_skipped = False
         if send_update_push:
-            if not device_info or not device_info.get("push_token") or not stored_data.get("device_key"):
+            if not device_info or not device_info.get("push_token") or not encryption_key(stored_data, device_info):
                 push_skipped = True
             else:
                 session = async_get_clientsession(hass)
@@ -4502,7 +4501,7 @@ class CasaAdminReprovisionDeviceView(HomeAssistantView):
         if not owner or getattr(owner, "is_admin", False):
             return self.json({"error": "Cannot re-provision a device on an admin account"}, status_code=400)
 
-        push_ready = bool(device_info.get("push_token")) and bool(stored_data.get("device_key"))
+        push_ready = bool(device_info.get("push_token")) and bool(encryption_key(stored_data, device_info))
         if method == "auto" and push_ready:
             return await self._via_push(request, user, device_id, owner_uid)
         return await self._via_qr(device_id, host_url)
